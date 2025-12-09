@@ -1,0 +1,5 @@
+.idea/
+.env
+.remote
+.DS_Store
+.tmp
