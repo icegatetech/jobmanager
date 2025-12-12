@@ -67,6 +67,7 @@ type JobsManager struct {
 }
 
 func NewJobsManager(storage Storage, config JobsManagerConfig, logger Logger, jobs JobDefinitions, opts ...Option) (*JobsManager, error) {
+	// TODO(med): we need to allocate an asynchronous API for managing and configuring jobs. So the client will be able to change job settings without restarting.
 	// TODO(low): consider reducing the number of parameters for manager startup
 
 	if len(jobs) == 0 {

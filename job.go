@@ -137,7 +137,7 @@ func (s *JobStatus) To(new JobStatus) error {
 		}
 	}
 
-	return fmt.Errorf("job status %s is not allowed (old: %s)", new, s)
+	return fmt.Errorf("job status change to '%s' is not allowed (old: %s)", new, s)
 }
 
 type Job struct {
@@ -331,7 +331,7 @@ func (j *Job) UpdateTaskHeartbeat(taskID string, workerID string, deadline time.
 // PickTaskToExecute selects a random pending task (to reduce competition between workers)
 func (j *Job) PickTaskToExecute(workerID string) (*task, error) {
 	if j.Status() != JobRunning {
-		if err := j.Work(workerID); err != nil {
+		if err := j.Work(workerID); err != nil { // change status to Running
 			return nil, fmt.Errorf("task cannot be picked up cause invalid job %s state", j.Code())
 		}
 	}
@@ -356,6 +356,7 @@ func (j *Job) MergeWithWorkerTasks(workerJob *Job, workerID string) error {
 		return fmt.Errorf("merge job '%s' failed - IDs is different", j.Code())
 	}
 	if err := j.status.To(workerJob.Status()); err != nil {
+		// TODO(low): its may be ok when job was already saved as completed, but current worker is late with failed task (current worker job status is running)
 		return fmt.Errorf("merge job '%s' status failed: %w", j.Code(), err)
 	}
 

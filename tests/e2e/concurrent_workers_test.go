@@ -16,6 +16,28 @@ import (
 
 // TestConcurrentWorkers verifies that multiple workers can process tasks from the same job concurrently
 func TestConcurrentWorkers(t *testing.T) {
+	testCases := []struct {
+		name             string
+		useCachedStorage bool
+	}{
+		{
+			name:             "with S3 storage",
+			useCachedStorage: false,
+		},
+		{
+			name:             "with cached storage",
+			useCachedStorage: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			runConcurrentWorkersTest(t, tc.useCachedStorage)
+		})
+	}
+}
+
+func runConcurrentWorkersTest(t *testing.T, useCachedStorage bool) {
 	ctx := context.Background()
 
 	taskCount := 10
@@ -76,7 +98,7 @@ func TestConcurrentWorkers(t *testing.T) {
 	require.NoError(t, err)
 
 	logger := testenv.NewTestLogger(t)
-	storage, err := jobmanager.NewS3Storage(
+	s3Storage, err := jobmanager.NewS3Storage(
 		ctx,
 		jobmanager.S3StorageConfig{
 			Endpoint:        minioEnv.Endpoint(),
@@ -92,6 +114,11 @@ func TestConcurrentWorkers(t *testing.T) {
 		jobmanager.NewRetrier(jobmanager.RetrierConfig{}, logger),
 	)
 	require.NoError(t, err)
+
+	var storage jobmanager.Storage = s3Storage
+	if useCachedStorage {
+		storage = jobmanager.NewCachedStorage(s3Storage, logger, jobmanager.NewDisabledMetrics())
+	}
 
 	managerEnv, err := testenv.NewManagerEnv(
 		t,

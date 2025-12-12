@@ -41,7 +41,7 @@ func (s *CachedStorage) GetJob(ctx context.Context, jobCode JobCode) (*Job, erro
 	if ok && cachedJob.IterationNum() == meta.IterNum && cachedJob.Version() == meta.Version {
 		s.mu.RUnlock()
 		s.recordCacheHit(ctx, "GetJob")
-		s.lgr.DebugContext(ctx, fmt.Sprintf("Get job '%s' from cache, tasks: %s", cachedJob.Code(), cachedJob.tasksAsString()))
+		s.lgr.DebugContext(ctx, fmt.Sprintf("Get job '%s' from cache, (id: %s, version: %s, tasks: %s)", cachedJob.Code(), cachedJob.ID(), cachedJob.Version(), cachedJob.tasksAsString()))
 		return cachedJob.Clone(), nil
 	}
 	s.mu.RUnlock()
@@ -65,7 +65,7 @@ func (s *CachedStorage) GetJobByMeta(ctx context.Context, jobMeta JobMeta) (*Job
 	if ok && cachedJob.IterationNum() == jobMeta.IterNum && cachedJob.Version() == jobMeta.Version {
 		s.mu.RUnlock()
 		s.recordCacheHit(ctx, "GetJobByMeta")
-		s.lgr.DebugContext(ctx, fmt.Sprintf("Get job by meta '%s' from cache, tasks: %s", cachedJob.Code(), cachedJob.tasksAsString()))
+		s.lgr.DebugContext(ctx, fmt.Sprintf("Get job '%s' by meta from cache, (id: %s, version: %s, tasks: %s)", cachedJob.Code(), cachedJob.ID(), cachedJob.Version(), cachedJob.tasksAsString()))
 		return cachedJob.Clone(), nil
 	}
 	s.mu.RUnlock()
@@ -95,7 +95,7 @@ func (s *CachedStorage) SaveJob(ctx context.Context, job *Job) error {
 
 	s.updateCache(job)
 
-	s.lgr.DebugContext(ctx, fmt.Sprintf("Job '%s' saved to storage and cache (tasks: %s)", job.Code(), job.tasksAsString()))
+	s.lgr.DebugContext(ctx, fmt.Sprintf("Job '%s' saved to storage and cache (id: %s, version: %s, tasks: %s)", job.Code(), job.ID(), job.Version(), job.tasksAsString()))
 
 	return nil
 }

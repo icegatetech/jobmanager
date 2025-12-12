@@ -287,7 +287,7 @@ func (w *worker) pickAndExecuteTask(ctx context.Context, job *Job) (wasAttemptPr
 			w.lgr.InfoContext(ctx, err.Error())
 			return true, nil
 		}
-		return true, fmt.Errorf("save job failed after start: %w", err)
+		return true, fmt.Errorf("save job failed after task started: %w", err)
 	}
 
 	w.lgr.InfoContext(ctx, fmt.Sprintf("Started processing task '%s' (code: %s)", tsk.ID(), tsk.Code()))
@@ -308,7 +308,7 @@ func (w *worker) executeTask(ctx context.Context, job *Job, tsk *task) error {
 
 	err = executor(ctx, tsk, newJobManager(job, w.storage, w.id))
 	if err != nil {
-		w.lgr.InfoContext(ctx, fmt.Errorf("execution task failed: %w", err).Error())
+		w.lgr.InfoContext(ctx, fmt.Errorf("task execution failed: %w", err).Error())
 		if err := job.FailTask(tsk.ID(), err.Error()); err != nil {
 			return err
 		}
@@ -327,7 +327,7 @@ func (w *worker) executeTask(ctx context.Context, job *Job, tsk *task) error {
 		return nil
 	}
 
-	w.lgr.InfoContext(ctx, fmt.Sprintf("Task %s handled with status %s", tsk.Code(), tsk.Status()))
+	w.lgr.InfoContext(ctx, fmt.Sprintf("Task '%s' handled successful ('%s')", tsk.Code(), tsk.Status()))
 
 	w.tryCompleteJob(ctx, job)
 
@@ -414,8 +414,6 @@ func (w *worker) saveJobState(ctx context.Context, job *Job, concurrentModificat
 				return needRetry, err
 			}
 
-			w.lgr.DebugContext(ctx, fmt.Sprintf("Job '%s' saved (id: %s; version: %s; tasks: %s)", job.Code(), job.id, job.Version(), job.tasksAsString()))
-
 			return true, err
 		},
 	)
@@ -445,6 +443,8 @@ func (w *worker) saveProcessedTask(ctx context.Context, job *Job, taskID string,
 	if err != nil {
 		return err
 	}
+
+	w.lgr.DebugContext(ctx, fmt.Sprintf("Job '%s' saved with processed task (version: %s; tasks: %s)", job.Code(), job.Version(), job.tasksAsString()))
 
 	tsk := job.GetTask(taskID)
 	w.metrics.RecordTaskProcessed(ctx, job.Code(), tsk.Code(), tsk.Status(), tsk.CompletedAt().Sub(tsk.StartedAt()))

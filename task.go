@@ -168,9 +168,9 @@ func (t *task) HeartbeatAt() time.Time {
 func (t *task) start(workerID string, deadline time.Duration) error {
 	if !t.canBePickedUp() {
 		if t.ProcessedByWorker() != workerID {
-			return fmt.Errorf("cannot start task (id: %s; code: %s) with status %s: %w", t.id, t.code, t.status, ErrTaskWorkerMismatch)
+			return fmt.Errorf("cannot start task (id: %s; code: %s; status: %s): %w", t.id, t.code, t.status, ErrTaskWorkerMismatch)
 		}
-		return fmt.Errorf("cannot start task (id: %s; code: %s) with status %s", t.id, t.code, t.status)
+		return fmt.Errorf("cannot start task (id: %s; code: %s; status %s; deadline at: %s)", t.id, t.code, t.status, t.DeadlineAt().String())
 	}
 
 	t.status = TaskStarted
@@ -208,11 +208,11 @@ func (t *task) fail(errMsg string) error {
 }
 
 func (t *task) updateHeartbeat(workerID string, deadline time.Duration) error {
-	if t.Status() != TaskStarted {
-		return fmt.Errorf("cannot update task '%s' heartbeat - task not in runnig status %s", t.Code(), t.Status())
-	}
 	if t.ProcessedByWorker() != workerID {
 		return fmt.Errorf("cannot update task '%s' heartbeat: %w", t.Code(), ErrTaskWorkerMismatch)
+	}
+	if t.Status() != TaskStarted {
+		return fmt.Errorf("cannot update task '%s' heartbeat - task not in runnig status (status: '%s')", t.Code(), t.Status())
 	}
 
 	t.heartbeatAt = time.Now()

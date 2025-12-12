@@ -34,7 +34,7 @@ func (l *TestLogger) formatAttrs(args ...slog.Attr) string {
 	if len(args) == 0 {
 		return ""
 	}
-	result := "{"
+	result := "; {"
 	for _, attr := range args {
 		result += fmt.Sprintf(" %s=%v;", attr.Key, attr.Value)
 	}

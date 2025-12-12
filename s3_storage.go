@@ -196,14 +196,15 @@ func (s s3Storage) GetJobByMeta(ctx context.Context, jobMeta JobMeta) (*Job, err
 // SaveJob saves job atomically with Version check
 func (s s3Storage) SaveJob(ctx context.Context, job *Job) error {
 	if job.IsStarted() {
-		s.lgr.DebugContext(ctx, fmt.Sprintf("Saving next job iteration (id: '%s', code: %s; status: %s; version: %s; tasks: %s)", job.id, job.Code(), job.Status(), job.Version(), job.tasksAsString()))
+		s.lgr.DebugContext(ctx, fmt.Sprintf("Saving next job iteration (id: %s, code: %s; status: %s; version: %s; tasks: %s)", job.id, job.Code(), job.Status(), job.Version(), job.tasksAsString()))
 		return s.putNextIteration(ctx, job)
 	}
 
-	s.lgr.DebugContext(ctx, fmt.Sprintf("Saving current job iteration (id: '%s', code: %s; status: %s; version: %s; tasks: %s)", job.id, job.Code(), job.Status(), job.Version(), job.tasksAsString()))
+	s.lgr.DebugContext(ctx, fmt.Sprintf("Saving current job iteration (id: %s, code: %s; status: %s; version: %s; tasks: %s)", job.id, job.Code(), job.Status(), job.Version(), job.tasksAsString()))
 	return s.putCurrentIteration(ctx, job)
 }
 
+// ErrConcurrentModification
 func (s s3Storage) putNextIteration(ctx context.Context, job *Job) error {
 	key := s.buildStatePath(job.Code(), job.IterationNum())
 
@@ -231,6 +232,7 @@ func (s s3Storage) putNextIteration(ctx context.Context, job *Job) error {
 	return nil
 }
 
+// ErrConcurrentModification
 func (s s3Storage) putCurrentIteration(ctx context.Context, job *Job) error {
 	key := s.buildStatePath(job.Code(), job.IterationNum())
 
