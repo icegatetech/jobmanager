@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/icegatetech/jobmanager"
 )
 
@@ -55,17 +57,16 @@ func NewManagerEnv(
 	}, nil
 }
 
-func (e *ManagerEnv) Start(ctx context.Context) error {
-	return e.manager.Start(ctx)
-}
-
-func (e *ManagerEnv) Wait() {
-	e.manager.Wait()
+func (m *ManagerEnv) GoStart(ctx context.Context) {
+	go func() {
+		err := m.manager.Start(ctx)
+		require.NoError(m.t, err)
+	}()
 }
 
 // WaitForAllJobsCompletion waits for completion of all jobs with maxIterations.
 // After return, calling code should cancel context to stop workers.
-func (e *ManagerEnv) WaitForAllJobsCompletion(ctx context.Context, timeout time.Duration) error {
+func (m *ManagerEnv) WaitForAllJobsCompletion(ctx context.Context, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -77,7 +78,7 @@ func (e *ManagerEnv) WaitForAllJobsCompletion(ctx context.Context, timeout time.
 		case <-ctx.Done():
 			return fmt.Errorf("timeout waiting for jobs to complete")
 		case <-ticker.C:
-			allDone, err := e.checkAllJobsCompleted(ctx)
+			allDone, err := m.checkAllJobsCompleted(ctx)
 			if err != nil {
 				continue
 			}
@@ -88,18 +89,18 @@ func (e *ManagerEnv) WaitForAllJobsCompletion(ctx context.Context, timeout time.
 	}
 }
 
-func (e *ManagerEnv) checkAllJobsCompleted(ctx context.Context) (bool, error) {
+func (m *ManagerEnv) checkAllJobsCompleted(ctx context.Context) (bool, error) {
 	jobsWithLimit := 0
 	jobsCompleted := 0
 
-	for jobCode, jobDef := range e.jobDefs {
+	for jobCode, jobDef := range m.jobDefs {
 		// Ignore jobs without iteration limit
 		if jobDef.MaxIterations() == 0 {
 			continue
 		}
 		jobsWithLimit++
 
-		job, err := e.storage.GetJob(ctx, jobCode)
+		job, err := m.storage.GetJob(ctx, jobCode)
 		if err != nil {
 			if errors.Is(err, jobmanager.ErrJobNotFound) {
 				continue // job not yet created
@@ -127,6 +128,6 @@ func (e *ManagerEnv) checkAllJobsCompleted(ctx context.Context) (bool, error) {
 }
 
 // Storage returns the storage instance
-func (e *ManagerEnv) Storage() jobmanager.Storage {
-	return e.storage
+func (m *ManagerEnv) Storage() jobmanager.Storage {
+	return m.storage
 }

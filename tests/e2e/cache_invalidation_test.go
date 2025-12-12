@@ -56,7 +56,7 @@ func TestCacheInvalidation(t *testing.T) {
 			SecretAccessKey: minioEnv.Password(),
 			BucketName:      "test-jobs",
 			UseSSL:          false,
-			BucketPrefix:    "jobs/",
+			BucketPrefix:    "jobs",
 		},
 		logger,
 		jobmanager.NewDisabledMetrics(),
@@ -82,14 +82,12 @@ func TestCacheInvalidation(t *testing.T) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	err = managerEnv.Start(ctx)
-	require.NoError(t, err)
+	managerEnv.GoStart(ctx)
 
 	// 5. Wait for job completion
 	err = managerEnv.WaitForAllJobsCompletion(ctx, 10*time.Second)
 	require.NoError(t, err)
 	cancel()
-	managerEnv.Wait()
 
 	// 6. Verify job completed and cache is consistent
 	// Get from cached storage - should return completed job

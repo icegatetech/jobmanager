@@ -64,7 +64,7 @@ func TestSimpleJobExecution(t *testing.T) {
 			SecretAccessKey: minioEnv.Password(),
 			BucketName:      "test-jobs",
 			UseSSL:          false,
-			BucketPrefix:    "jobs/",
+			BucketPrefix:    "jobs",
 		},
 		logger,
 		jobmanager.NewDisabledMetrics(),
@@ -88,14 +88,12 @@ func TestSimpleJobExecution(t *testing.T) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	err = managerEnv.Start(ctx)
-	require.NoError(t, err)
+	managerEnv.GoStart(ctx)
 
 	// 5. Wait for all jobs with maxIterations to complete, then stop workers
 	err = managerEnv.WaitForAllJobsCompletion(ctx, 10*time.Second)
 	require.NoError(t, err)
 	cancel()
-	managerEnv.Wait()
 
 	// 6. Verify
 	assert.True(t, executed.Load(), "task should be executed")
@@ -175,7 +173,7 @@ func TestMultiTaskSequence(t *testing.T) {
 			SecretAccessKey: minioEnv.Password(),
 			BucketName:      "test-jobs",
 			UseSSL:          false,
-			BucketPrefix:    "jobs/",
+			BucketPrefix:    "jobs",
 		},
 		logger,
 		jobmanager.NewDisabledMetrics(),
@@ -199,13 +197,11 @@ func TestMultiTaskSequence(t *testing.T) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	err = managerEnv.Start(ctx)
-	require.NoError(t, err)
+	managerEnv.GoStart(ctx)
 
 	err = managerEnv.WaitForAllJobsCompletion(ctx, 15*time.Second)
 	require.NoError(t, err)
 	cancel()
-	managerEnv.Wait()
 
 	assert.True(t, firstTaskExecuted.Load(), "first task should execute")
 	assert.True(t, secondTaskExecuted.Load(), "second task should execute")

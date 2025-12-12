@@ -70,7 +70,7 @@ func TestTaskDeadlineExpiry(t *testing.T) {
 			SecretAccessKey: minioEnv.Password(),
 			BucketName:      "test-jobs",
 			UseSSL:          false,
-			BucketPrefix:    "jobs/",
+			BucketPrefix:    "jobs",
 		},
 		logger,
 		jobmanager.NewDisabledMetrics(),
@@ -94,14 +94,12 @@ func TestTaskDeadlineExpiry(t *testing.T) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	err = managerEnv.Start(ctx)
-	require.NoError(t, err)
+	managerEnv.GoStart(ctx)
 
 	// 5. Wait for job completion (should retry after first attempt fails)
 	err = managerEnv.WaitForAllJobsCompletion(ctx, 15*time.Second)
 	require.NoError(t, err)
 	cancel()
-	managerEnv.Wait()
 
 	// 6. Verify task was attempted multiple times
 	assert.GreaterOrEqual(t, attemptCount.Load(), int32(2), "task should be attempted at least twice (first fails, second completes)")

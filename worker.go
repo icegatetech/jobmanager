@@ -55,7 +55,7 @@ func newWorker(registry jobRegistry, storage Storage, config WorkerConfig, logge
 		config.PollInterval = defaultPollInterval
 	}
 	if config.PollIntervalRandomization <= 0 {
-		config.PollInterval = defaultPollIntervalRandomization
+		config.PollIntervalRandomization = defaultPollIntervalRandomization
 	}
 	if config.MaxPollInterval <= 0 {
 		config.MaxPollInterval = defaultMaxPollInterval
@@ -176,18 +176,21 @@ func (w *worker) createNewJob(ctx context.Context, code JobCode, metadata map[st
 		return nil, fmt.Errorf("job %s not registered: %w", code, err)
 	}
 
-	job := NewJob(code, w.createTasksFromJobDef(jobDef), metadata, w.id)
+	job := NewJob(code, w.createTasksFromJobDef(jobDef), metadata, w.id, jobDef.maxIterations)
 
+	isJobCreated := true // only for log(
 	err = w.saveJobState(ctx, job, func(savedJob *Job) (updatedJob *Job, needRetry bool, err error) {
 		// TODO(low): in saveJobState on ErrConcurrentModification we re-read job, which is unnecessary in this case.
 		w.lgr.DebugContext(ctx, fmt.Sprintf("Job has concurrent modification when creating - skip"))
+		isJobCreated = false
 		return savedJob, false, nil // someone beat us to it
 	})
 	if err != nil {
 		return nil, err
 	}
-
-	w.lgr.InfoContext(ctx, fmt.Sprintf("New job '%s' created (id: %s) by worker '%s'", code, job.ID(), job.updatedByWorkerID))
+	if isJobCreated {
+		w.lgr.InfoContext(ctx, fmt.Sprintf("New job '%s' created (id: %s) by worker '%s'", code, job.ID(), job.updatedByWorkerID))
+	}
 
 	return job, nil
 }
@@ -234,21 +237,24 @@ func (w *worker) startNewJobIteration(ctx context.Context, job *Job) (*Job, erro
 		return nil, fmt.Errorf("failed to get job definition %s: %w", job.Code(), err)
 	}
 
-	err = job.NextIteration(w.createTasksFromJobDef(jobDef), w.id)
+	err = job.NextIteration(w.createTasksFromJobDef(jobDef), w.id, jobDef.maxIterations)
 	if err != nil {
 		return nil, err
 	}
 
+	isJobIterated := true // only for log(
 	err = w.saveJobState(ctx, job, func(savedJob *Job) (updatedJob *Job, needRetry bool, err error) {
 		// TODO(low): in saveJobState on ErrConcurrentModification we re-read job, which is unnecessary in this case.
 		w.lgr.DebugContext(ctx, fmt.Sprintf("Job has concurrent modification when starting new iteration - skip"))
+		isJobIterated = false
 		return savedJob, false, nil // someone beat us to it - exit with updated job
 	})
 	if err != nil {
 		return nil, err
 	}
-
-	w.lgr.InfoContext(ctx, fmt.Sprintf("New job '%s' iteration started (id: %s) by worker '%s'", job.Code(), job.ID(), job.updatedByWorkerID))
+	if isJobIterated {
+		w.lgr.InfoContext(ctx, fmt.Sprintf("New job '%s' iteration started (id: %s, iter: %d) by worker '%s'", job.Code(), job.ID(), job.IterationNum(), job.updatedByWorkerID))
+	}
 
 	return job, nil
 }
@@ -290,7 +296,7 @@ func (w *worker) pickAndExecuteTask(ctx context.Context, job *Job) (wasAttemptPr
 		return true, fmt.Errorf("save job failed after task started: %w", err)
 	}
 
-	w.lgr.InfoContext(ctx, fmt.Sprintf("Started processing task '%s' (code: %s)", tsk.ID(), tsk.Code()))
+	w.lgr.InfoContext(ctx, fmt.Sprintf("Started processing task '%s' (job iter: %d)", tsk.ID(), job.IterationNum()))
 
 	return true, w.executeTask(ctx, job, tsk)
 }
@@ -366,7 +372,7 @@ func (w *worker) startHeartbeat(ctx context.Context, job *Job, task *task) {
 				w.lgr.ErrorContext(ctx, fmt.Errorf("failed to update heartbeat for task %s: %w", task.Code(), err).Error())
 				return
 			}
-			w.lgr.DebugContext(ctx, fmt.Sprintf("Heartbeat updating for task %s", task.Code()))
+			w.lgr.DebugContext(ctx, fmt.Sprintf("Heartbeat updating for task %s (job iter: %d)", task.Code(), job.IterationNum()))
 			err = w.saveJobState(ctx, job, func(savedJob *Job) (updatedJob *Job, needRetry bool, err error) {
 				if ctx.Err() != nil {
 					return savedJob, false, err
@@ -389,7 +395,7 @@ func (w *worker) startHeartbeat(ctx context.Context, job *Job, task *task) {
 				w.lgr.ErrorContext(ctx, fmt.Errorf("failed to update heartbeat for task %s: %w", task.Code(), err).Error())
 				return
 			}
-			w.lgr.DebugContext(ctx, fmt.Sprintf("Heartbeat updated for task %s", task.Code()))
+			w.lgr.DebugContext(ctx, fmt.Sprintf("Heartbeat updated for task %s (job iter: %d)", task.Code(), job.IterationNum()))
 		}
 	}
 }
@@ -444,7 +450,7 @@ func (w *worker) saveProcessedTask(ctx context.Context, job *Job, taskID string,
 		return err
 	}
 
-	w.lgr.DebugContext(ctx, fmt.Sprintf("Job '%s' saved with processed task (version: %s; tasks: %s)", job.Code(), job.Version(), job.tasksAsString()))
+	w.lgr.DebugContext(ctx, fmt.Sprintf("Job '%s' saved with processed task (iter: %d, version: %s; tasks: %s)", job.Code(), job.IterationNum(), job.Version(), job.tasksAsString()))
 
 	tsk := job.GetTask(taskID)
 	w.metrics.RecordTaskProcessed(ctx, job.Code(), tsk.Code(), tsk.Status(), tsk.CompletedAt().Sub(tsk.StartedAt()))
@@ -459,7 +465,7 @@ func (w *worker) tryCompleteJob(ctx context.Context, job *Job) {
 }
 
 func (w *worker) jobCompleted(ctx context.Context, job *Job) {
-	w.lgr.InfoContext(ctx, fmt.Sprintf("Job %s completed", job.Code()))
+	w.lgr.InfoContext(ctx, fmt.Sprintf("Job %s completed (iter: %d)", job.Code(), job.IterationNum()))
 	w.metrics.RecordJobIterationComplete(ctx, job.Code(), JobCompleted, job.CompletedAt().Sub(job.StartedAt()))
 }
 

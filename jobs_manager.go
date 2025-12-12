@@ -122,9 +122,7 @@ func (m *JobsManager) Start(ctx context.Context) error {
 		}(w)
 	}
 
-	return nil
-}
-
-func (m *JobsManager) Wait() {
 	m.wg.Wait()
+
+	return nil
 }

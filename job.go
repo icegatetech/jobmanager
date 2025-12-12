@@ -154,10 +154,10 @@ type Job struct {
 	nextStartAt       time.Time
 	metadata          map[string]any
 	version           string
-	maxIterations     uint64 // 0 = unlimited, from JobDefinition
+	maxIterations     uint64 // 0 = unlimited, from JobDefinition TODO(low): extract to new settings structure
 }
 
-func NewJob(code JobCode, tasks []*task, metadata map[string]any, workerID string) *Job {
+func NewJob(code JobCode, tasks []*task, metadata map[string]any, workerID string, maxIterations uint64) *Job {
 	j := &Job{
 		id:                uuid.New().String(),
 		code:              code,
@@ -167,6 +167,7 @@ func NewJob(code JobCode, tasks []*task, metadata map[string]any, workerID strin
 		metadata:          metadata,
 		startedAt:         time.Now(),
 		updatedByWorkerID: workerID,
+		maxIterations:     maxIterations,
 	}
 
 	for _, tsk := range tasks {
@@ -177,13 +178,16 @@ func NewJob(code JobCode, tasks []*task, metadata map[string]any, workerID strin
 }
 
 // NextIteration prepares the job for the next iteration
-func (j *Job) NextIteration(tasks []*task, workerID string) error {
+func (j *Job) NextIteration(tasks []*task, workerID string, maxIterations uint64) error {
+	if !j.IsReadyToNextIteration() {
+		return fmt.Errorf("job is not ready to next iteration")
+	}
 	if err := j.status.To(JobStarted); err != nil {
 		return err
 	}
 
 	old := *j
-	*j = *(NewJob(j.code, tasks, j.metadata, workerID))
+	*j = *(NewJob(j.code, tasks, j.metadata, workerID, maxIterations))
 	j.id = old.id
 	// TODO(low): in the future, a mechanism for restarting the sequence is needed (currently the maximum sequence is 10^20). Sequential uuid will not work, as there may be a race when creating a new job by different workers.
 	j.iterNum = old.iterNum + 1

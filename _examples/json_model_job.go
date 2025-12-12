@@ -2,11 +2,10 @@ package main
 
 import (
 	"context"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"log"
 	"log/slog"
-	"math/rand"
 	"os"
 	"os/signal"
 	"syscall"
@@ -15,20 +14,25 @@ import (
 	"github.com/icegatetech/jobmanager"
 )
 
-// TODO(med): example with storing json models in tasks as import/export
-// TODO(low): example with reading/writing to SQLite
+// This example demonstrates how to pass structured data (JSON) between sequential tasks.
+// The 'json_first_step' task creates a 'TaskData' struct, marshals it to JSON, and passes it to 'json_second_step'.
+// The 'json_second_step' task receives the JSON as input, unmarshals it, and processes the data.
 
-// This example demonstrates a job with two sequential tasks.
-// The first task 'first_step' simulates intermittent failures.
-// Upon success, it creates the 'second_step' task.
+// TaskData represents the data model passed between tasks
+type TaskData struct {
+	ID        string    `json:"id"`
+	Timestamp time.Time `json:"timestamp"`
+	Message   string    `json:"message"`
+	Value     int       `json:"value"`
+}
 
 func main() {
-	if err := runSimpleSeqJob(); err != nil {
+	if err := runJsonModelJob(); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func runSimpleSeqJob() error {
+func runJsonModelJob() error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
@@ -36,18 +40,19 @@ func runSimpleSeqJob() error {
 		slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	)
 
-	// 1. Define the 'Simple Job'
-	taskDef, err := jobmanager.NewTaskDefinition("first_step", nil)
+	// 1. Define the tasks
+	firstStepTask, err := jobmanager.NewTaskDefinition("json_first_step", nil)
 	if err != nil {
 		return fmt.Errorf("failed to create first step task: %w", err)
 	}
-	extr := executor{lgr: lgr}
+
+	extr := jsonExecutor{lgr: lgr}
 	jobDef, err := jobmanager.NewJobDefinition(
-		"simple_sequence",
-		[]jobmanager.TaskDefinition{taskDef},
+		"json_model_job",
+		[]jobmanager.TaskDefinition{firstStepTask},
 		map[jobmanager.TaskCode]jobmanager.TaskExecutor{
-			"first_step":  extr.firstStepExecutor,
-			"second_step": extr.secondStepExecutor,
+			"json_first_step":  extr.firstStepExecutor,
+			"json_second_step": extr.secondStepExecutor,
 		},
 	)
 	if err != nil {
@@ -118,25 +123,34 @@ func runSimpleSeqJob() error {
 	return nil
 }
 
-type executor struct {
+type jsonExecutor struct {
 	lgr jobmanager.Logger
 }
 
-func (e executor) firstStepExecutor(ctx context.Context, task jobmanager.ImmutableTask, manager jobmanager.JobManager) error {
+func (e jsonExecutor) firstStepExecutor(ctx context.Context, task jobmanager.ImmutableTask, manager jobmanager.JobManager) error {
 	e.lgr.Info("[FirstStep] Started", slog.String("task_id", task.ID()))
 
 	// Simulate work
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
-	// Simulate flaky failure (30% chance)
-	if rand.Float32() < 0.3 {
-		return errors.New("random simulated failure")
+	// Create data for the next step
+	data := TaskData{
+		ID:        task.ID(),
+		Timestamp: time.Now(),
+		Message:   "Hello from first step!",
+		Value:     42,
 	}
 
-	e.lgr.Info("[FirstStep] Work completed successfully. Scheduling next step.")
+	// Serialize to JSON
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("failed to marshal struct: %w", err)
+	}
 
-	// Create the second task
-	nextTask, err := jobmanager.NewTaskDefinition("second_step", []byte("data from step 1"))
+	e.lgr.Info("[FirstStep] Work completed. Scheduling next step with data.", slog.String("data", string(jsonData)))
+
+	// Create the second task with JSON data
+	nextTask, err := jobmanager.NewTaskDefinition("json_second_step", jsonData)
 	if err != nil {
 		return fmt.Errorf("failed to create second step task: %w", err)
 	}
@@ -146,12 +160,22 @@ func (e executor) firstStepExecutor(ctx context.Context, task jobmanager.Immutab
 		return fmt.Errorf("failed to add second step task: %w", err)
 	}
 
-	return manager.CompleteTask(task.ID(), []byte("done"))
+	return manager.CompleteTask(task.ID(), nil)
 }
 
-func (e executor) secondStepExecutor(ctx context.Context, task jobmanager.ImmutableTask, manager jobmanager.JobManager) error {
-	input := string(task.GetInput())
-	e.lgr.Info("[SecondStep] Started", slog.String("input", input))
+func (e jsonExecutor) secondStepExecutor(ctx context.Context, task jobmanager.ImmutableTask, manager jobmanager.JobManager) error {
+	// Deserialize from JSON
+	var data TaskData
+	if err := json.Unmarshal(task.GetInput(), &data); err != nil {
+		return fmt.Errorf("failed to unmarshal struct: %w", err)
+	}
+
+	e.lgr.Info("[SecondStep] Started",
+		slog.String("received_id", data.ID),
+		slog.String("received_msg", data.Message),
+		slog.Int("received_value", data.Value),
+		slog.Time("received_ts", data.Timestamp),
+	)
 
 	// Simulate work
 	time.Sleep(200 * time.Millisecond)

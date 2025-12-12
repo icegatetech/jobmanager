@@ -98,7 +98,7 @@ func runConcurrentWorkersTest(t *testing.T, useCachedStorage bool) {
 	require.NoError(t, err)
 
 	logger := testenv.NewTestLogger(t)
-	s3Storage, err := jobmanager.NewS3Storage(
+	storage, err := jobmanager.NewS3Storage(
 		ctx,
 		jobmanager.S3StorageConfig{
 			Endpoint:        minioEnv.Endpoint(),
@@ -106,7 +106,7 @@ func runConcurrentWorkersTest(t *testing.T, useCachedStorage bool) {
 			SecretAccessKey: minioEnv.Password(),
 			BucketName:      "test-jobs",
 			UseSSL:          false,
-			BucketPrefix:    "jobs/",
+			BucketPrefix:    "jobs",
 		},
 		logger,
 		jobmanager.NewDisabledMetrics(),
@@ -115,9 +115,8 @@ func runConcurrentWorkersTest(t *testing.T, useCachedStorage bool) {
 	)
 	require.NoError(t, err)
 
-	var storage jobmanager.Storage = s3Storage
 	if useCachedStorage {
-		storage = jobmanager.NewCachedStorage(s3Storage, logger, jobmanager.NewDisabledMetrics())
+		storage = jobmanager.NewCachedStorage(storage, logger, jobmanager.NewDisabledMetrics())
 	}
 
 	managerEnv, err := testenv.NewManagerEnv(
@@ -134,16 +133,20 @@ func runConcurrentWorkersTest(t *testing.T, useCachedStorage bool) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	err = managerEnv.Start(ctx)
-	require.NoError(t, err)
+	managerEnv.GoStart(ctx)
 
 	err = managerEnv.WaitForAllJobsCompletion(ctx, 30*time.Second)
 	require.NoError(t, err)
 	cancel()
-	managerEnv.Wait()
 
-	// Verify all tasks were executed exactly once
-	assert.Equal(t, int32(taskCount), executionCount.Load(), "all tasks should be executed")
+	// Verify final job state
+	job, err := storage.GetJob(context.Background(), "test_concurrent_job")
+	require.NoError(t, err)
+	assert.Equal(t, jobmanager.JobCompleted, job.Status())
+	assert.Equal(t, int(maxIterations), int(job.IterationNum()), "job iteration mismatch")
+
+	// Verify all tasks were executed. Due to concurrency, task may be processed several times.
+	assert.GreaterOrEqual(t, executionCount.Load(), int32(taskCount), "task execution count mismatch")
 
 	// Verify each task was executed exactly once
 	executedCount := 0
@@ -151,11 +154,5 @@ func runConcurrentWorkersTest(t *testing.T, useCachedStorage bool) {
 		executedCount++
 		return true
 	})
-	assert.Equal(t, taskCount, executedCount, "no task should be executed twice")
-
-	// Verify final job state
-	job, err := storage.GetJob(context.Background(), "test_concurrent_job")
-	require.NoError(t, err)
-	assert.Equal(t, jobmanager.JobCompleted, job.Status())
-	assert.Equal(t, maxIterations, job.IterationNum())
+	assert.Equal(t, taskCount, executedCount, "all tasks must be executed")
 }

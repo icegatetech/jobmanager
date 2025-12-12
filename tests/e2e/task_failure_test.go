@@ -66,7 +66,7 @@ func TestTaskFailureAndRetry(t *testing.T) {
 			SecretAccessKey: minioEnv.Password(),
 			BucketName:      "test-jobs",
 			UseSSL:          false,
-			BucketPrefix:    "jobs/",
+			BucketPrefix:    "jobs",
 		},
 		logger,
 		jobmanager.NewDisabledMetrics(),
@@ -90,14 +90,12 @@ func TestTaskFailureAndRetry(t *testing.T) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	err = managerEnv.Start(ctx)
-	require.NoError(t, err)
+	managerEnv.GoStart(ctx)
 
 	// 5. Wait for all jobs with maxIterations to complete, then stop workers
 	err = managerEnv.WaitForAllJobsCompletion(ctx, 15*time.Second)
 	require.NoError(t, err)
 	cancel()
-	managerEnv.Wait()
 
 	// 6. Verify task was attempted multiple times
 	assert.GreaterOrEqual(t, attemptCount.Load(), int32(2), "task should be retried after failure")

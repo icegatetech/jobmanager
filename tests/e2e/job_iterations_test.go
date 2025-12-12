@@ -64,7 +64,7 @@ func TestJobIterations(t *testing.T) {
 			SecretAccessKey: minioEnv.Password(),
 			BucketName:      "test-jobs",
 			UseSSL:          false,
-			BucketPrefix:    "jobs/",
+			BucketPrefix:    "jobs",
 		},
 		logger,
 		jobmanager.NewDisabledMetrics(),
@@ -88,14 +88,12 @@ func TestJobIterations(t *testing.T) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	err = managerEnv.Start(ctx)
-	require.NoError(t, err)
+	managerEnv.GoStart(ctx)
 
 	// 5. Wait for all iterations to complete
 	err = managerEnv.WaitForAllJobsCompletion(ctx, 15*time.Second)
 	require.NoError(t, err)
 	cancel()
-	managerEnv.Wait()
 
 	// 6. Verify correct number of iterations
 	assert.Equal(t, expectedIterations, iterationCount.Load(), "should have completed all iterations")

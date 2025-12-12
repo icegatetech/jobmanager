@@ -31,14 +31,7 @@ type S3StorageConfig struct {
 	BucketName      string
 	UseSSL          bool
 	Region          string
-	BucketPrefix    string // Prefix for all jobs (e.g., "jobs/")
-}
-
-// jobStateFile represents information about job state file in S3
-type jobStateFile struct {
-	IterNum uint64
-	ETag    string
-	Key     string
+	BucketPrefix    string // Prefix for all jobs (e.g., "jobs")
 }
 
 type s3Storage struct {
@@ -47,7 +40,7 @@ type s3Storage struct {
 	bucketPrefix string
 	lgr          Logger
 	metrics      Metrics
-	registry     JobDefinitionRegistry
+	registry     JobDefinitionRegistry // TODO(med): save job settings separately and provide an API for changing settings
 	retrier      Retrier
 }
 
@@ -196,11 +189,11 @@ func (s s3Storage) GetJobByMeta(ctx context.Context, jobMeta JobMeta) (*Job, err
 // SaveJob saves job atomically with Version check
 func (s s3Storage) SaveJob(ctx context.Context, job *Job) error {
 	if job.IsStarted() {
-		s.lgr.DebugContext(ctx, fmt.Sprintf("Saving next job iteration (id: %s, code: %s; status: %s; version: %s; tasks: %s)", job.id, job.Code(), job.Status(), job.Version(), job.tasksAsString()))
+		s.lgr.DebugContext(ctx, fmt.Sprintf("Saving next job iteration (id: %s, code: %s; iter: %d; status: %s; version: %s; tasks: %s)", job.id, job.Code(), job.IterationNum(), job.Status(), job.Version(), job.tasksAsString()))
 		return s.putNextIteration(ctx, job)
 	}
 
-	s.lgr.DebugContext(ctx, fmt.Sprintf("Saving current job iteration (id: %s, code: %s; status: %s; version: %s; tasks: %s)", job.id, job.Code(), job.Status(), job.Version(), job.tasksAsString()))
+	s.lgr.DebugContext(ctx, fmt.Sprintf("Saving current job iteration (id: %s, code: %s; iter: %d; status: %s; version: %s; tasks: %s)", job.id, job.Code(), job.IterationNum(), job.Status(), job.Version(), job.tasksAsString()))
 	return s.putCurrentIteration(ctx, job)
 }
 
@@ -234,6 +227,8 @@ func (s s3Storage) putNextIteration(ctx context.Context, job *Job) error {
 
 // ErrConcurrentModification
 func (s s3Storage) putCurrentIteration(ctx context.Context, job *Job) error {
+	// TODO(med): to check - set {PutObjectOptions{DisableMultipart: true} and send correct file. When multipart is on there may be problems with the etag.
+
 	key := s.buildStatePath(job.Code(), job.IterationNum())
 
 	data, err := s.serializeJob(job)
@@ -273,7 +268,7 @@ func (s s3Storage) checkConcurrentModification(err error) error {
 }
 
 func (s s3Storage) buildJobPath(jobCode JobCode) string {
-	return fmt.Sprintf("%s%s/", s.bucketPrefix, jobCode)
+	return fmt.Sprintf("%s/%s/", s.bucketPrefix, jobCode)
 }
 
 // buildStatePath builds path to state file with inverted iterNum for S3 sorting
