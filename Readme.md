@@ -43,7 +43,7 @@ JobManager takes a radically simpler approach: **use S3 (or any S3-compatible ob
 - ❌ You need to perform a large number of tasks inside the job. But you can partition tasks into multiple jobs, then the concurrency of job processing will decrease.
 
 ## Algorithm
-
+### Description
 - Each **job** is stored in a single **file** `state-{inverted_iter_num}.json` (e.g., `state-18446744073709551614.json`).
     - The file uses **inverted iter_num** (`MaxUint64 - iterNum`) so that newer iterations appear first in S3 LIST operations (S3 sorts by name), making LIST requests faster.
     - A new file is created when **starting a new iteration** of the job (when status transitions to `started`). `iter_num` is a monotonically increasing number.
@@ -90,3 +90,31 @@ JobManager takes a radically simpler approach: **use S3 (or any S3-compatible ob
         - Worker checks status of other tasks in state - if all have `status=completed`, worker change job status to `completed`.
         - Atomically changes job state in file.
 - If job has `maxIterations` set and the limit is reached, worker marks job as `exhausted` in cache and stops polling it.
+### Diagram
+```mermaid
+flowchart TD
+    A["worker loop (with jittered poll)"] --> C["for each job definition"]
+    C --> D{should poll job now}
+    D -- no --> C
+    D -- yes --> E{get job state from storage}
+    E -- not found --> F["create new job (atomically save)"]
+    E -- found --> G["update worker cache version"]
+    F --> H
+    G --> H{job state check}
+    H -- job processed & max iterations reached --> I["mark job in worker cache as exhausted"]
+    H -- ready to next iteration --> J["start new iteration; reset tasks; atomically save"]
+    H -- ready for processing --> K{"pick task"}
+    J --> K
+    K -- no task --> L["adaptive backoff; increase poll interval"]
+    K -- task chosen --> M["start task; set deadline"]
+    M --> N["save job state (atomically); retry on concurrent; set async heartbeat"]
+    N --> O{"execute task executor"}
+    O -- error --> P["fail task"]
+    O -- success --> Q["complete task -> try complete job"]
+    P --> R["save job state (atomically); merge on conflict"]
+    Q --> R["save job state (atomically); merge on conflict"]
+    R --> T["Continue polling next tasks"]
+    I --> C
+    L --> A
+    T --> A
+```
