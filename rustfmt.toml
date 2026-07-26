@@ -1,0 +1,16 @@
+# Rust formatting configuration for jobmanager
+# https://rust-lang.github.io/rustfmt/
+#
+# Some options below are nightly-only, so plain `cargo fmt` silently ignores this file.
+# Use `make fmt-fix` / `make fmt`, which run `cargo +nightly fmt`.
+
+# Edition
+edition = "2024"
+
+# Basic formatting
+max_width = 120
+chain_width = 80
+reorder_imports = true
+
+format_code_in_doc_comments = true
+group_imports = "StdExternalCrate"
