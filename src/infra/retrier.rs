@@ -33,7 +33,7 @@ impl Default for RetrierConfig {
                 Duration::from_secs(1),
                 Duration::from_secs(5),
                 Duration::from_secs(10),
-                Duration::from_secs(60),
+                Duration::from_mins(1),
             ],
         }
     }

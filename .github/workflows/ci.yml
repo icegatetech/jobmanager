@@ -79,13 +79,19 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    env:
+      # Pinned deliberately: pedantic and nursery are denied crate-wide, so every new stable
+      # release can fail this job on code nobody touched. Bump this in its own commit and fix
+      # the new lints there.
+      CLIPPY_TOOLCHAIN: "1.97.0"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.CLIPPY_TOOLCHAIN }}
           components: clippy
 
       - name: Cache cargo registry
@@ -108,9 +114,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: target
-          key: ${{ runner.os }}-stable-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-clippy-${{ env.CLIPPY_TOOLCHAIN }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-stable-cargo-build-target-
+            ${{ runner.os }}-clippy-${{ env.CLIPPY_TOOLCHAIN }}-cargo-build-target-
 
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
