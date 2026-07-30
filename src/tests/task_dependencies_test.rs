@@ -119,18 +119,14 @@ async fn test_task_dependencies() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. Create storage
     let storage = S3Storage::new(
-        S3StorageConfig {
-            endpoint: store.endpoint().to_string(),
-            access_key_id: store.username().to_string(),
-            secret_access_key: store.password().to_string(),
-            bucket_name: "test-jobs".to_string(),
-            use_ssl: false,
-            region: "us-east-1".to_string(),
-            bucket_prefix: "jobs".to_string(),
-            job_state_codec: JobStateCodecKind::Json,
-            request_timeout: Duration::from_secs(5),
-            retrier_config: RetrierConfig::default(),
-        },
+        S3StorageConfig::new(
+            store.endpoint(),
+            store.username(),
+            store.password(),
+            "test-jobs",
+            "us-east-1",
+        )
+        .with_job_state_codec(JobStateCodecKind::Json),
         job_registry.clone(),
         Metrics::new_disabled(),
     )
@@ -145,6 +141,7 @@ async fn test_task_dependencies() -> Result<(), Box<dyn std::error::Error>> {
             retrier_config: RetrierConfig::default(),
             ..Default::default()
         },
+        ..Default::default()
     };
 
     let mut manager_env = ManagerEnv::new(Arc::new(storage), config, Arc::clone(&job_registry), vec![job_def])?;

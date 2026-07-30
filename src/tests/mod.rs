@@ -7,6 +7,8 @@ mod cache_invalidation_test;
 mod concurrent_workers_test;
 mod deadline_expiry_test;
 mod dynamic_task_test;
+mod job_cleanup_s3_test;
+mod job_cleanup_test;
 mod job_iterations_test;
 mod shutdown_test;
 mod simple_job_test;

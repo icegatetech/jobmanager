@@ -1,11 +1,13 @@
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use crate::{Error, InternalError, JobRegistry, Metrics, Storage, Worker, WorkerConfig};
+use crate::execution::job_cleaner::JobIterationStarted;
+use crate::{Error, InternalError, JobCleaner, JobCleanerConfig, JobRegistry, Metrics, Storage, Worker, WorkerConfig};
 
 /// Configuration for a [`JobsManager`].
 #[derive(Clone)]
@@ -16,6 +18,8 @@ pub struct JobsManagerConfig {
     pub worker_count: usize,
     /// Polling interval, backoff, and retry policy applied by every spawned worker.
     pub worker_config: WorkerConfig,
+    /// Old-iteration cleanup behavior.
+    pub cleaner_config: JobCleanerConfig,
 }
 
 impl Default for JobsManagerConfig {
@@ -23,6 +27,7 @@ impl Default for JobsManagerConfig {
         Self {
             worker_count: 1,
             worker_config: WorkerConfig::default(),
+            cleaner_config: JobCleanerConfig::default(),
         }
     }
 }
@@ -120,6 +125,8 @@ impl JobsManager {
         let cancel_token = CancellationToken::new();
         let mut join_set = JoinSet::new();
 
+        let cleanup_notifier = self.spawn_job_cleaner(&mut join_set, &cancel_token);
+
         // TODO(med): dynamic worker count - reduce workers when there's little work to minimize storage
         // requests
         for i in 0..self.config.worker_count {
@@ -128,6 +135,7 @@ impl JobsManager {
                 Arc::clone(&self.storage),
                 self.config.worker_config.clone(),
                 self.metrics.clone(),
+                cleanup_notifier.clone(),
             );
 
             let token = cancel_token.clone();
@@ -153,6 +161,46 @@ impl JobsManager {
         }
 
         Ok(JobsManagerHandle { cancel_token, join_set })
+    }
+
+    /// Spawns the [`JobCleaner`] into the pool and returns the sender workers report iterations
+    /// through, or `None` when cleanup is disabled.
+    ///
+    /// The cleaner starts without the workers' stagger delay: its start-up reconciliation should
+    /// run before the first iterations arrive. The channel is sized for five passes of every
+    /// worker over every job, so a burst of reports arriving while the start-up reconciliation is
+    /// still running does not push reports out. A cleaner that falls further behind than that has
+    /// its reports dropped by [`Worker`], and the tail they would have trimmed waits for the next
+    /// start-up reconciliation. Every factor is at least 1, so the capacity never reaches the
+    /// value `mpsc::channel` panics on.
+    fn spawn_job_cleaner(
+        &self,
+        join_set: &mut JoinSet<Result<(), InternalError>>,
+        cancel_token: &CancellationToken,
+    ) -> Option<mpsc::Sender<JobIterationStarted>> {
+        if !self.config.cleaner_config.enabled {
+            info!("Job cleaner is disabled: outdated job iterations are kept");
+            return None;
+        }
+
+        let (sender, receiver) = mpsc::channel(self.config.worker_count * self.job_registry.list_jobs().len() * 5);
+        let cleaner = JobCleaner::new(
+            Arc::clone(&self.job_registry),
+            Arc::clone(&self.storage),
+            &self.config.cleaner_config,
+        );
+        let token = cancel_token.clone();
+
+        join_set.spawn(async move {
+            if let Err(e) = cleaner.start(receiver, token).await {
+                error!("Job cleaner stopped with error: {}", e);
+                Err(e)
+            } else {
+                Ok(())
+            }
+        });
+
+        Some(sender)
     }
 }
 

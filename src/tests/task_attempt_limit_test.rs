@@ -36,6 +36,7 @@ fn manager_config() -> JobsManagerConfig {
             max_poll_interval: Duration::from_millis(50),
             ..Default::default()
         },
+        ..Default::default()
     }
 }
 

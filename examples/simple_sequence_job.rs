@@ -88,18 +88,14 @@ async fn run_simple_seq_job() -> Result<(), Error> {
 
     // 2. Initialize S3 Storage
     let storage = S3Storage::new(
-        S3StorageConfig {
-            endpoint: "http://localhost:9000".to_string(),
-            access_key_id: "rustfsadmin".to_string(),
-            secret_access_key: "rustfsadmin".to_string(),
-            bucket_name: "jobs".to_string(),
-            use_ssl: false,
-            region: "us-east-1".to_string(),
-            bucket_prefix: "jobs".to_string(),
-            job_state_codec: JobStateCodecKind::Json,
-            request_timeout: Duration::from_secs(5),
-            retrier_config: RetrierConfig::default(),
-        },
+        S3StorageConfig::new(
+            "http://localhost:9000",
+            "rustfsadmin",
+            "rustfsadmin",
+            "jobs",
+            "us-east-1",
+        )
+        .with_job_state_codec(JobStateCodecKind::Json),
         job_registry.clone(),
         Metrics::new_disabled(),
     )
@@ -114,6 +110,7 @@ async fn run_simple_seq_job() -> Result<(), Error> {
             max_poll_interval: Duration::from_secs(2),
             retrier_config: RetrierConfig::default(),
         },
+        ..Default::default()
     };
 
     let manager = JobsManager::new(

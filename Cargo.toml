@@ -78,3 +78,9 @@ dashmap = "6.1"
 testcontainers = { version = "0.27", features = ["blocking"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tokio = { version = "1.48.0", features = ["rt-multi-thread", "net", "process", "signal"] }
+
+# Serves canned S3 responses to the SDK. A multi-object delete reports per-key failures inside a
+# `200`, and no real store can be made to produce one on demand, so that response is scripted here.
+aws-smithy-http-client = { version = "1.1", features = ["test-util"] }
+aws-smithy-types = "1"
+http = "1"

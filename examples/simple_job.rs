@@ -8,8 +8,8 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use chrono::Duration as ChronoDuration;
 use jobmanager::{
-    Error, JobCode, JobDefinition, JobRegistry, JobStateCodecKind, JobsManager, JobsManagerConfig, Metrics,
-    RetrierConfig, S3Storage, S3StorageConfig, TaskCode, TaskDefinition, TaskExecutorFn,
+    Error, JobCode, JobDefinition, JobRegistry, JobStateCodecKind, JobsManager, JobsManagerConfig, Metrics, S3Storage,
+    S3StorageConfig, TaskCode, TaskDefinition, TaskExecutorFn,
 };
 
 #[allow(dead_code)]
@@ -57,18 +57,15 @@ pub async fn run_simple_job(codec: JobStateCodecKind, bucket_prefix: String) -> 
 
     // 5. Initialize S3 Storage
     let storage = S3Storage::new(
-        S3StorageConfig {
-            endpoint: "http://localhost:9000".to_string(),
-            access_key_id: "rustfsadmin".to_string(),
-            secret_access_key: "rustfsadmin".to_string(),
-            bucket_name: "jobs".to_string(),
-            use_ssl: false,
-            region: "us-east-1".to_string(),
-            bucket_prefix: bucket_prefix.clone(),
-            job_state_codec: codec,
-            request_timeout: Duration::from_secs(5),
-            retrier_config: RetrierConfig::default(),
-        },
+        S3StorageConfig::new(
+            "http://localhost:9000",
+            "rustfsadmin",
+            "rustfsadmin",
+            "jobs",
+            "us-east-1",
+        )
+        .with_bucket_prefix(bucket_prefix)
+        .with_job_state_codec(codec),
         job_registry.clone(),
         Metrics::new_disabled(),
     )

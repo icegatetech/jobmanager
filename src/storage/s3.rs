@@ -4,7 +4,11 @@ use std::{
 };
 
 use aws_config::timeout::TimeoutConfig;
-use aws_sdk_s3::{Client, primitives::ByteStream};
+use aws_sdk_s3::{
+    Client,
+    primitives::ByteStream,
+    types::{Delete, ObjectIdentifier},
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -12,14 +16,31 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::{
-    Error, Job, JobCode, JobDefinitionRegistry, JobMeta, JobStatus, Metrics, Retrier, RetrierConfig, Storage,
-    StorageError, StorageResult, Task, TaskCode, TaskStatus,
+    Error, Job, JobCode, JobDefinitionRegistry, JobMeta, JobStatus, Metrics, Retrier, RetrierConfig, RetryStep,
+    Storage, StorageError, StorageResult, Task, TaskCode, TaskStatus,
+    storage::s3_error::{classify_delete_failures, map_s3_error},
 };
 
-// TODO(low): need mechanism to clean up old job states. Required for iter num restart and reduced storage load
 // TODO(high): add test s3 storage with Toxiproxy for testing network problems (chaos test))
 
 const JOB_STATE_FILE_PREFIX: &str = "state-";
+
+/// Prefix a bucket's job state objects live under unless overridden.
+const DEFAULT_BUCKET_PREFIX: &str = "jobs";
+
+/// Timeout of a single S3 operation unless overridden.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Keys requested per `LIST` page while scanning a job's outdated iterations. 1000 is the maximum
+/// a single `ListObjectsV2` response can carry, so the common empty-tail scan costs one request.
+/// Being the protocol maximum, it doubles as the upper bound
+/// [`S3StorageConfig::with_list_page_size`] accepts.
+const DEFAULT_LIST_PAGE_SIZE: i32 = 1000;
+
+/// Keys sent per multi-object delete request; 1000 is the maximum `DeleteObjects` accepts. Being
+/// the protocol maximum, it doubles as the upper bound
+/// [`S3StorageConfig::with_delete_batch_size`] accepts.
+const DEFAULT_DELETE_BATCH_SIZE: usize = 1000;
 
 trait JobStateCodec: Send + Sync {
     fn file_extension(&self) -> &'static str;
@@ -138,30 +159,113 @@ struct JobJson {
 }
 
 /// Configuration for connecting [`S3Storage`] to a bucket.
+///
+/// Build with [`S3StorageConfig::new`] and override the optional parts with the `with_*` methods.
 pub struct S3StorageConfig {
-    /// S3 endpoint URL.
-    pub endpoint: String,
-    /// Access key ID for S3.
-    pub access_key_id: String,
-    /// Secret access key for S3.
-    pub secret_access_key: String,
-    /// Bucket name for job state.
-    pub bucket_name: String,
-    /// Unused: the scheme comes from `endpoint`, and nothing reads this field.
+    endpoint: String,
+    access_key_id: String,
+    secret_access_key: String,
+    bucket_name: String,
+    region: String,
+    bucket_prefix: String,
+    job_state_codec: JobStateCodecKind,
+    request_timeout: Duration,
+    retrier_config: RetrierConfig,
+    list_page_size: i32,
+    delete_batch_size: usize,
+}
+
+impl S3StorageConfig {
+    /// Connection details of the bucket holding job state. Everything else takes a default that
+    /// the `with_*` methods override.
     ///
-    /// Setting it to `true` does **not** turn on TLS — pass an `https://` endpoint instead.
-    // TODO(med): remove this field; it only misleads callers into thinking TLS is configurable here.
-    pub use_ssl: bool,
-    /// AWS region name.
-    pub region: String,
-    /// Prefix for job state objects.
-    pub bucket_prefix: String,
-    /// Job state serialization codec.
-    pub job_state_codec: JobStateCodecKind,
-    /// Request timeout for S3 operations.
-    pub request_timeout: Duration,
-    /// Retry policy configuration.
-    pub retrier_config: RetrierConfig,
+    /// Pass an `https://` endpoint to use TLS - there is no separate switch for it.
+    pub fn new(
+        endpoint: impl Into<String>,
+        access_key_id: impl Into<String>,
+        secret_access_key: impl Into<String>,
+        bucket_name: impl Into<String>,
+        region: impl Into<String>,
+    ) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            access_key_id: access_key_id.into(),
+            secret_access_key: secret_access_key.into(),
+            bucket_name: bucket_name.into(),
+            region: region.into(),
+            bucket_prefix: DEFAULT_BUCKET_PREFIX.to_string(),
+            job_state_codec: JobStateCodecKind::Json,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            retrier_config: RetrierConfig::default(),
+            list_page_size: DEFAULT_LIST_PAGE_SIZE,
+            delete_batch_size: DEFAULT_DELETE_BATCH_SIZE,
+        }
+    }
+
+    /// Prefix every job's state objects live under. Defaults to `jobs`.
+    #[must_use]
+    pub fn with_bucket_prefix(mut self, bucket_prefix: impl Into<String>) -> Self {
+        self.bucket_prefix = bucket_prefix.into();
+        self
+    }
+
+    /// Serialization format of persisted job state. Defaults to [`JobStateCodecKind::Json`].
+    ///
+    /// Changing this on a bucket that already holds state leaves the previously written objects
+    /// unreadable *and* invisible to cleanup - see [`JobStateCodecKind`].
+    #[must_use]
+    pub const fn with_job_state_codec(mut self, job_state_codec: JobStateCodecKind) -> Self {
+        self.job_state_codec = job_state_codec;
+        self
+    }
+
+    /// Timeout applied to a single S3 operation and to each of its attempts. Defaults to 5s.
+    #[must_use]
+    pub const fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = request_timeout;
+        self
+    }
+
+    /// Retry policy of the storage operations that retry internally. Defaults to
+    /// [`RetrierConfig::default`].
+    #[must_use]
+    pub fn with_retrier_config(mut self, retrier_config: RetrierConfig) -> Self {
+        self.retrier_config = retrier_config;
+        self
+    }
+
+    /// Keys one cleanup `LIST` asks for. Defaults to 1000, which is the maximum a single
+    /// `ListObjectsV2` response carries; lower it only to bound the size of a single response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Other`] outside `1..=1000`.
+    pub fn with_list_page_size(mut self, list_page_size: i32) -> Result<Self, Error> {
+        if !(1..=DEFAULT_LIST_PAGE_SIZE).contains(&list_page_size) {
+            return Err(Error::Other(format!(
+                "s3 list page size must be within 1..={DEFAULT_LIST_PAGE_SIZE}"
+            )));
+        }
+        self.list_page_size = list_page_size;
+        Ok(self)
+    }
+
+    /// Keys one multi-object delete carries. Defaults to 1000, the maximum `DeleteObjects`
+    /// accepts on AWS; lower it for a backend whose limit is smaller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Other`] outside `1..=1000`. Zero would make cleanup split its work into
+    /// empty chunks and panic.
+    pub fn with_delete_batch_size(mut self, delete_batch_size: usize) -> Result<Self, Error> {
+        if !(1..=DEFAULT_DELETE_BATCH_SIZE).contains(&delete_batch_size) {
+            return Err(Error::Other(format!(
+                "s3 delete batch size must be within 1..={DEFAULT_DELETE_BATCH_SIZE}"
+            )));
+        }
+        self.delete_batch_size = delete_batch_size;
+        Ok(self)
+    }
 }
 
 /// S3-backed `Storage`: each job's state is one object.
@@ -177,6 +281,8 @@ pub struct S3Storage {
     registry: Arc<dyn JobDefinitionRegistry>,
     retrier: Retrier,
     metrics: Metrics,
+    list_page_size: i32,
+    delete_batch_size: usize,
 }
 
 impl S3Storage {
@@ -241,24 +347,24 @@ impl S3Storage {
                         match client.head_bucket().bucket(&bucket_name).send().await {
                             Ok(_) => {
                                 info!("Bucket {} exists", bucket_name);
-                                Ok((false, ()))
+                                Ok(RetryStep::Done(()))
                             }
                             Err(aws_sdk_s3::error::SdkError::ServiceError(se)) if se.raw().status().as_u16() == 404 => {
                                 match client.create_bucket().bucket(&bucket_name).send().await {
                                     Ok(_) => {
                                         info!("Created bucket {}", bucket_name);
-                                        Ok((false, ()))
+                                        Ok(RetryStep::Done(()))
                                     }
                                     Err(aws_sdk_s3::error::SdkError::ServiceError(se))
                                         if se.raw().status().as_u16() == 409 =>
                                     {
                                         info!("Bucket {} already exists", bucket_name);
-                                        Ok((false, ()))
+                                        Ok(RetryStep::Done(()))
                                     }
                                     Err(e) => {
-                                        let mapped = Self::map_s3_error(&e);
+                                        let mapped = map_s3_error(&e);
                                         if mapped.is_retryable() {
-                                            Ok((true, ()))
+                                            Ok(RetryStep::Retry(mapped))
                                         } else {
                                             Err(mapped)
                                         }
@@ -266,9 +372,9 @@ impl S3Storage {
                                 }
                             }
                             Err(e) => {
-                                let mapped = Self::map_s3_error(&e);
+                                let mapped = map_s3_error(&e);
                                 if mapped.is_retryable() {
-                                    Ok((true, ()))
+                                    Ok(RetryStep::Retry(mapped))
                                 } else {
                                     Err(mapped)
                                 }
@@ -289,6 +395,8 @@ impl S3Storage {
             registry,
             retrier,
             metrics,
+            list_page_size: config.list_page_size,
+            delete_batch_size: config.delete_batch_size,
         })
     }
 
@@ -305,29 +413,13 @@ impl S3Storage {
         self.metrics.record_s3_operation(operation, &status, start.elapsed());
     }
 
-    fn map_s3_error<E: std::fmt::Debug>(err: &aws_sdk_s3::error::SdkError<E>) -> StorageError {
-        // TODO(med): add job context to errors
-        match err {
-            aws_sdk_s3::error::SdkError::ServiceError(service_err) => {
-                let status = service_err.raw().status().as_u16();
-                let details = err.to_string();
-                match status {
-                    401 | 403 => StorageError::Auth(details),
-                    404 => StorageError::NotFound(details),
-                    408 => StorageError::Timeout,
-                    412 => StorageError::ConcurrentModification(details),
-                    429 => StorageError::RateLimited,
-                    500 | 502 | 503 | 504 => StorageError::ServiceUnavailable,
-                    _ => StorageError::S3(format!("S3 SDK error: {err:?}")),
-                }
-            }
-            aws_sdk_s3::error::SdkError::TimeoutError(_) => StorageError::Timeout,
-            aws_sdk_s3::error::SdkError::DispatchFailure(_) => {
-                // Network/connection errors are transient and should be retried.
-                StorageError::ServiceUnavailable
-            }
-            _ => StorageError::S3(format!("S3 SDK error: {err:?}")),
-        }
+    /// Records an operation whose request succeeded but whose response turned out to be a failure:
+    /// a body that could not be read, or one reporting per-key errors.
+    ///
+    /// Such a failure has no HTTP status of its own - the status was `200` - so it is labelled
+    /// `ERR` rather than a code that would read as if the request itself had failed.
+    fn record_s3_response_failure(&self, operation: &str, start: Instant) {
+        self.metrics.record_s3_operation(operation, "ERR", start.elapsed());
     }
 
     fn build_job_path(&self, job_code: &JobCode) -> String {
@@ -504,7 +596,7 @@ impl S3Storage {
             }
             Err(e) => {
                 self.record_s3_err("PUT", &e, start);
-                Err(Self::map_s3_error(&e))
+                Err(map_s3_error(&e))
             }
         }
     }
@@ -536,9 +628,72 @@ impl S3Storage {
             }
             Err(e) => {
                 self.record_s3_err("PUT", &e, start);
-                Err(Self::map_s3_error(&e))
+                Err(map_s3_error(&e))
             }
         }
+    }
+
+    /// Deletes one state object. `DELETE` answers 204 for a key that is already gone, which is
+    /// what makes iteration cleanup idempotent.
+    async fn delete_state_object(&self, key: &str) -> StorageResult<()> {
+        let start = Instant::now();
+        match self.client.delete_object().bucket(&self.bucket_name).key(key).send().await {
+            Ok(_) => {
+                self.record_s3_ok("DELETE", start);
+                Ok(())
+            }
+            Err(e) => {
+                self.record_s3_err("DELETE", &e, start);
+                Err(map_s3_error(&e))
+            }
+        }
+    }
+
+    /// Deletes up to `delete_batch_size` state objects in one request.
+    ///
+    /// A multi-object delete reports per-key failures inside a `200` response, so the request only
+    /// counts as successful once the body reports no failure - both for the returned result and for
+    /// the metric the request is recorded under. Any reported failure is an error, including one
+    /// whose entry carries no key; whether it is retryable is decided by
+    /// [`classify_delete_failures`].
+    async fn delete_state_objects(&self, keys: &[String]) -> StorageResult<()> {
+        let mut objects = Vec::with_capacity(keys.len());
+        for key in keys {
+            objects.push(
+                ObjectIdentifier::builder()
+                    .key(key)
+                    .build()
+                    .map_err(|e| StorageError::Other(format!("Failed to build delete entry for {key}: {e}")))?,
+            );
+        }
+        let delete = Delete::builder()
+            .set_objects(Some(objects))
+            .build()
+            .map_err(|e| StorageError::Other(format!("Failed to build delete request: {e}")))?;
+
+        let start = Instant::now();
+        let output = match self
+            .client
+            .delete_objects()
+            .bucket(&self.bucket_name)
+            .delete(delete)
+            .send()
+            .await
+        {
+            Ok(output) => output,
+            Err(e) => {
+                self.record_s3_err("DELETE", &e, start);
+                return Err(map_s3_error(&e));
+            }
+        };
+
+        let Some(failure) = classify_delete_failures(output.errors()) else {
+            self.record_s3_ok("DELETE", start);
+            return Ok(());
+        };
+
+        self.record_s3_response_failure("DELETE", start);
+        Err(failure)
     }
 
     fn normalize_etag(etag: &str) -> String {
@@ -558,25 +713,22 @@ impl Storage for S3Storage {
         // But if job has few tasks, we'll miss often and make extra requests
 
         let job_code_for_retry = job_code.clone();
-        let job_opt = self
-            .retrier
+        self.retrier
             .retry(
                 move || {
                     let job_code = job_code_for_retry.clone();
                     async move {
                         let job_meta = self.find_job_meta(&job_code, cancel_token).await?;
                         match self.get_job_by_meta(&job_meta, cancel_token).await {
-                            Ok(job) => Ok((false, Some(job))),
-                            Err(e) if e.is_retryable() || e.is_conflict() => Ok((true, None)),
+                            Ok(job) => Ok(RetryStep::Done(job)),
+                            Err(e) if e.is_retryable() || e.is_conflict() => Ok(RetryStep::Retry(e)),
                             Err(e) => Err(e),
                         }
                     }
                 },
                 cancel_token,
             )
-            .await?;
-
-        job_opt.ok_or_else(|| StorageError::Other("retry finished without job".into()))
+            .await
     }
 
     #[tracing::instrument(skip(self, cancel_token), fields(job_version = %job_meta.version))]
@@ -600,7 +752,7 @@ impl Storage for S3Storage {
             Ok(output) => output,
             Err(e) => {
                 self.record_s3_err("GET", &e, start);
-                return Err(Self::map_s3_error(&e));
+                return Err(map_s3_error(&e));
             }
         };
 
@@ -609,7 +761,7 @@ impl Storage for S3Storage {
             .collect()
             .await
             .map_err(|e| {
-                self.metrics.record_s3_operation("GET", "ERR", start.elapsed());
+                self.record_s3_response_failure("GET", start);
                 StorageError::S3(format!("Failed to read job body: {e}"))
             })?
             .into_bytes();
@@ -644,7 +796,7 @@ impl Storage for S3Storage {
             }
             Err(e) => {
                 self.record_s3_err("LIST", &e, start);
-                return Err(Self::map_s3_error(&e));
+                return Err(map_s3_error(&e));
             }
         };
 
@@ -709,8 +861,8 @@ impl Storage for S3Storage {
                         };
 
                         match result {
-                            Ok(etag) => Ok((false, etag)),
-                            Err(e) if e.is_retryable() => Ok((true, None)),
+                            Ok(etag) => Ok(RetryStep::Done(etag)),
+                            Err(e) if e.is_retryable() => Ok(RetryStep::Retry(e)),
                             Err(e) => Err(e),
                         }
                     }
@@ -739,5 +891,285 @@ impl Storage for S3Storage {
         );
 
         Ok(())
+    }
+
+    #[tracing::instrument(skip(self, cancel_token), fields(job_code = %job_code))]
+    async fn list_job_outdated_iterations(
+        &self,
+        job_code: &JobCode,
+        retention_boundary: u64,
+        cancel_token: &CancellationToken,
+    ) -> StorageResult<Vec<u64>> {
+        if cancel_token.is_cancelled() {
+            return Err(StorageError::Cancelled);
+        }
+
+        let prefix = self.build_job_path(job_code);
+        // Names carry the inverted iteration number, so the ascending key order is descending
+        // iteration order: everything at or below the boundary sits after the key of the oldest
+        // iteration that must be kept.
+        let oldest_kept_iter_num = retention_boundary.checked_add(1).ok_or_else(|| {
+            StorageError::Other(format!("Retention boundary {retention_boundary} has no next iteration"))
+        })?;
+        let start_after = self.build_state_path(job_code, oldest_kept_iter_num);
+
+        let mut outdated_iter_nums = Vec::new();
+        let mut continuation_token: Option<String> = None;
+
+        loop {
+            if cancel_token.is_cancelled() {
+                return Err(StorageError::Cancelled);
+            }
+
+            let start = Instant::now();
+            let result = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket_name)
+                .prefix(&prefix)
+                .start_after(start_after.as_str())
+                .max_keys(self.list_page_size)
+                .set_continuation_token(continuation_token)
+                .send()
+                .await;
+
+            let output = match result {
+                Ok(output) => {
+                    self.record_s3_ok("LIST", start);
+                    output
+                }
+                Err(e) => {
+                    self.record_s3_err("LIST", &e, start);
+                    return Err(map_s3_error(&e));
+                }
+            };
+
+            for object in output.contents() {
+                let Some(key) = object.key() else { continue };
+                match self.parse_iter_num_from_path(key) {
+                    Ok(iter_num) if iter_num <= retention_boundary => outdated_iter_nums.push(iter_num),
+                    // Reached only by a backend that ignores `start_after`. Dropping the key here
+                    // is what keeps the newest state object undeletable even then.
+                    Ok(iter_num) => debug!("Skipping iteration {iter_num} above retention boundary of job {job_code}"),
+                    Err(e) => debug!("Skipping object {key} that is not a state of the current codec: {e}"),
+                }
+            }
+
+            continuation_token = output.next_continuation_token().map(ToString::to_string);
+            if continuation_token.is_none() {
+                return Ok(outdated_iter_nums);
+            }
+        }
+    }
+
+    #[tracing::instrument(skip(self, cancel_token), fields(job_code = %job_code, iterations = iter_nums.len()))]
+    async fn delete_job_iterations(
+        &self,
+        job_code: &JobCode,
+        iter_nums: &[u64],
+        cancel_token: &CancellationToken,
+    ) -> StorageResult<()> {
+        if cancel_token.is_cancelled() {
+            return Err(StorageError::Cancelled);
+        }
+        if iter_nums.is_empty() {
+            return Ok(());
+        }
+
+        // The steady-state case is a single iteration falling out of the retention window, and a
+        // single-object DELETE is free at every provider, while a multi-object one is not.
+        if let [iter_num] = iter_nums {
+            return self.delete_state_object(&self.build_state_path(job_code, *iter_num)).await;
+        }
+
+        for chunk in iter_nums.chunks(self.delete_batch_size) {
+            if cancel_token.is_cancelled() {
+                return Err(StorageError::Cancelled);
+            }
+            let keys: Vec<String> = chunk
+                .iter()
+                .map(|iter_num| self.build_state_path(job_code, *iter_num))
+                .collect();
+            self.delete_state_objects(&keys).await?;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region, retry::RetryConfig};
+    use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
+    use aws_smithy_types::body::SdkBody;
+
+    use super::*;
+    use crate::JobDefinition;
+
+    fn build_config() -> S3StorageConfig {
+        S3StorageConfig::new("http://localhost:9000", "key", "secret", "jobs", "us-east-1")
+    }
+
+    /// Registry double for the delete path, which never resolves a job definition: reaching for one
+    /// is a defect, so it fails instead of returning something plausible.
+    struct UnusedJobRegistry;
+
+    impl JobDefinitionRegistry for UnusedJobRegistry {
+        fn get_job(&self, code: &JobCode) -> Result<JobDefinition, Error> {
+            Err(Error::Other(format!(
+                "a delete must not need the definition of job {code}"
+            )))
+        }
+    }
+
+    /// Builds a storage whose S3 client answers with `response`.
+    ///
+    /// Constructed field by field rather than through [`S3Storage::new`], which reaches a real
+    /// endpoint to check the bucket and builds a client of its own; there is no other seam for a
+    /// canned response, and adding one to the production configuration for a test would be a
+    /// second way to configure the same thing.
+    fn build_storage_answering(response: http::Response<SdkBody>) -> S3Storage {
+        let request = http::Request::builder()
+            .uri("http://localhost:9000/jobs")
+            .body(SdkBody::empty())
+            .expect("the scripted request must build");
+        let http_client = StaticReplayClient::new(vec![ReplayEvent::new(request, response)]);
+
+        let s3_config = aws_sdk_s3::config::Builder::new()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("key", "secret", None, None, "static"))
+            .endpoint_url("http://localhost:9000")
+            .force_path_style(true)
+            .http_client(http_client)
+            // The retry budget under test is the cleaner's; an SDK-level retry would spend requests
+            // the request quota of this crate does not account for.
+            .retry_config(RetryConfig::disabled())
+            .build();
+
+        S3Storage {
+            client: Client::from_conf(s3_config),
+            bucket_name: "jobs".to_string(),
+            bucket_prefix: DEFAULT_BUCKET_PREFIX.to_string(),
+            codec: JobStateCodecKind::Json.build(),
+            registry: Arc::new(UnusedJobRegistry),
+            retrier: Retrier::new(RetrierConfig::default()),
+            metrics: Metrics::new_disabled(),
+            list_page_size: DEFAULT_LIST_PAGE_SIZE,
+            delete_batch_size: DEFAULT_DELETE_BATCH_SIZE,
+        }
+    }
+
+    /// The `200` a multi-object delete answers with when it deleted one key and could not delete
+    /// the other, as documented for `DeleteObjects`.
+    fn build_delete_response(failure: Option<&str>) -> http::Response<SdkBody> {
+        let failure_element = failure.map_or_else(String::new, |code| {
+            format!(
+                "<Error><Key>jobs/job/state-00000000000000000002.json</Key><Code>{code}</Code>\
+                 <Message>scripted failure</Message></Error>"
+            )
+        });
+        let body = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <Deleted><Key>jobs/job/state-00000000000000000001.json</Key></Deleted>\
+             {failure_element}</DeleteResult>"
+        );
+
+        http::Response::builder()
+            .status(200)
+            .header("content-type", "application/xml")
+            .body(SdkBody::from(body))
+            .expect("the scripted response must build")
+    }
+
+    fn build_deleted_keys() -> Vec<String> {
+        vec![
+            "jobs/job/state-00000000000000000001.json".to_string(),
+            "jobs/job/state-00000000000000000002.json".to_string(),
+        ]
+    }
+
+    /// A per-key failure arrives inside a `200`, so nothing but the parsed body distinguishes this
+    /// from a clean delete - and a transient one has to come back retryable for the cleaner to
+    /// retry it at all.
+    #[tokio::test]
+    async fn test_multi_object_delete_reporting_a_transient_failure_returns_a_retryable_error() {
+        let storage = build_storage_answering(build_delete_response(Some("SlowDown")));
+
+        let error = storage
+            .delete_state_objects(&build_deleted_keys())
+            .await
+            .expect_err("a body reporting a failed key must not be reported as success");
+
+        assert!(
+            matches!(error, StorageError::RateLimited),
+            "a throttled key must reach the caller as the rate-limit error, got: {error:?}"
+        );
+        assert!(error.is_retryable(), "a throttled key must be retried");
+    }
+
+    #[tokio::test]
+    async fn test_multi_object_delete_reporting_a_permanent_failure_returns_a_non_retryable_error() {
+        let storage = build_storage_answering(build_delete_response(Some("AccessDenied")));
+
+        let error = storage
+            .delete_state_objects(&build_deleted_keys())
+            .await
+            .expect_err("a body reporting a failed key must not be reported as success");
+
+        assert!(!error.is_retryable(), "a rejected key must be attempted exactly once");
+    }
+
+    #[tokio::test]
+    async fn test_multi_object_delete_without_reported_failures_succeeds() {
+        let storage = build_storage_answering(build_delete_response(None));
+
+        storage
+            .delete_state_objects(&build_deleted_keys())
+            .await
+            .expect("a body reporting no failure is a successful delete");
+    }
+
+    #[test]
+    fn test_delete_batch_size_of_zero_is_rejected() {
+        assert!(build_config().with_delete_batch_size(0).is_err());
+    }
+
+    #[test]
+    fn test_delete_batch_size_above_the_protocol_maximum_is_rejected() {
+        assert!(build_config().with_delete_batch_size(1001).is_err());
+    }
+
+    #[test]
+    fn test_list_page_size_below_one_is_rejected() {
+        assert!(build_config().with_list_page_size(0).is_err());
+    }
+
+    #[test]
+    fn test_list_page_size_above_the_protocol_maximum_is_rejected() {
+        assert!(build_config().with_list_page_size(1001).is_err());
+    }
+
+    #[test]
+    fn test_delete_batch_size_at_the_accepted_bounds_is_applied() {
+        let lowest = build_config()
+            .with_delete_batch_size(1)
+            .expect("1 is inside the accepted range");
+        let highest = build_config()
+            .with_delete_batch_size(1000)
+            .expect("1000 is the protocol maximum");
+
+        assert_eq!(lowest.delete_batch_size, 1);
+        assert_eq!(highest.delete_batch_size, 1000);
+    }
+
+    #[test]
+    fn test_list_page_size_at_the_accepted_bounds_is_applied() {
+        let lowest = build_config().with_list_page_size(1).expect("1 is inside the accepted range");
+        let highest = build_config().with_list_page_size(1000).expect("1000 is the protocol maximum");
+
+        assert_eq!(lowest.list_page_size, 1);
+        assert_eq!(highest.list_page_size, 1000);
     }
 }

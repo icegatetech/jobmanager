@@ -39,6 +39,7 @@ fn start_returns_error_when_worker_count_is_zero() -> Result<(), Box<dyn std::er
         JobsManagerConfig {
             worker_count: 0,
             worker_config: WorkerConfig::default(),
+            ..Default::default()
         },
         job_registry,
         Metrics::new_disabled(),
@@ -100,6 +101,7 @@ async fn test_shutdown_cancels_executor() -> Result<(), Box<dyn std::error::Erro
                 poll_interval_randomization: Duration::from_millis(0),
                 ..Default::default()
             },
+            ..Default::default()
         },
         job_registry,
         Metrics::new_disabled(),

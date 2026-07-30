@@ -39,10 +39,29 @@ changed behavior -> possible failure -> test layer -> concrete test
 ```
 
 - Every changed branch and error path is covered, or its omission is justified.
+- A test MUST fail when the behavior it protects is broken — check by breaking that behavior
+  deliberately. A test that stays green either asserts the implementation back to itself or never
+  reached the case. This applies to every test, not only to the regression test below.
 - Every bug fix carries a regression test that fails without the fix.
-- Boundaries get all three cases — below, at, above: attempt budget, payload limits, iteration
-  limit, deadline.
+- A boundary is any input with an ordered domain or a limit, not only the ones named here. Each gets
+  all three cases — below, at, above: attempt budget, payload limits, iteration limit, deadline.
 - A behavior-preserving refactor needs no new tests, but the existing coverage must be identified.
+
+## Cases
+
+The areas listed below represent a minimum set, not an exhaustive list.
+
+- List all possible areas of change and define the extreme values for each one. A scenario should be recorded
+  if you cannot name a reason why it could not occur in a production environment; branch coverage is
+  a subsequent check for completeness, but by no means a source of scenarios.
+- Degenerate input data: an empty set, a single element, duplicates, zero.
+- Time: before, exactly at the moment, after; a clock running backward; a zero-time interval.
+- Failure point: any step where an I/O failure could occur—before a write, after a write, a response that was
+  lost, or between two writes.
+- Concurrency: the object changes between read and write operations.
+- Restart: the process terminates at any point between saves.
+- Saved format: an object saved by a different version or in a different format.
+- The categories listed above represent a minimum set and are not an exhaustive list.
 
 ## Concurrency
 
@@ -60,6 +79,9 @@ changed behavior -> possible failure -> test layer -> concrete test
 - Expected values come from the documented contract or are stated literally — never computed by the
   code under test or by its helpers. Do not derive an expected object key from the key builder.
 - Arrange code may use production builders; assertions about the result stay independent of them.
+- The number of requests sent to Object Storage is **critical**. Many providers charge for each
+  request. Therefore, for each method, the storage component **must** track how many requests are sent to S3. A request
+  quota must be specified for each method (based on the task requirements). Any increase in the quota must be approved.
 - Prove the fixture reaches the condition under test when that is not obvious: that a deadline really
   expired, that a budget is really spent, that two workers really contended.
 - Assert counts or non-emptiness before inspecting results — never guard an assertion behind

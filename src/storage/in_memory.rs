@@ -106,4 +106,30 @@ impl Storage for InMemoryStorage {
         *self.job.write().await = Some(job.clone());
         Ok(())
     }
+
+    /// Always empty: only the current iteration is held, so no iteration is ever outdated.
+    async fn list_job_outdated_iterations(
+        &self,
+        _job_code: &JobCode,
+        _retention_boundary: u64,
+        cancel_token: &CancellationToken,
+    ) -> StorageResult<Vec<u64>> {
+        if cancel_token.is_cancelled() {
+            return Err(StorageError::Cancelled);
+        }
+        Ok(Vec::new())
+    }
+
+    /// No-op: there is no iteration history to delete from.
+    async fn delete_job_iterations(
+        &self,
+        _job_code: &JobCode,
+        _iter_nums: &[u64],
+        cancel_token: &CancellationToken,
+    ) -> StorageResult<()> {
+        if cancel_token.is_cancelled() {
+            return Err(StorageError::Cancelled);
+        }
+        Ok(())
+    }
 }

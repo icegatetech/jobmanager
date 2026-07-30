@@ -150,6 +150,19 @@ impl Default for TaskLimits {
     }
 }
 
+/// Number of most recent iterations of a job kept in storage.
+///
+/// Sized so an operator can still inspect the recent history of a job while the tail of a
+/// long-running job does not grow without bound. Override per job with
+/// [`JobDefinition::with_iteration_retention`].
+pub const DEFAULT_ITERATION_RETENTION: u64 = 100;
+
+/// Smallest accepted [`JobDefinition::with_iteration_retention`] value.
+///
+/// A retention window has to stay wider than the gap a worker can lag behind the current
+/// iteration; see the builder's doc comment for what a too-narrow window costs.
+const MIN_ITERATION_RETENTION: u64 = 5;
+
 /// Immutable job definition with initial tasks and executors.
 #[derive(Clone)]
 pub struct JobDefinition {
@@ -159,6 +172,7 @@ pub struct JobDefinition {
     max_iterations: Option<u64>, // None = unlimited
     iteration_interval: Option<Duration>,
     task_limits: TaskLimits,
+    iteration_retention: u64,
 }
 
 impl JobDefinition {
@@ -201,6 +215,7 @@ impl JobDefinition {
             max_iterations: None,
             iteration_interval: None,
             task_limits: TaskLimits::default(),
+            iteration_retention: DEFAULT_ITERATION_RETENTION,
         })
     }
 
@@ -242,6 +257,20 @@ impl JobDefinition {
         self.task_limits
     }
 
+    /// Newest iteration number of this job that may be deleted while its current iteration is
+    /// `iter_num`, or `None` when the retention window still covers the whole history.
+    ///
+    /// `iter_num` is the domain iteration number - 1, 2, 3, … - not a storage key. The inverted
+    /// numbering that makes the current iteration findable in one `LIST` belongs to `S3Storage`
+    /// and never reaches this rule.
+    pub const fn calculate_retention_boundary(&self, iter_num: u64) -> Option<u64> {
+        match iter_num.checked_sub(self.iteration_retention) {
+            // Iteration numbers start at 1, so a zero boundary names nothing deletable.
+            None | Some(0) => None,
+            Some(retention_boundary) => Some(retention_boundary),
+        }
+    }
+
     /// Caps the number of iterations; once reached, the job is no longer polled.
     ///
     /// The count includes the first iteration, so `1` means the job runs exactly once. The limit
@@ -256,6 +285,31 @@ impl JobDefinition {
             return Err(Error::Other("job max iterations must be positive".into()));
         }
         self.max_iterations = Some(max_iterations);
+        Ok(self)
+    }
+
+    /// Keeps only the given number of most recent iterations of the job in storage; older ones
+    /// are deleted in the background. Defaults to [`DEFAULT_ITERATION_RETENTION`].
+    ///
+    /// Like [`TaskLimits`], the value is not persisted with the job state but re-read from the
+    /// definition, so changing it in code also applies to jobs that already exist in storage.
+    ///
+    /// The floor is 5, not 1, because deletion races with workers rather than excluding them: a
+    /// worker that read the job's metadata before an iteration finished may still write its own
+    /// iteration afterwards, and a conditional create cannot tell "never existed" from "existed
+    /// and was deleted". With a narrow window that write recreates an already-deleted iteration,
+    /// which then carries a duplicate copy of the initial tasks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Other`] if `iteration_retention` is below 5.
+    pub fn with_iteration_retention(mut self, iteration_retention: u64) -> Result<Self, Error> {
+        if iteration_retention < MIN_ITERATION_RETENTION {
+            return Err(Error::Other(format!(
+                "job iteration retention must be at least {MIN_ITERATION_RETENTION}"
+            )));
+        }
+        self.iteration_retention = iteration_retention;
         Ok(self)
     }
 
@@ -291,7 +345,7 @@ pub(crate) struct Job {
     // TODO(low): make UUID as microtype (different for job, task)
     id: Uuid,
     code: JobCode,
-    iter_num: u64,
+    iter_num: u64, // for every new job start, the value increases
     status: JobStatus,
     tasks_by_id: HashMap<Uuid, Arc<Task>>, // Arc makes cloning cheap - only pointer is cloned
     updated_by_worker_id: Uuid,
@@ -2699,6 +2753,9 @@ mod tests {
 
         assert_eq!(job_def.max_iterations(), None);
         assert_eq!(job_def.iteration_interval(), None);
+        // Retention of 100 is what makes iteration 101 the first one with anything to delete.
+        assert_eq!(job_def.calculate_retention_boundary(100), None);
+        assert_eq!(job_def.calculate_retention_boundary(101), Some(1));
         assert_eq!(
             job_def.task_limits().max_input_bytes,
             TaskLimits::default().max_input_bytes
@@ -2747,6 +2804,55 @@ mod tests {
 
         let result = job_def.with_max_iterations(0);
         assert!(matches!(result, Err(Error::Other(_))));
+    }
+
+    #[test]
+    fn test_job_definition_with_iteration_retention_rejects_below_floor_and_applies_accepted_values() {
+        let mut executors = HashMap::new();
+        let executor: crate::TaskExecutorFn = Arc::new(|_, _, _| Box::pin(async { Ok(()) }));
+        executors.insert(TaskCode::new("noop"), executor);
+        let task_def = TaskDefinition::new(TaskCode::new("noop"), Vec::new(), Duration::seconds(5)).unwrap();
+        let job_def = JobDefinition::new(JobCode::new("job"), vec![task_def], executors).unwrap();
+
+        let below = job_def.clone().with_iteration_retention(4);
+        assert!(matches!(below, Err(Error::Other(_))));
+
+        assert!(job_def.clone().with_iteration_retention(5).is_ok());
+
+        // The boundary tests below all build their definition with a window of 5, so this is the
+        // only place where an accepted argument other than the floor is proven to be applied at
+        // all: an ignored argument would leave the default window of 100 and yield `None` here.
+        let above_floor = job_def.with_iteration_retention(7).unwrap();
+        assert_eq!(above_floor.calculate_retention_boundary(8), Some(1));
+    }
+
+    fn build_job_definition_for_retention(iteration_retention: u64) -> JobDefinition {
+        let mut executors = HashMap::new();
+        let executor: crate::TaskExecutorFn = Arc::new(|_, _, _| Box::pin(async { Ok(()) }));
+        executors.insert(TaskCode::new("noop"), executor);
+        let task_def = TaskDefinition::new(TaskCode::new("noop"), Vec::new(), Duration::seconds(5)).unwrap();
+
+        JobDefinition::new(JobCode::new("job"), vec![task_def], executors)
+            .unwrap()
+            .with_iteration_retention(iteration_retention)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_retention_boundary_is_absent_while_the_window_covers_the_whole_history() {
+        let job_def = build_job_definition_for_retention(5);
+
+        assert_eq!(job_def.calculate_retention_boundary(4), None);
+        assert_eq!(job_def.calculate_retention_boundary(5), None);
+    }
+
+    #[test]
+    fn test_retention_boundary_is_the_newest_iteration_outside_the_window() {
+        let job_def = build_job_definition_for_retention(5);
+
+        assert_eq!(job_def.calculate_retention_boundary(6), Some(1));
+        assert_eq!(job_def.calculate_retention_boundary(106), Some(101));
+        assert_eq!(job_def.calculate_retention_boundary(u64::MAX), Some(u64::MAX - 5));
     }
 
     #[test]

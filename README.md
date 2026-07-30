@@ -33,6 +33,16 @@ it is never picked up again, tasks blocked behind it never run, and the job iter
 failed. That is not the end of the job — the next iteration starts on its normal schedule and is
 planned from scratch, so a permanently failing task delays work instead of blocking it forever.
 
+Old iterations do not pile up: each job keeps its most recent ones — 100 by default, set per job
+with `JobDefinition::with_iteration_retention` — and the rest are deleted in the background as new
+iterations start, plus one sweep per job at start-up that picks up whatever earlier runs left
+behind. Turn it off with `JobsManagerConfig::cleaner_config`. Only jobs in the `JobRegistry` are
+cleaned, so renaming a job's code leaves its old state under the previous prefix for you to delete.
+Switching `JobStateCodecKind` on a bucket that already holds state leaves everything written under
+the previous codec in place: those objects are no longer recognized as iterations, so delete them
+yourself. Cleanup is best-effort by design — a sweep that is dropped or fails leaves the tail in
+place until the next start-up and never delays, blocks, or fails an iteration.
+
 ## Quick start
 
 Bring up an S3-compatible store:

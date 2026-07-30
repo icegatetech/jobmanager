@@ -17,6 +17,10 @@ pub struct CountingStorage {
     put_attempts: AtomicU64,
     put_successes: AtomicU64,
     list_and_get_successes: AtomicU64,
+    find_meta_calls: AtomicU64,
+    list_outdated_calls: AtomicU64,
+    delete_iterations_calls: AtomicU64,
+    deleted_iterations_total: AtomicU64,
 }
 
 impl CountingStorage {
@@ -26,6 +30,10 @@ impl CountingStorage {
             put_attempts: AtomicU64::new(0),
             put_successes: AtomicU64::new(0),
             list_and_get_successes: AtomicU64::new(0),
+            find_meta_calls: AtomicU64::new(0),
+            list_outdated_calls: AtomicU64::new(0),
+            delete_iterations_calls: AtomicU64::new(0),
+            deleted_iterations_total: AtomicU64::new(0),
         }
     }
 
@@ -39,6 +47,24 @@ impl CountingStorage {
 
     pub fn list_and_get_successes(&self) -> u64 {
         self.list_and_get_successes.load(Ordering::SeqCst)
+    }
+
+    /// Counts `find_job_meta` calls, which cost a `LIST` on an object store just like
+    /// `list_outdated_iterations` does.
+    pub fn find_meta_calls(&self) -> u64 {
+        self.find_meta_calls.load(Ordering::SeqCst)
+    }
+
+    pub fn list_outdated_calls(&self) -> u64 {
+        self.list_outdated_calls.load(Ordering::SeqCst)
+    }
+
+    pub fn delete_iterations_calls(&self) -> u64 {
+        self.delete_iterations_calls.load(Ordering::SeqCst)
+    }
+
+    pub fn deleted_iterations_total(&self) -> u64 {
+        self.deleted_iterations_total.load(Ordering::SeqCst)
     }
 }
 
@@ -57,6 +83,7 @@ impl Storage for CountingStorage {
     }
 
     async fn find_job_meta(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<JobMeta> {
+        self.find_meta_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.find_job_meta(job_code, cancel_token).await
     }
 
@@ -86,6 +113,33 @@ impl Storage for CountingStorage {
                 job.iter_num(),
                 job.version()
             );
+        }
+        result
+    }
+
+    async fn list_job_outdated_iterations(
+        &self,
+        job_code: &JobCode,
+        retention_boundary: u64,
+        cancel_token: &CancellationToken,
+    ) -> StorageResult<Vec<u64>> {
+        self.list_outdated_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .list_job_outdated_iterations(job_code, retention_boundary, cancel_token)
+            .await
+    }
+
+    async fn delete_job_iterations(
+        &self,
+        job_code: &JobCode,
+        iter_nums: &[u64],
+        cancel_token: &CancellationToken,
+    ) -> StorageResult<()> {
+        self.delete_iterations_calls.fetch_add(1, Ordering::SeqCst);
+        let result = self.inner.delete_job_iterations(job_code, iter_nums, cancel_token).await;
+        if result.is_ok() {
+            self.deleted_iterations_total
+                .fetch_add(u64::try_from(iter_nums.len()).unwrap_or(u64::MAX), Ordering::SeqCst);
         }
         result
     }
