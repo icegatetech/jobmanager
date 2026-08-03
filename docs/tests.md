@@ -61,7 +61,6 @@ The areas listed below represent a minimum set, not an exhaustive list.
 - Concurrency: the object changes between read and write operations.
 - Restart: the process terminates at any point between saves.
 - Saved format: an object saved by a different version or in a different format.
-- The categories listed above represent a minimum set and are not an exhaustive list.
 
 ## Concurrency
 
