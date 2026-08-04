@@ -3,14 +3,16 @@ use std::{any::Any, collections::HashMap, panic::AssertUnwindSafe, sync::Arc};
 use futures_util::FutureExt;
 use parking_lot::{Mutex, RwLock};
 use rand::Rng;
+use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::execution::job_cleaner::JobIterationStarted;
 use crate::execution::job_manager::JobManagerImpl;
 use crate::{
-    InternalError, Job, JobCode, JobError, JobRegistry, JobStatus, Metrics, Retrier, RetrierConfig, Storage,
+    InternalError, Job, JobCode, JobError, JobRegistry, JobStatus, Metrics, Retrier, RetrierConfig, RetryStep, Storage,
     StorageError, TaskCode, TaskPickup,
 };
 // TODO(low): implement subscription mechanism for job updates between workers - if worker received/saved job, other workers should update their state to reduce races.
@@ -86,6 +88,7 @@ pub(crate) struct Worker {
     config: WorkerConfig,
     retrier: Retrier,
     metrics: Metrics,
+    iteration_notifier: Option<mpsc::Sender<JobIterationStarted>>,
 
     // Cache to minimize S3 poll requests
     job_cache: RwLock<HashMap<JobCode, JobCacheEntry>>,
@@ -99,6 +102,7 @@ impl Worker {
         storage: Arc<dyn Storage>,
         config: WorkerConfig,
         metrics: Metrics,
+        cleanup_notifier: Option<mpsc::Sender<JobIterationStarted>>,
     ) -> Self {
         let retrier = Retrier::new(config.retrier_config.clone());
 
@@ -109,6 +113,7 @@ impl Worker {
             config,
             retrier,
             metrics,
+            iteration_notifier: cleanup_notifier,
             job_cache: RwLock::new(HashMap::new()),
         }
     }
@@ -362,9 +367,27 @@ impl Worker {
                 job.iter_num(),
                 self.id
             );
+            self.report_started_iteration(job.code(), job.iter_num());
         }
 
         Ok(job)
+    }
+
+    fn report_started_iteration(&self, job_code: &JobCode, iter_num: u64) {
+        let Some(notifier) = self.iteration_notifier.as_ref() else {
+            return;
+        };
+
+        let message = JobIterationStarted {
+            job_code: job_code.clone(),
+            iter_num,
+        };
+        // Never blocks and never fails the iteration: a report that does not fit in the channel, or
+        // arrives after the cleaner is gone, is dropped. The cleanup it would have triggered is
+        // picked up by the next start-up reconciliation instead.
+        if let Err(e) = notifier.try_send(message) {
+            warn!("Job '{job_code}' iteration {iter_num} not reported for cleanup: {e}");
+        }
     }
 
     async fn pick_and_execute_task(
@@ -626,9 +649,10 @@ impl Worker {
                                 Ok(()) => {
                                     // Save succeeded: store updated job and stop retrying.
                                     *wrapped_job.lock() = Some(current_job);
-                                    Ok((false, SaveOutcome::Saved))
+                                    Ok(RetryStep::Done(SaveOutcome::Saved))
                                 }
                                 Err(e) if e.is_conflict() => {
+                                    let conflict = InternalError::from(e);
                                     // Conflict: refresh from storage, merge (if needed), and decide if we retry.
                                     let saved_job = storage.get_job(&job_code, cancel_token).await?; // TODO(med): getting a job is not always necessary, for example, it is not necessary when taking a task to work.
                                     match handler(JobMergeContext {
@@ -637,11 +661,11 @@ impl Worker {
                                     })? {
                                         MergeDecision::Retry(updated_job) => {
                                             *wrapped_job.lock() = Some(updated_job);
-                                            Ok((true, SaveOutcome::Saved))
+                                            Ok(RetryStep::Retry(conflict))
                                         }
                                         MergeDecision::Done(updated_job, outcome) => {
                                             *wrapped_job.lock() = Some(updated_job);
-                                            Ok((false, outcome))
+                                            Ok(RetryStep::Done(outcome))
                                         }
                                     }
                                 }

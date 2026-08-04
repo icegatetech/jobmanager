@@ -10,6 +10,7 @@ crate-wide precisely so that promise stays honest.
 
 ## Core principles
 
+- IMPORTANT: the main principle when writing code is separation of responsibility.
 - Correctness over cleverness; clarity over brevity.
 - No code beyond what the task requires. An unused item does not compile here (`dead_code` is
   denied), so speculative scaffolding is not an option.
@@ -84,6 +85,9 @@ crate-wide precisely so that promise stays honest.
 - Use the builder pattern (`with_*`) for optional construction parameters, returning `Result` when
   the value is validated and `Self` when it is not.
 - Group a struct's declaration with its `impl`.
+- A component's configuration struct lives in the module of the component it configures, next to
+  it — `WorkerConfig` in `worker.rs`, `S3StorageConfig` in `s3.rs`. A config declared in the module
+  that merely *holds* the component drifts away from the type whose behavior it describes.
 
 ## Error handling
 
@@ -107,6 +111,10 @@ crate-wide precisely so that promise stays honest.
 - Limit parameters to 8 (`too-many-arguments-threshold`); past ~5, prefer a config struct.
 - Return early to reduce nesting.
 - Use iterators and combinators over explicit loops where clearer.
+- **No `#[cfg(test)]` methods on production types.** A test that needs a different value configures
+  it through the type's own configuration; a second, test-only way to set the same field is the
+  parallel mechanism this file forbids. An exception needs an explicit agreement and a comment
+  saying why the configuration path could not carry it.
 
 ## Async and concurrency
 

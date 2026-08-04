@@ -34,13 +34,13 @@ Do not reproduce these in prose — read the source of truth:
 Place a change in the module that owns its responsibility. This is a single-crate library, so the
 module tree *is* the architecture.
 
-| Module           | Responsibility                                                                                     |
-|------------------|----------------------------------------------------------------------------------------------------|
-| `src/core/`      | Domain: job and task state, status transitions, dependency and attempt rules, merging; the registry and the error types |
+| Module           | Responsibility                                                                                                                 |
+|------------------|--------------------------------------------------------------------------------------------------------------------------------|
+| `src/core/`      | Domain: job and task state, status transitions, dependency and attempt rules, merging; the registry and the error types        |
 | `src/execution/` | Orchestration: worker-pool lifecycle, the poll → pick → execute → save loop, and the `JobManager` surface an executor is given |
-| `src/storage/`   | Persistence: the `Storage` trait and its backends                                                  |
-| `src/infra/`     | Cross-cutting utilities: retry policy, metrics                                                     |
-| `src/tests/`     | Integration tests that need `pub(crate)` access — see [docs/tests.md](docs/tests.md)               |
+| `src/storage/`   | Persistence: the `Storage` trait and its backends                                                                              |
+| `src/infra/`     | Cross-cutting utilities: retry policy, metrics                                                                                 |
+| `src/tests/`     | Integration tests that need `pub(crate)` access — see [docs/tests.md](docs/tests.md)                                           |
 
 ### Dependency rules
 
@@ -88,8 +88,13 @@ iteration. The mechanics are documented on the types themselves; what follows is
 - **Never carry failed tasks into the next iteration.** An iteration that cannot progress ends as
   failed and the next one replans from scratch — that is what stops a permanently failing task from
   blocking its dependents forever.
-- Job settings (`max_iterations`, `iteration_interval`, `TaskLimits`) are re-read from the
-  `JobDefinition` on every load, so they are changed in code, never by editing a stored object.
+- **Never delete an iteration above the retention boundary**, which is
+  `iter_num - iteration_retention` of the iteration a worker has already persisted. The boundary is
+  strictly below the job's current iteration, so the newest state object is never deletable;
+  deleting it would let `find_job_meta` miss the job and a worker recreate it from `iter_num = 1`.
+- Job settings (`max_iterations`, `iteration_interval`, `TaskLimits`, `iteration_retention`) are
+  re-read from the `JobDefinition` on every load, so they are changed in code, never by editing a
+  stored object.
 
 ## Before a change
 

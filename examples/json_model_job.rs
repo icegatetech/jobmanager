@@ -5,7 +5,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use chrono::Duration as ChronoDuration;
 use jobmanager::{
     CachedStorage, Error, ImmutableTask, JobDefinition, JobManager, JobRegistry, JobStateCodecKind, JobsManager,
-    JobsManagerConfig, Metrics, RetrierConfig, S3Storage, S3StorageConfig, TaskDefinition, TaskExecutorFn,
+    JobsManagerConfig, Metrics, S3Storage, S3StorageConfig, TaskDefinition, TaskExecutorFn,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{Level, info};
@@ -26,18 +26,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting JSON model job example");
 
     // 1. Setup Storage
-    let s3_config = S3StorageConfig {
-        endpoint: "http://localhost:9000".to_string(),
-        access_key_id: "rustfsadmin".to_string(),
-        secret_access_key: "rustfsadmin".to_string(),
-        bucket_name: "jobs".to_string(),
-        use_ssl: false,
-        region: "us-east-1".to_string(),
-        bucket_prefix: "jobs".to_string(),
-        job_state_codec: JobStateCodecKind::Json,
-        request_timeout: Duration::from_secs(5),
-        retrier_config: RetrierConfig::default(),
-    };
+    let s3_config = S3StorageConfig::new(
+        "http://localhost:9000",
+        "rustfsadmin",
+        "rustfsadmin",
+        "jobs",
+        "us-east-1",
+    )
+    .with_job_state_codec(JobStateCodecKind::Json);
 
     // Storage needs job definitions for reading job settings (enrich_job).
     // We'll build JobRegistry first and share it with storage + manager.

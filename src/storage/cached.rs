@@ -203,4 +203,32 @@ impl Storage for CachedStorage {
             Err(e) => Err(e),
         }
     }
+
+    async fn list_job_outdated_iterations(
+        &self,
+        job_code: &JobCode,
+        retention_boundary: u64,
+        cancel_token: &CancellationToken,
+    ) -> StorageResult<Vec<u64>> {
+        if cancel_token.is_cancelled() {
+            return Err(StorageError::Cancelled);
+        }
+        self.inner
+            .list_job_outdated_iterations(job_code, retention_boundary, cancel_token)
+            .await
+    }
+
+    /// Delegates to the wrapped backend and leaves the cache alone: it only ever holds a job's
+    /// current iteration, which is never among the deleted ones.
+    async fn delete_job_iterations(
+        &self,
+        job_code: &JobCode,
+        iter_nums: &[u64],
+        cancel_token: &CancellationToken,
+    ) -> StorageResult<()> {
+        if cancel_token.is_cancelled() {
+            return Err(StorageError::Cancelled);
+        }
+        self.inner.delete_job_iterations(job_code, iter_nums, cancel_token).await
+    }
 }

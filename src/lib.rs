@@ -15,13 +15,13 @@
 //! # Example
 //!
 //! ```no_run
-//! use std::{collections::HashMap, sync::Arc, time::Duration};
+//! use std::{collections::HashMap, sync::Arc};
 //!
 //! use chrono::Duration as ChronoDuration;
 //! use jobmanager::{
 //!     Error, JobCode, JobDefinition, JobRegistry, JobStateCodecKind, JobsManager,
-//!     JobsManagerConfig, Metrics, RetrierConfig, S3Storage, S3StorageConfig, TaskCode,
-//!     TaskDefinition, TaskExecutorFn,
+//!     JobsManagerConfig, Metrics, S3Storage, S3StorageConfig, TaskCode, TaskDefinition,
+//!     TaskExecutorFn,
 //! };
 //!
 //! # async fn run() -> Result<(), Error> {
@@ -44,18 +44,15 @@
 //!
 //! // 3. Point at S3-backed storage for job state.
 //! let storage = S3Storage::new(
-//!     S3StorageConfig {
-//!         endpoint: "http://localhost:9000".to_string(),
-//!         access_key_id: "rustfsadmin".to_string(),
-//!         secret_access_key: "rustfsadmin".to_string(),
-//!         bucket_name: "jobs".to_string(),
-//!         use_ssl: false,
-//!         region: "us-east-1".to_string(),
-//!         bucket_prefix: "simple-json".to_string(),
-//!         job_state_codec: JobStateCodecKind::Json,
-//!         request_timeout: Duration::from_secs(5),
-//!         retrier_config: RetrierConfig::default(),
-//!     },
+//!     S3StorageConfig::new(
+//!         "http://localhost:9000",
+//!         "rustfsadmin",
+//!         "rustfsadmin",
+//!         "jobs",
+//!         "us-east-1",
+//!     )
+//!     .with_bucket_prefix("simple-json")
+//!     .with_job_state_codec(JobStateCodecKind::Json),
 //!     job_registry.clone(),
 //!     Metrics::new_disabled(),
 //! )
@@ -87,17 +84,19 @@ pub use crate::core::error::{Error, Result};
 pub(crate) use crate::core::error::{InternalError, JobError};
 pub(crate) use crate::core::job::Job;
 pub(crate) use crate::core::job::TaskPickup;
-pub use crate::core::job::{JobCode, JobDefinition, JobStatus, TaskLimits};
+pub use crate::core::job::{DEFAULT_ITERATION_RETENTION, JobCode, JobDefinition, JobStatus, TaskLimits};
 pub use crate::core::registry::{JobRegistry, TaskExecutorFn};
 pub(crate) use crate::core::task::Task;
 pub use crate::core::task::{DEFAULT_MAX_ATTEMPTS, ImmutableTask, TaskCode, TaskDefinition, TaskStatus};
+pub(crate) use crate::execution::job_cleaner::JobCleaner;
+pub use crate::execution::job_cleaner::JobCleanerConfig;
 pub use crate::execution::job_manager::JobManager;
 pub use crate::execution::jobs_manager::{JobsManager, JobsManagerConfig, JobsManagerHandle};
 pub(crate) use crate::execution::worker::Worker;
 pub use crate::execution::worker::WorkerConfig;
 pub use crate::infra::metrics::Metrics;
-pub(crate) use crate::infra::retrier::Retrier;
 pub use crate::infra::retrier::RetrierConfig;
+pub(crate) use crate::infra::retrier::{Retrier, RetryStep};
 pub use crate::storage::JobDefinitionRegistry;
 pub use crate::storage::cached::CachedStorage;
 pub use crate::storage::in_memory::InMemoryStorage;

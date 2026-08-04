@@ -20,6 +20,7 @@ pub enum Error {
     /// Generic error message.
     #[error("{0}")]
     Other(String),
+    // TODO(med): add config error
 }
 
 /// Result type for public APIs.
@@ -37,8 +38,8 @@ pub(crate) enum InternalError {
     #[error("operation cancelled")]
     Cancelled,
 
-    #[error("max retry attempts reached")]
-    MaxAttemptsReached,
+    #[error("max retry attempts reached: {0}")]
+    MaxAttemptsReached(#[source] Box<Self>),
 
     #[error("{0}")]
     Other(String),
@@ -86,11 +87,11 @@ impl From<Error> for InternalError {
 }
 
 impl RetryError for InternalError {
-    fn cancelled() -> Self {
+    fn from_cancellation() -> Self {
         Self::Cancelled
     }
 
-    fn max_attempts() -> Self {
-        Self::MaxAttemptsReached
+    fn from_spent_attempts(last_cause: Self) -> Self {
+        Self::MaxAttemptsReached(Box::new(last_cause))
     }
 }
