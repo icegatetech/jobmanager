@@ -26,81 +26,92 @@ Tasks can declare dependencies on each other, carry an input and an output paylo
 deadline. A job can repeat: it runs iterations on a schedule, and an executor can move the next
 iteration earlier or later.
 
-Every task also has an attempt budget — five by default, set per task with
-`TaskDefinition::with_max_attempts`. Every start spends one, whether the task failed or its
-deadline expired and another worker took it over. Once the budget is gone the task is terminal:
-it is never picked up again, tasks blocked behind it never run, and the job iteration ends as
-failed. That is not the end of the job — the next iteration starts on its normal schedule and is
-planned from scratch, so a permanently failing task delays work instead of blocking it forever.
+Every task has an attempt budget, set per task with `TaskDefinition::with_max_attempts`. Once it is
+spent the task is terminal and its iteration ends as failed — which is not the end of the job: the
+next iteration is planned from scratch, so a permanently failing task delays work instead of
+blocking it forever.
 
-Old iterations do not pile up: each job keeps its most recent ones — 100 by default, set per job
-with `JobDefinition::with_iteration_retention` — and the rest are deleted in the background as new
-iterations start, plus one sweep per job at start-up that picks up whatever earlier runs left
-behind. Turn it off with `JobsManagerConfig::cleaner_config`. Only jobs in the `JobRegistry` are
-cleaned, so renaming a job's code leaves its old state under the previous prefix for you to delete.
-Switching `JobStateCodecKind` on a bucket that already holds state leaves everything written under
-the previous codec in place: those objects are no longer recognized as iterations, so delete them
-yourself. Cleanup is best-effort by design — a sweep that is dropped or fails leaves the tail in
-place until the next start-up and never delays, blocks, or fails an iteration.
+Old iterations do not pile up: each job keeps its most recent ones, set per job with
+`JobBuilder::keep_iterations`, and the rest are deleted in the background. Turn it off with
+`.no_cleanup()`. Only jobs the builder knows about are cleaned, so renaming a job's code leaves its
+old state under the previous prefix for you to delete. Switching `JobStateCodecKind` on a bucket
+that already holds state leaves everything written under the previous codec in place: those objects
+are no longer recognized as iterations, so delete them yourself. Cleanup is best-effort by design —
+a sweep that is dropped or fails leaves the tail in place until the next start-up and never delays,
+blocks, or fails an iteration.
 
 ## Quick start
 
-Bring up an S3-compatible store:
-
-```bash
-make examples-infra-up
-```
-
-Then run an example:
-
-```bash
-cargo run --example simple_job
-```
+The examples run against a local S3-compatible store; [`examples/README.md`](examples/README.md) has
+the commands that bring it up and run one.
 
 The shape of it:
 
 ```rust
-// 1. Describe a task and the code that runs it.
-let task_def = TaskDefinition::new(TaskCode::new("my task code"), Vec::new(), Duration::seconds(5))?;
-let task_executor: TaskExecutorFn = Arc::new(|task, manager, _cancel_token| {
-    let task_id = *task.id();
-    Box::pin(async move { manager.complete_task(&task_id, b"done".to_vec()) })
-});
+use jobmanager::prelude::*;
+use jobmanager::{JobStateCodecKind, S3StorageConfig};
 
-// 2. Bind them into a job and register it.
-let job_def = JobDefinition::new(JobCode::new("simple job"), vec![task_def], task_executors)?;
-let job_registry = Arc::new(JobRegistry::new(vec![job_def])?);
+let manager = JobsManager::builder()
+    .s3(s3_config)
+    .workers(4)
+    .job("simple job", |j| {
+        j.add_task(
+            TaskDefinition::new("my task code", Duration::from_secs(5)),
+            task_fn(|_ctx| async move { Ok(b"done".to_vec().into()) }),
+        );
+    })
+    .build()
+    .await?;
 
-// 3. Point at storage and start the worker pool.
-let storage = S3Storage::new(s3_config, Arc::clone(&job_registry), Metrics::new_disabled()).await?;
-let manager = JobsManager::new(
-    Arc::new(storage),
-    JobsManagerConfig::default(),
-    Arc::clone(&job_registry),
-    Metrics::new_disabled(),
-)?;
 let handle = manager.start()?;
+handle.shutdown_on_signal().await?;
 ```
 
-Full versions live in [`examples/`](examples/): a plain job, the same job with CBOR-encoded
-state, a job whose payloads are typed JSON models, and a sequence of dependent tasks.
+`JobsManager::builder()` is the only way in: it takes the storage backend, the jobs, and their
+executors, and validates the description — its rustdoc lists what `build()` rejects, all of it
+before the first iteration rather than during one.
+
+An executor is anything implementing `TaskExecutor`; wrap an async closure with `task_fn`, or pass
+an `Arc<YourStruct>` straight in. Returning a payload is what closes the task, so it cannot be left
+hanging by forgetting to complete it; return `TaskOutcome::Deferred` to keep manual control.
+
+The handle owns the pool — dropping it aborts every worker — so it is `#[must_use]`. Besides
+`shutdown`, it can wait for work: `wait_for_iteration_completion` and `wait_for_job_completion`
+block until the named job reaches the point they name, so nothing has to poll storage or sleep.
+What each of them guarantees is on the method.
+
+[`examples/`](examples/) holds a worked example of each shape the crate is used in — a fan-out with a
+join task, executors that hold dependencies, several processes over one bucket, deadline takeovers,
+attempt budgets, and adaptive scheduling. See [its README](examples/README.md) for the catalogue.
 
 ## Storage backends
 
-| Backend | Use |
+| Builder call | Backend |
 |---|---|
-| `S3Storage` | production; one object per job, conditional writes for concurrency |
-| `CachedStorage` | wraps any backend, skips reads when the cached state is still current |
-| `InMemoryStorage` | tests; holds a single job, nothing survives the process |
+| `.s3(config)` | production; one object per job, conditional writes for concurrency, read cache in front |
+| `.s3(config).no_cache()` | the same without the cache |
+| `.in_memory()` | tests and examples; conditional writes as above, but only the current iteration and nothing survives the process |
+
+The backends themselves are not part of the public API — the builder constructs and wires them,
+including the registry they read job settings from.
 
 Job state serializes as either JSON (readable, debuggable) or CBOR (compact) — pick with
 `JobStateCodecKind`.
 
 ## Observability
 
-`Metrics` records job and task durations, storage latency, cache hit rate, task takeovers, and
-save-conflict retries through OpenTelemetry. Pass `Metrics::new_disabled()` if you don't want
-any of it.
+Job and task durations, storage latency, cache hit rate, task takeovers, and save-conflict retries
+are written to a `MetricsSink`. Nothing is recorded until one is registered with
+`.metrics(...)`. `OtelMetrics` implements it on top of OpenTelemetry and lives behind the
+`metrics-otel` feature, which is off by default — it takes a `Meter` you own, so it is only useful
+to a consumer that already depends on `opentelemetry`:
+
+```toml
+jobmanager = { git = "...", features = ["metrics-otel"] }
+```
+
+Without the feature the `opentelemetry` dependency is absent from your tree while every measurement
+still reaches a sink of your own.
 
 ## Status
 

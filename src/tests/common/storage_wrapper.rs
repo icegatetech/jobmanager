@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use async_trait::async_trait;
@@ -18,6 +18,7 @@ pub struct CountingStorage {
     put_successes: AtomicU64,
     list_and_get_successes: AtomicU64,
     find_meta_calls: AtomicU64,
+    get_by_meta_calls: AtomicU64,
     list_outdated_calls: AtomicU64,
     delete_iterations_calls: AtomicU64,
     deleted_iterations_total: AtomicU64,
@@ -31,6 +32,7 @@ impl CountingStorage {
             put_successes: AtomicU64::new(0),
             list_and_get_successes: AtomicU64::new(0),
             find_meta_calls: AtomicU64::new(0),
+            get_by_meta_calls: AtomicU64::new(0),
             list_outdated_calls: AtomicU64::new(0),
             delete_iterations_calls: AtomicU64::new(0),
             deleted_iterations_total: AtomicU64::new(0),
@@ -53,6 +55,11 @@ impl CountingStorage {
     /// `list_outdated_iterations` does.
     pub fn find_meta_calls(&self) -> u64 {
         self.find_meta_calls.load(Ordering::SeqCst)
+    }
+
+    /// Counts `get_job_by_meta` calls, which cost a `GET` on an object store.
+    pub fn get_by_meta_calls(&self) -> u64 {
+        self.get_by_meta_calls.load(Ordering::SeqCst)
     }
 
     pub fn list_outdated_calls(&self) -> u64 {
@@ -79,6 +86,7 @@ impl Storage for CountingStorage {
     }
 
     async fn get_job_by_meta(&self, job_meta: &JobMeta, cancel_token: &CancellationToken) -> StorageResult<Job> {
+        self.get_by_meta_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.get_job_by_meta(job_meta, cancel_token).await
     }
 
@@ -142,5 +150,77 @@ impl Storage for CountingStorage {
                 .fetch_add(u64::try_from(iter_nums.len()).unwrap_or(u64::MAX), Ordering::SeqCst);
         }
         result
+    }
+}
+
+/// Storage double that makes exactly one save of an existing iteration lose a race: another
+/// worker's write lands first, so the save that follows finds the version it read already moved.
+///
+/// The interference re-saves what is already stored, which leaves `processing_by_worker` untouched.
+/// The conflict therefore resolves as a merge and a retry, never as a steal.
+pub struct ContendingStorage {
+    inner: Arc<dyn Storage>,
+    is_interference_pending: AtomicBool,
+    interferences: AtomicU64,
+}
+
+impl ContendingStorage {
+    pub fn new(inner: Arc<dyn Storage>) -> Self {
+        Self {
+            inner,
+            is_interference_pending: AtomicBool::new(true),
+            interferences: AtomicU64::new(0),
+        }
+    }
+
+    /// How many times the double really got a write in ahead of its caller, so a test can prove its
+    /// fixture reached the conflict it asserts on.
+    pub fn interferences(&self) -> u64 {
+        self.interferences.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl Storage for ContendingStorage {
+    async fn get_job(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<Job> {
+        self.inner.get_job(job_code, cancel_token).await
+    }
+
+    async fn get_job_by_meta(&self, job_meta: &JobMeta, cancel_token: &CancellationToken) -> StorageResult<Job> {
+        self.inner.get_job_by_meta(job_meta, cancel_token).await
+    }
+
+    async fn find_job_meta(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<JobMeta> {
+        self.inner.find_job_meta(job_code, cancel_token).await
+    }
+
+    async fn save_job(&self, job: &mut Job, cancel_token: &CancellationToken) -> StorageResult<()> {
+        // A save carrying no version creates an iteration and has no version to invalidate.
+        if !job.version().is_empty() && self.is_interference_pending.swap(false, Ordering::SeqCst) {
+            let mut stored = self.inner.get_job(job.code(), cancel_token).await?;
+            self.inner.save_job(&mut stored, cancel_token).await?;
+            self.interferences.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.save_job(job, cancel_token).await
+    }
+
+    async fn list_job_outdated_iterations(
+        &self,
+        job_code: &JobCode,
+        retention_boundary: u64,
+        cancel_token: &CancellationToken,
+    ) -> StorageResult<Vec<u64>> {
+        self.inner
+            .list_job_outdated_iterations(job_code, retention_boundary, cancel_token)
+            .await
+    }
+
+    async fn delete_job_iterations(
+        &self,
+        job_code: &JobCode,
+        iter_nums: &[u64],
+        cancel_token: &CancellationToken,
+    ) -> StorageResult<()> {
+        self.inner.delete_job_iterations(job_code, iter_nums, cancel_token).await
     }
 }

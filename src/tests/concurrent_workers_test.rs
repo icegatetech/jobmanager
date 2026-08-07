@@ -1,6 +1,5 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
-use chrono::Duration as ChronoDuration;
 use dashmap::DashMap;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -8,8 +7,9 @@ use uuid::Uuid;
 use super::common::s3_container::S3TestContainer;
 use super::common::{manager_env::ManagerEnv, storage_wrapper::CountingStorage};
 use crate::{
-    CachedStorage, JobCode, JobDefinition, JobRegistry, JobStateCodecKind, JobStatus, JobsManagerConfig, Metrics,
-    RetrierConfig, S3Storage, S3StorageConfig, Storage, TaskCode, TaskDefinition, TaskExecutorFn, WorkerConfig,
+    CachedStorage, JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStateCodecKind, JobStatus,
+    JobsManagerConfig, NoopMetrics, S3Storage, S3StorageConfig, Storage, TaskCode, TaskDefinition, TaskLimits,
+    TaskOutcome, task_fn,
 };
 
 // TODO(med): Add a check for the absence of errors in the logs. It won't be easy to do this, because when subscribing to errors and parallel tests, we catch errors from all tests and it's difficult to account for errors only in a specific test.
@@ -54,52 +54,52 @@ async fn run_concurrent_workers_test(use_cached_storage: bool) -> Result<(), Box
     let executed_sec_tasks_counter = Arc::clone(&executed_sec_tasks);
 
     // Init task executor
-    let primary_executor: TaskExecutorFn = Arc::new(move |task, manager, _cancel_token| {
+    let primary_executor = task_fn(move |ctx| {
         let executed = Arc::clone(&executed_primary_tasks_counter);
-        let task_id = *task.id();
+        let task_id = *ctx.id();
 
-        Box::pin(async move {
+        async move {
             // Create multiple work tasks
             #[allow(clippy::cast_possible_truncation)]
             for i in 0..secondary_task_count {
-                let secondary_task_def = TaskDefinition::new(
-                    TaskCode::new("secondary_task"),
-                    vec![i as u8],
-                    ChronoDuration::seconds(1),
-                )?;
-                manager.add_task(secondary_task_def)?;
+                let secondary_task_def = TaskDefinition::new(TaskCode::new("secondary_task"), Duration::from_secs(1))
+                    .with_input(vec![i as u8]);
+                ctx.job().add_task(secondary_task_def)?;
             }
 
             executed.insert(task_id, true);
 
-            manager.complete_task(&task_id, Vec::new())
-        })
+            Ok(TaskOutcome::empty())
+        }
     });
 
     // Work task executor
-    let secondary_executor: TaskExecutorFn = Arc::new(move |task, manager, _cancel_token| {
+    let secondary_executor = task_fn(move |ctx| {
         let executed = Arc::clone(&executed_sec_tasks_counter);
-        let task_id = *task.id();
+        let task_id = *ctx.id();
 
-        Box::pin(async move {
+        async move {
             // Simulate some work
             tokio::time::sleep(Duration::from_millis(20)).await;
 
             // Track execution
             executed.insert(task_id, true);
 
-            manager.complete_task(&task_id, b"done".to_vec())
-        })
+            Ok(TaskOutcome::Completed(b"done".to_vec()))
+        }
     });
 
-    let primary_task_def = TaskDefinition::new(TaskCode::new("primary_task"), Vec::new(), ChronoDuration::seconds(1))?;
+    let primary_task_def = TaskDefinition::new(TaskCode::new("primary_task"), Duration::from_secs(1));
 
-    let mut executors = HashMap::new();
-    executors.insert(TaskCode::new("primary_task"), primary_executor);
-    executors.insert(TaskCode::new("secondary_task"), secondary_executor);
-
-    let job_def = JobDefinition::new(JobCode::new("test_concurrent_job"), vec![primary_task_def], executors)?
-        .with_max_iterations(max_iterations)?;
+    let job_def = JobDefinition::new(
+        JobDefinitionId::new(),
+        JobCode::new("test_concurrent_job"),
+        vec![(primary_task_def, primary_executor)],
+        vec![(TaskCode::new("secondary_task"), secondary_executor)],
+        Vec::new(),
+        TaskLimits::default(),
+    )?
+    .with_max_iterations(max_iterations)?;
 
     // 3. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
@@ -116,7 +116,7 @@ async fn run_concurrent_workers_test(use_cached_storage: bool) -> Result<(), Box
             )
             .with_job_state_codec(JobStateCodecKind::Json),
             job_registry.clone(),
-            Metrics::new_disabled(),
+            Arc::new(NoopMetrics),
         )
         .await?,
     );
@@ -125,7 +125,7 @@ async fn run_concurrent_workers_test(use_cached_storage: bool) -> Result<(), Box
     let storage: Arc<dyn Storage> = if use_cached_storage {
         Arc::new(CachedStorage::new(
             counting_storage.clone() as Arc<dyn Storage>,
-            Metrics::new_disabled(),
+            Arc::new(NoopMetrics),
         ))
     } else {
         counting_storage.clone()
@@ -134,12 +134,7 @@ async fn run_concurrent_workers_test(use_cached_storage: bool) -> Result<(), Box
     // 5. Start manager with multiple workers
     let config = JobsManagerConfig {
         worker_count: workers_cnt,
-        worker_config: WorkerConfig {
-            poll_interval: Duration::from_millis(20),
-            poll_interval_randomization: Duration::from_millis(10),
-            retrier_config: RetrierConfig::default(),
-            ..Default::default()
-        },
+        worker_config: super::common::build_worker_config(Duration::from_millis(20), Duration::from_millis(10)),
         ..Default::default()
     };
 

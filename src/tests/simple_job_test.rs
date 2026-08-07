@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -7,14 +6,14 @@ use std::{
     time::Duration,
 };
 
-use chrono::Duration as ChronoDuration;
 use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
 use super::common::s3_container::S3TestContainer;
+use crate::storage::in_memory::InMemoryStorage;
 use crate::{
-    JobCode, JobDefinition, JobRegistry, JobStateCodecKind, JobStatus, JobsManagerConfig, Metrics, RetrierConfig,
-    S3Storage, S3StorageConfig, TaskCode, TaskDefinition, TaskExecutorFn, WorkerConfig,
+    JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStateCodecKind, JobStatus, JobsManagerConfig, NoopMetrics,
+    S3Storage, S3StorageConfig, Storage, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, task_fn,
 };
 
 /// `TestSimpleJobExecution` verifies basic job execution with one task
@@ -46,30 +45,30 @@ async fn run_simple_job_execution(codec: JobStateCodecKind) -> Result<(), Box<dy
     let executed_clone = Arc::clone(&executed);
     let task_input_clone = Arc::clone(&task_input_captured);
 
-    let executor: TaskExecutorFn = Arc::new(move |task, manager, _cancel_token| {
+    let executor = task_fn(move |ctx| {
         let executed = Arc::clone(&executed_clone);
         let task_input = Arc::clone(&task_input_clone);
-        let task_id = *task.id();
-        let input = task.get_input().to_vec();
+        let input = ctx.input().to_vec();
 
-        Box::pin(async move {
+        async move {
             *task_input.lock() = input;
             executed.store(true, Ordering::SeqCst);
-            manager.complete_task(&task_id, b"result".to_vec())
-        })
+            Ok(TaskOutcome::Completed(b"result".to_vec()))
+        }
     });
 
-    let task_def = TaskDefinition::new(
-        TaskCode::new("simple_task"),
-        b"test-input".to_vec(),
-        ChronoDuration::seconds(5),
-    )?;
+    let task_def =
+        TaskDefinition::new(TaskCode::new("simple_task"), Duration::from_secs(5)).with_input(b"test-input".to_vec());
 
-    let mut executors = HashMap::new();
-    executors.insert(TaskCode::new("simple_task"), executor);
-
-    let job_def = JobDefinition::new(JobCode::new("test_simple_job"), vec![task_def], executors)?
-        .with_max_iterations(max_iterations)?;
+    let job_def = JobDefinition::new(
+        JobDefinitionId::new(),
+        JobCode::new("test_simple_job"),
+        vec![(task_def, executor)],
+        Vec::new(),
+        Vec::new(),
+        TaskLimits::default(),
+    )?
+    .with_max_iterations(max_iterations)?;
 
     // 3. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
@@ -85,19 +84,14 @@ async fn run_simple_job_execution(codec: JobStateCodecKind) -> Result<(), Box<dy
         )
         .with_job_state_codec(codec),
         job_registry.clone(),
-        Metrics::new_disabled(),
+        Arc::new(NoopMetrics),
     )
     .await?;
 
     // 5. Start manager
     let config = JobsManagerConfig {
         worker_count: 1,
-        worker_config: WorkerConfig {
-            poll_interval: Duration::from_millis(100),
-            poll_interval_randomization: Duration::from_millis(10),
-            retrier_config: RetrierConfig::default(),
-            ..Default::default()
-        },
+        worker_config: super::common::build_worker_config(Duration::from_millis(100), Duration::from_millis(10)),
         ..Default::default()
     };
 
@@ -127,103 +121,97 @@ async fn run_simple_job_execution(codec: JobStateCodecKind) -> Result<(), Box<dy
     Ok(())
 }
 
-/// `TestMultiTaskSequence` verifies a job with sequential tasks
+/// `TestMultiTaskSequence` verifies a job with sequential tasks.
+///
+/// The subject is that an executor's task reaches its successor with the payload it was given, so
+/// the in-memory backend stands in for the object store; the round-trip of several runtime tasks
+/// through real storage is asserted in `dynamic_task_test`.
 #[tokio::test]
 async fn test_multi_task_sequence() -> Result<(), Box<dyn std::error::Error>> {
     super::common::init_tracing();
 
     let max_iterations = 1u64;
 
-    // 1. Start object storage
-    let store = S3TestContainer::start().await?;
-
-    // 2. Define job with two sequential tasks
+    // 1. Define job with two sequential tasks
     let first_task_executed = Arc::new(AtomicBool::new(false));
     let second_task_executed = Arc::new(AtomicBool::new(false));
+    // Read by the second task and asserted after the wait: a failed assertion inside an executor
+    // is caught by the worker and would only surface as a task failure.
+    let second_task_input = Arc::new(parking_lot::Mutex::new(Vec::new()));
 
     let first_executed_clone = Arc::clone(&first_task_executed);
-    let first_task_executor: TaskExecutorFn = Arc::new(move |task, manager, _cancel_token| {
+    let first_task_executor = task_fn(move |ctx| {
         let executed = Arc::clone(&first_executed_clone);
-        let task_id = *task.id();
 
-        Box::pin(async move {
+        async move {
             executed.store(true, Ordering::SeqCst);
 
             // Create second task
-            let second_task_def = TaskDefinition::new(
-                TaskCode::new("second_task"),
-                b"from-first".to_vec(),
-                ChronoDuration::seconds(5),
-            )?;
+            let second_task_def = TaskDefinition::new(TaskCode::new("second_task"), Duration::from_secs(5))
+                .with_input(b"from-first".to_vec());
 
-            manager.add_task(second_task_def)?;
-            manager.complete_task(&task_id, b"first-done".to_vec())
-        })
+            ctx.job().add_task(second_task_def)?;
+            Ok(TaskOutcome::Completed(b"first-done".to_vec()))
+        }
     });
 
     let second_executed_clone = Arc::clone(&second_task_executed);
-    let second_task_executor: TaskExecutorFn = Arc::new(move |task, manager, _cancel_token| {
+    let second_input_clone = Arc::clone(&second_task_input);
+    let second_task_executor = task_fn(move |ctx| {
         let executed = Arc::clone(&second_executed_clone);
-        let task_id = *task.id();
-        let input = task.get_input().to_vec();
+        let seen_input = Arc::clone(&second_input_clone);
+        let input = ctx.input().to_vec();
 
-        Box::pin(async move {
+        async move {
             executed.store(true, Ordering::SeqCst);
-            assert_eq!(input, b"from-first".to_vec(), "should receive data from first task");
-            manager.complete_task(&task_id, b"second-done".to_vec())
-        })
+            *seen_input.lock() = input;
+            Ok(TaskOutcome::Completed(b"second-done".to_vec()))
+        }
     });
 
-    let first_task_def = TaskDefinition::new(TaskCode::new("first_task"), Vec::new(), ChronoDuration::seconds(5))?;
+    let first_task_def = TaskDefinition::new(TaskCode::new("first_task"), Duration::from_secs(5));
 
-    let mut executors = HashMap::new();
-    executors.insert(TaskCode::new("first_task"), first_task_executor);
-    executors.insert(TaskCode::new("second_task"), second_task_executor);
+    let job_def = JobDefinition::new(
+        JobDefinitionId::new(),
+        JobCode::new("test_sequence_job"),
+        vec![(first_task_def, first_task_executor)],
+        vec![(TaskCode::new("second_task"), second_task_executor)],
+        Vec::new(),
+        TaskLimits::default(),
+    )?
+    .with_max_iterations(max_iterations)?;
 
-    let job_def = JobDefinition::new(JobCode::new("test_sequence_job"), vec![first_task_def], executors)?
-        .with_max_iterations(max_iterations)?;
-
-    // 3. Create job definitions
+    // 2. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
 
-    // 4. Create storage
-    let storage = S3Storage::new(
-        S3StorageConfig::new(
-            store.endpoint(),
-            store.username(),
-            store.password(),
-            "test-jobs",
-            "us-east-1",
-        )
-        .with_job_state_codec(JobStateCodecKind::Json),
-        job_registry.clone(),
-        Metrics::new_disabled(),
-    )
-    .await?;
-
-    // 5. Start manager
+    // 3. Start manager
     let config = JobsManagerConfig {
         worker_count: 1,
-        worker_config: WorkerConfig {
-            poll_interval: Duration::from_millis(100),
-            poll_interval_randomization: Duration::from_millis(10),
-            retrier_config: RetrierConfig::default(),
-            ..Default::default()
-        },
+        worker_config: super::common::build_worker_config(Duration::from_millis(100), Duration::from_millis(10)),
         ..Default::default()
     };
 
-    let mut manager_env = ManagerEnv::new(Arc::new(storage), config, Arc::clone(&job_registry), vec![job_def])?;
+    let mut manager_env = ManagerEnv::new(
+        Arc::new(InMemoryStorage::new()) as Arc<dyn Storage>,
+        config,
+        Arc::clone(&job_registry),
+        vec![job_def],
+    )?;
 
-    // 6. Wait for completion
+    // 4. Wait for completion
     manager_env.wait_for_all_jobs_completion(Duration::from_secs(15)).await?;
     manager_env.stop().await;
 
-    // 7. Verify
+    // 5. Verify
     assert!(first_task_executed.load(Ordering::SeqCst), "first task should execute");
     assert!(
         second_task_executed.load(Ordering::SeqCst),
         "second task should execute"
+    );
+    assert_eq!(
+        *second_task_input.lock(),
+        b"from-first".to_vec(),
+        "the second task should receive the payload the first one gave it"
     );
 
     // Verify job state in storage

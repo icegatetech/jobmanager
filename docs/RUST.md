@@ -66,6 +66,10 @@ crate-wide precisely so that promise stays honest.
   not get from the code, delete it.
 - **Acid test:** a good comment answers a question that arises *after* reading the code. One that
   answers "what does this line do" is noise.
+- **Budget:** a comment on a non-public item is one or two lines. Go past that only for an invariant,
+  a trap, or a decision whose alternative the code does not show. A doc comment on a `pub` item is as
+  long as its contract needs and not a line longer — a justification written for whoever reviews the
+  change does not belong in the file the change lands in.
 - A shared mechanism is documented **once** at its definition; call sites **MUST NOT** repeat the
   explanation.
 - `TODO` markers carry a severity: `TODO(low)`, `TODO(med)`, `TODO(high)`. Keep the prefix when
@@ -88,6 +92,8 @@ crate-wide precisely so that promise stays honest.
 - A component's configuration struct lives in the module of the component it configures, next to
   it — `WorkerConfig` in `worker.rs`, `S3StorageConfig` in `s3.rs`. A config declared in the module
   that merely *holds* the component drifts away from the type whose behavior it describes.
+- Domain structures, VO, and POCO must always be in a consistent state.
+- Never place logic inside a DTO. DTOs are only data carriers.
 
 ## Error handling
 

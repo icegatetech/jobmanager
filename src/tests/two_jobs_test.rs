@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -7,15 +6,15 @@ use std::{
     time::Duration,
 };
 
-use chrono::Duration as ChronoDuration;
 use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
 use super::common::s3_container::S3TestContainer;
 use crate::storage::Storage;
 use crate::{
-    CachedStorage, JobCode, JobDefinition, JobRegistry, JobStateCodecKind, JobStatus, JobsManagerConfig, Metrics,
-    RetrierConfig, S3Storage, S3StorageConfig, TaskCode, TaskDefinition, TaskExecutorFn, WorkerConfig,
+    CachedStorage, JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStateCodecKind, JobStatus,
+    JobsManagerConfig, NoopMetrics, S3Storage, S3StorageConfig, TaskCode, TaskDefinition, TaskLimits, TaskOutcome,
+    task_fn,
 };
 
 /// Runs two jobs in parallel with two workers.
@@ -40,13 +39,12 @@ async fn test_two_jobs_concurrent() -> Result<(), Box<dyn std::error::Error>> {
     let primary_job_count_clone = Arc::clone(&primary_job_count);
     let secondary_job_count_clone = Arc::clone(&secondary_job_count);
 
-    let executor: TaskExecutorFn = Arc::new(move |task, manager, _cancel_token| {
+    let executor = task_fn(move |ctx| {
         let primary_job_count = Arc::clone(&primary_job_count_clone);
         let secondary_job_count = Arc::clone(&secondary_job_count_clone);
-        let task_id = *task.id();
-        let payload = task.get_input().to_vec();
+        let payload = ctx.input().to_vec();
 
-        Box::pin(async move {
+        async move {
             match payload.as_slice() {
                 b"job_a" => {
                     primary_job_count.fetch_add(1, Ordering::SeqCst);
@@ -57,37 +55,44 @@ async fn test_two_jobs_concurrent() -> Result<(), Box<dyn std::error::Error>> {
                 _ => {}
             }
 
-            manager.complete_task(&task_id, b"done".to_vec())
-        })
+            Ok(TaskOutcome::Completed(b"done".to_vec()))
+        }
     });
-
-    let mut primary_executors = HashMap::new();
-    primary_executors.insert(task_code.clone(), Arc::clone(&executor));
-    let mut secondary_executors = HashMap::new();
-    secondary_executors.insert(task_code.clone(), Arc::clone(&executor));
 
     let mut primary_tasks = Vec::new();
     for _ in 0..tasks_per_iter {
-        primary_tasks.push(TaskDefinition::new(
-            task_code.clone(),
-            b"job_a".to_vec(),
-            ChronoDuration::seconds(2),
-        )?);
+        primary_tasks.push((
+            TaskDefinition::new(task_code.clone(), Duration::from_secs(2)).with_input(b"job_a".to_vec()),
+            Arc::clone(&executor),
+        ));
     }
 
     let mut secondary_tasks = Vec::new();
     for _ in 0..tasks_per_iter {
-        secondary_tasks.push(TaskDefinition::new(
-            task_code.clone(),
-            b"job_b".to_vec(),
-            ChronoDuration::seconds(2),
-        )?);
+        secondary_tasks.push((
+            TaskDefinition::new(task_code.clone(), Duration::from_secs(2)).with_input(b"job_b".to_vec()),
+            Arc::clone(&executor),
+        ));
     }
 
-    let primary_job_def = JobDefinition::new(primary_job_code.clone(), primary_tasks, primary_executors)?
-        .with_max_iterations(max_iterations)?;
-    let secondary_job_def = JobDefinition::new(secondary_job_code.clone(), secondary_tasks, secondary_executors)?
-        .with_max_iterations(max_iterations)?;
+    let primary_job_def = JobDefinition::new(
+        JobDefinitionId::new(),
+        primary_job_code.clone(),
+        primary_tasks,
+        Vec::new(),
+        Vec::new(),
+        TaskLimits::default(),
+    )?
+    .with_max_iterations(max_iterations)?;
+    let secondary_job_def = JobDefinition::new(
+        JobDefinitionId::new(),
+        secondary_job_code.clone(),
+        secondary_tasks,
+        Vec::new(),
+        Vec::new(),
+        TaskLimits::default(),
+    )?
+    .with_max_iterations(max_iterations)?;
 
     // 3. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![
@@ -108,24 +113,19 @@ async fn test_two_jobs_concurrent() -> Result<(), Box<dyn std::error::Error>> {
             .with_job_state_codec(JobStateCodecKind::Json)
             .with_request_timeout(Duration::from_millis(100)),
             job_registry.clone(),
-            Metrics::new_disabled(),
+            Arc::new(NoopMetrics),
         )
         .await?,
     );
     let storage = Arc::new(CachedStorage::new(
         storage.clone() as Arc<dyn Storage>,
-        Metrics::new_disabled(),
+        Arc::new(NoopMetrics),
     ));
 
     // 5. Start manager with 2 workers
     let config = JobsManagerConfig {
         worker_count: 2,
-        worker_config: WorkerConfig {
-            poll_interval: Duration::from_millis(100),
-            poll_interval_randomization: Duration::from_millis(10),
-            retrier_config: RetrierConfig::default(),
-            ..Default::default()
-        },
+        worker_config: super::common::build_worker_config(Duration::from_millis(100), Duration::from_millis(10)),
         ..Default::default()
     };
 

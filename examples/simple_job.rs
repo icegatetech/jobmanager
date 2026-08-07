@@ -1,93 +1,36 @@
-// This minimal example demonstrates how to configure and run a simple job with a single task.
-// It sets up the necessary components: logger, storage (S3), job definition, and the job manager
-// itself.
+// Minimal example: one job with one task, state kept in an S3-compatible store.
 
 #![allow(missing_docs)]
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+mod support;
 
-use chrono::Duration as ChronoDuration;
-use jobmanager::{
-    Error, JobCode, JobDefinition, JobRegistry, JobStateCodecKind, JobsManager, JobsManagerConfig, Metrics, S3Storage,
-    S3StorageConfig, TaskCode, TaskDefinition, TaskExecutorFn,
-};
+use jobmanager::prelude::*;
 
-#[allow(dead_code)]
 #[tokio::main]
-async fn main() -> Result<(), Error> {
-    run_simple_job(JobStateCodecKind::Json, "simple-json".to_string()).await
-}
-
-pub async fn run_simple_job(codec: JobStateCodecKind, bucket_prefix: String) -> Result<(), Error> {
-    // Initialize tracing/logging
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .with_env_filter("jobmanager=debug")
-        .init();
+async fn main() -> Result<()> {
+    support::init_tracing();
 
     tracing::info!("Starting simple job example");
 
-    // 1. Define the initial task
-    let task_def = TaskDefinition::new(TaskCode::new("my task code"), Vec::new(), ChronoDuration::seconds(5))?;
-
-    // 2. Map executor for task
-    let task_executor: TaskExecutorFn = Arc::new(|task, manager, _cancel_token| {
-        // Extract task ID before async block to avoid Send trait issues
-        let task_id = *task.id();
-
-        Box::pin(async move {
-            tracing::info!("Executing task: {}", task_id);
-
-            // Simulate work
-            tokio::time::sleep(Duration::from_millis(100)).await;
-
-            tracing::info!("Task completed: {}", task_id);
-            manager.complete_task(&task_id, b"done".to_vec())
+    let manager = JobsManager::builder()
+        .s3(support::build_s3_config("simple-json"))
+        .job("simple job", |j| {
+            j.add_task(
+                TaskDefinition::new("my task code", Duration::from_secs(5)),
+                task_fn(|ctx| async move {
+                    tracing::info!("Executing task: {}", ctx.id());
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tracing::info!("Task completed: {}", ctx.id());
+                    Ok(b"done".to_vec().into())
+                }),
+            );
         })
-    });
+        .build()
+        .await?;
 
-    let mut task_executors = HashMap::new();
-    task_executors.insert(TaskCode::new("my task code"), task_executor);
-
-    // 3. Define the job
-    let job_def = JobDefinition::new(JobCode::new("simple job"), vec![task_def], task_executors)?;
-
-    // 4. Create job definitions
-    let job_registry = Arc::new(JobRegistry::new(vec![job_def])?);
-
-    // 5. Initialize S3 Storage
-    let storage = S3Storage::new(
-        S3StorageConfig::new(
-            "http://localhost:9000",
-            "rustfsadmin",
-            "rustfsadmin",
-            "jobs",
-            "us-east-1",
-        )
-        .with_bucket_prefix(bucket_prefix)
-        .with_job_state_codec(codec),
-        job_registry.clone(),
-        Metrics::new_disabled(),
-    )
-    .await?;
-
-    // 6. Initialize JobsManager
-    let manager = JobsManager::new(
-        Arc::new(storage),
-        JobsManagerConfig::default(),
-        Arc::clone(&job_registry),
-        Metrics::new_disabled(),
-    )?;
-
-    // 7. Start the manager with signal handling
     tracing::info!("Starting job manager (press Ctrl+C to stop)");
-
     let handle = manager.start()?;
-    tokio::signal::ctrl_c()
-        .await
-        .map_err(|e| Error::Other(format!("ctrl_c error: {e}")))?;
-    tracing::info!("Received interrupt signal, shutting down...");
-    handle.shutdown().await?;
+    handle.shutdown_on_signal().await?;
 
     tracing::info!("Job manager stopped");
     Ok(())

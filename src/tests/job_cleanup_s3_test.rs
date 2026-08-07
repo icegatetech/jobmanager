@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use aws_sdk_s3::Client;
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::Utc;
 use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -10,10 +10,17 @@ use super::common::manager_env::ManagerEnv;
 use super::common::s3_container::S3TestContainer;
 use super::common::storage_wrapper::CountingStorage;
 use crate::{
-    Job, JobCleaner, JobCleanerConfig, JobCode, JobDefinition, JobRegistry, JobStateCodecKind, JobStatus,
-    JobsManagerConfig, Metrics, S3Storage, S3StorageConfig, Storage, StorageError, TaskCode, TaskDefinition,
-    TaskExecutorFn, TaskLimits, Worker, WorkerConfig,
+    FinishedIterationSink, Job, JobCleaner, JobCleanerConfig, JobCode, JobDefinition, JobDefinitionId, JobRegistry,
+    JobStateCodecKind, JobStatus, JobsManagerConfig, NoopMetrics, S3Storage, S3StorageConfig, Storage, StorageError,
+    TaskCode, TaskDefinition, TaskLimits, TaskOutcome, Worker, task_fn,
 };
+
+/// Sink for the tests here, which drive workers without a manager and do not observe iteration ends.
+struct DiscardedIterations;
+
+impl FinishedIterationSink for DiscardedIterations {
+    fn record_finished_iteration(&self, _job_code: &JobCode, _iter_num: u64) {}
+}
 
 /// Bound on every wait: iteration cleanup is asynchronous, so tests poll for its effect.
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
@@ -46,16 +53,18 @@ fn build_job_definition(
     job_code: &JobCode,
     iteration_retention: u64,
 ) -> Result<JobDefinition, Box<dyn std::error::Error>> {
-    let executor: TaskExecutorFn = Arc::new(|task, manager, _cancel_token| {
-        let task_id = *task.id();
-        Box::pin(async move { manager.complete_task(&task_id, b"done".to_vec()) })
-    });
-    let task_def = TaskDefinition::new(TaskCode::new("cleanup_task"), Vec::new(), ChronoDuration::seconds(5))?;
-    let mut executors = HashMap::new();
-    executors.insert(TaskCode::new("cleanup_task"), executor);
+    let executor = task_fn(|_ctx| async { Ok(TaskOutcome::Completed(b"done".to_vec())) });
+    let task_def = TaskDefinition::new(TaskCode::new("cleanup_task"), Duration::from_secs(5));
 
-    Ok(JobDefinition::new(job_code.clone(), vec![task_def], executors)?
-        .with_iteration_retention(iteration_retention)?)
+    Ok(JobDefinition::new(
+        JobDefinitionId::new(),
+        job_code.clone(),
+        vec![(task_def, executor)],
+        Vec::new(),
+        Vec::new(),
+        TaskLimits::default(),
+    )?
+    .with_iteration_retention(iteration_retention)?)
 }
 
 fn build_s3_config(
@@ -85,7 +94,7 @@ async fn build_s3_storage(
     Ok(S3Storage::new(
         build_s3_config(store, bucket_name, bucket_prefix, codec),
         job_registry,
-        Metrics::new_disabled(),
+        Arc::new(NoopMetrics),
     )
     .await?)
 }
@@ -245,19 +254,17 @@ async fn test_concurrent_workers_report_each_started_iteration_once() -> Result<
 
     // Wider than any legal number of reports, so a duplicate cannot be swallowed by a full channel.
     let (sender, mut receiver) = mpsc::channel(64);
+    let finished_iterations = Arc::new(DiscardedIterations) as Arc<dyn FinishedIterationSink>;
     let cancel_token = CancellationToken::new();
     let mut worker_tasks = JoinSet::new();
     for _ in 0..3 {
         let worker = Worker::new(
             Arc::clone(&job_registry),
             Arc::clone(&storage) as Arc<dyn Storage>,
-            WorkerConfig {
-                poll_interval: Duration::from_millis(20),
-                poll_interval_randomization: Duration::from_millis(0),
-                ..Default::default()
-            },
-            Metrics::new_disabled(),
+            super::common::build_worker_config(Duration::from_millis(20), Duration::ZERO),
+            Arc::new(NoopMetrics),
             Some(sender.clone()),
+            Arc::clone(&finished_iterations),
         );
         let worker_token = cancel_token.clone();
         worker_tasks.spawn(async move { worker.start(worker_token).await });
@@ -376,7 +383,7 @@ async fn test_list_outdated_iterations_pages_through_whole_tail() -> Result<(), 
         S3Storage::new(
             build_s3_config(&store, bucket_name, bucket_prefix, JobStateCodecKind::Json).with_list_page_size(2)?,
             job_registry.clone(),
-            Metrics::new_disabled(),
+            Arc::new(NoopMetrics),
         )
         .await?,
     );
@@ -434,7 +441,7 @@ async fn run_delete_iterations_deletes_every_chunk_and_keeps_the_rest(
         S3Storage::new(
             build_s3_config(&store, bucket_name, bucket_prefix, codec).with_delete_batch_size(2)?,
             job_registry.clone(),
-            Metrics::new_disabled(),
+            Arc::new(NoopMetrics),
         )
         .await?,
     );
@@ -593,11 +600,7 @@ async fn test_restarted_manager_continues_iterations_after_cleanup() -> Result<(
     .await?;
     let manager_config = JobsManagerConfig {
         worker_count: 1,
-        worker_config: WorkerConfig {
-            poll_interval: Duration::from_millis(50),
-            poll_interval_randomization: Duration::from_millis(10),
-            ..Default::default()
-        },
+        worker_config: super::common::build_worker_config(Duration::from_millis(50), Duration::from_millis(10)),
         ..Default::default()
     };
 

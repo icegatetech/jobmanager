@@ -2,7 +2,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{Error, JobError};
+use crate::{JobDefinitionId, JobError, TaskLimits};
 
 /// Task identifier used in job definitions and execution.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -12,8 +12,10 @@ pub struct TaskCode(String);
 impl TaskCode {
     /// Wraps a raw code as-is; nothing is validated here.
     ///
-    /// The code is the lookup key for the task's executor within a job, so it must match a key of
-    /// the executor map passed to [`JobDefinition::new`](crate::JobDefinition::new). A mismatch
+    /// The code is the lookup key for the task's executor within a job. For an initial task the
+    /// two are bound together by [`JobBuilder::add_task`](crate::JobBuilder::add_task); for a task
+    /// created at runtime the code must match one registered with
+    /// [`JobBuilder::add_task_executor`](crate::JobBuilder::add_task_executor), and a mismatch
     /// surfaces only when the task is about to be executed.
     pub fn new(code: impl Into<String>) -> Self {
         Self(code.into())
@@ -94,37 +96,88 @@ impl std::fmt::Display for TaskStatus {
 /// instead of blocking its dependents and the job's next iteration forever.
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 
+/// How a task names another task it waits for.
+///
+/// Handed out by [`JobBuilder::add_task`](crate::JobBuilder::add_task) for an initial task and by
+/// [`JobHandle::add_task`](crate::JobHandle::add_task) for one created at runtime; it cannot be
+/// constructed by a caller, so a reference always names a task that was really declared.
+///
+/// An initial task is named by its position, not by an identifier: identifiers are minted per
+/// iteration, while the position is what the description carries. The two forms are therefore not
+/// interchangeable - a reference to an initial task is rejected by `JobHandle::add_task`, and a
+/// reference to a runtime task is rejected by `JobsManagerBuilder::build`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskRef(TaskRefKind);
+
+/// The two forms a [`TaskRef`] takes. Kept private so the invariant above cannot be bypassed by
+/// constructing a variant directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskRefKind {
+    /// Position of an initial task in the description of `job_definition`.
+    Initial {
+        job_definition: JobDefinitionId,
+        position: usize,
+    },
+    /// Identifier of a task that already exists in the current iteration.
+    Created(Uuid),
+}
+
+impl TaskRef {
+    /// Names the initial task sitting at `position` in the description of `job_definition`.
+    pub(crate) const fn initial(job_definition: JobDefinitionId, position: usize) -> Self {
+        Self(TaskRefKind::Initial {
+            job_definition,
+            position,
+        })
+    }
+
+    /// Names a task that already exists in the current iteration.
+    pub(crate) const fn created(id: Uuid) -> Self {
+        Self(TaskRefKind::Created(id))
+    }
+
+    /// Borrows the form of the reference, for the layer that has to tell the two apart.
+    pub(crate) const fn kind(self) -> TaskRefKind {
+        self.0
+    }
+}
+
 /// Definition of a task to be executed.
 #[derive(Debug, Clone)]
 pub struct TaskDefinition {
     code: TaskCode,
     input: Vec<u8>,
-    timeout: Duration,
-    depends_on: Vec<Uuid>,
+    timeout: std::time::Duration,
+    depends_on: Vec<TaskRef>,
     max_attempts: u32,
 }
 
 impl TaskDefinition {
-    /// Builds a dependency-free definition; use [`Self::with_dependencies`] to add dependencies.
+    /// Builds a definition with no input, no dependencies and the default attempt budget.
     ///
     /// `timeout` is not a cancellation budget: it sets the deadline after which another worker is
-    /// allowed to take the task over, while the original executor keeps running. Size of `input`
-    /// is checked against the job's `TaskLimits` only when the task is created, not here.
+    /// allowed to take the task over, while the original executor keeps running.
     ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Other`] if `timeout` is zero or negative.
-    pub fn new(code: TaskCode, input: Vec<u8>, timeout: Duration) -> Result<Self, Error> {
-        if timeout <= Duration::zero() {
-            return Err(Error::Other("task timeout must be positive".into()));
-        }
-        Ok(Self {
-            code,
-            input,
+    /// Nothing is rejected here. A definition is checked where a task is actually created from it -
+    /// by [`JobsManagerBuilder::build`](crate::JobsManagerBuilder::build) for an initial task and by
+    /// [`JobHandle::add_task`](crate::JobHandle::add_task) for a runtime one - because the limits it
+    /// is checked against belong to the job, which a bare definition knows nothing about.
+    pub fn new(code: impl Into<TaskCode>, timeout: std::time::Duration) -> Self {
+        Self {
+            code: code.into(),
+            input: Vec::new(),
             timeout,
             depends_on: Vec::new(),
             max_attempts: DEFAULT_MAX_ATTEMPTS,
-        })
+        }
+    }
+
+    /// Attaches the payload the executor reads through
+    /// [`TaskContext::input`](crate::TaskContext::input), replacing whatever was attached before.
+    #[must_use]
+    pub fn with_input(mut self, input: Vec<u8>) -> Self {
+        self.input = input;
+        self
     }
 
     /// Code under which this task's executor is looked up in the job definition.
@@ -138,43 +191,78 @@ impl TaskDefinition {
     }
 
     /// Time after which a started task may be taken over by another worker.
-    pub const fn timeout(&self) -> Duration {
+    pub const fn timeout(&self) -> std::time::Duration {
         self.timeout
     }
 
-    /// Sets task dependencies by task id.
+    /// Makes the task wait for every reference in `depends_on`, replacing whatever it waited for
+    /// before.
+    ///
+    /// The replacement covers this definition only: for an initial task,
+    /// [`JobBuilder::depends_on`](crate::JobBuilder::depends_on) adds its own declarations to this
+    /// list at build time rather than overwriting it, so a task declared through both channels
+    /// waits for the union.
+    ///
+    /// A reference handed out by [`JobBuilder::add_task`](crate::JobBuilder::add_task) belongs to a
+    /// job description and is only legal on an initial task; one handed out by
+    /// [`JobHandle::add_task`](crate::JobHandle::add_task) is only legal on a runtime task. Mixing
+    /// them is rejected where the task is created.
     #[must_use]
-    pub fn with_dependencies(mut self, depends_on: Vec<Uuid>) -> Self {
+    pub fn with_dependencies(mut self, depends_on: Vec<TaskRef>) -> Self {
         self.depends_on = depends_on;
         self
-    }
-
-    /// Returns dependency task ids.
-    pub fn depends_on(&self) -> &[Uuid] {
-        &self.depends_on
     }
 
     /// Caps how many times the task may be started before it is terminally
     /// failed and never picked up again. Defaults to [`DEFAULT_MAX_ATTEMPTS`].
     ///
     /// The budget covers every start of the task, not only failures: a takeover
-    /// of an expired task spends an attempt too.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Other`] if `max_attempts` is zero (a task must get at
-    /// least one attempt).
-    pub fn with_max_attempts(mut self, max_attempts: u32) -> Result<Self, Error> {
-        if max_attempts == 0 {
-            return Err(Error::Other("task max attempts must be positive".into()));
-        }
+    /// of an expired task spends an attempt too. A zero budget is rejected where the task is
+    /// created, in the same place as the rest of the definition.
+    #[must_use]
+    pub const fn with_max_attempts(mut self, max_attempts: u32) -> Self {
         self.max_attempts = max_attempts;
-        Ok(self)
+        self
     }
 
     /// Returns the execution attempt budget.
-    pub const fn max_attempts(&self) -> u32 {
+    const fn max_attempts(&self) -> u32 {
         self.max_attempts
+    }
+
+    pub(crate) fn depends_on(&self) -> &[TaskRef] {
+        &self.depends_on
+    }
+
+    /// Checks the definition against the limits of the job it is about to join.
+    ///
+    /// Called from the two points a definition enters a job: `JobDefinition::new` for an initial
+    /// task and `Job::add_task` for one created at runtime. There are two because a job description
+    /// is checked once, when it is assembled, and every iteration is then planned from the same
+    /// checked description, while a runtime definition first exists at the moment it is added.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::Other`] if the timeout is zero or beyond the millisecond range the
+    /// stored state uses, if the attempt budget is zero, or if the input exceeds `limits`.
+    pub(crate) fn validate(&self, limits: TaskLimits) -> Result<(), JobError> {
+        if self.timeout.is_zero() {
+            return Err(JobError::Other("task timeout must be positive".into()));
+        }
+        if Duration::from_std(self.timeout).is_err() {
+            return Err(JobError::Other("task timeout is too large".into()));
+        }
+        if self.max_attempts == 0 {
+            return Err(JobError::Other("task max attempts must be positive".into()));
+        }
+        if self.input.len() > limits.max_input_bytes {
+            return Err(JobError::Other(format!(
+                "task input size {} exceeds limit {}",
+                self.input.len(),
+                limits.max_input_bytes
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -183,13 +271,14 @@ pub trait ImmutableTask: Send + Sync {
     /// Identifier of the task, unique within its job and stable across retries.
     ///
     /// It is assigned when the task is created, so it is only known after
-    /// `JobManager::add_task` returns - a definition alone cannot be addressed by id.
+    /// [`JobHandle::add_task`](crate::JobHandle::add_task) returns - a definition alone cannot be
+    /// addressed by id.
     fn id(&self) -> &Uuid;
 
     /// Code the task was defined with, used to resolve its executor.
     ///
     /// Not unique: a job may hold several tasks sharing one code, which is why
-    /// `JobManager::get_tasks_by_code` returns a collection.
+    /// [`JobHandle::get_tasks_by_code`](crate::JobHandle::get_tasks_by_code) returns a collection.
     fn code(&self) -> &TaskCode;
 
     /// Input payload the task was created with. Empty if none was supplied.
@@ -208,6 +297,10 @@ pub trait ImmutableTask: Send + Sync {
     fn get_error(&self) -> &str;
 
     /// Ids of tasks that must complete before this one becomes runnable.
+    ///
+    /// An existing task always has its dependencies resolved, so this is an id rather than a
+    /// [`TaskRef`]: a reference would be wider than the domain here.
+    // TODO(med): return TaskId once the newtype exists
     fn depends_on(&self) -> &[Uuid];
 
     /// Whether the task's execution deadline has passed.
@@ -257,19 +350,26 @@ pub(crate) struct Task {
 }
 
 impl Task {
-    pub(crate) fn new(created_by_worker: Uuid, task_def: &TaskDefinition) -> Self {
-        let status = if task_def.depends_on().is_empty() {
+    /// Creates a task in its starting state: `Blocked` when it has dependencies, `Todo` otherwise.
+    ///
+    /// The identifier is passed in rather than minted here, because the dependencies of an initial
+    /// task are positions and can only be resolved once every task of the iteration has one.
+    pub(crate) fn new(id: Uuid, created_by_worker: Uuid, task_def: &TaskDefinition, depends_on: Vec<Uuid>) -> Self {
+        let status = if depends_on.is_empty() {
             TaskStatus::Todo
         } else {
             TaskStatus::Blocked
         };
+
         Self {
-            id: Uuid::new_v4(),
+            id,
             code: task_def.code().clone(),
             status,
             processing_by_worker: None,
             created_by_worker,
-            timeout: task_def.timeout(),
+            // The definition passed `TaskDefinition::validate` before reaching here, so the
+            // conversion cannot fail; the fallback only stands in for the lint-forbidden `unwrap`.
+            timeout: Duration::from_std(task_def.timeout()).unwrap_or_else(|_| Duration::zero()),
             started_at: None,
             completed_at: None,
             deadline_at: None,
@@ -278,7 +378,7 @@ impl Task {
             input: task_def.input().to_vec(),
             output: Vec::new(),
             error_msg: String::new(),
-            depends_on: task_def.depends_on().to_vec(),
+            depends_on,
         }
     }
 
@@ -518,5 +618,100 @@ impl ImmutableTask for Task {
 
     fn max_attempts(&self) -> u32 {
         self.max_attempts()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_definition_keeps_std_duration() {
+        let def = TaskDefinition::new("t", std::time::Duration::from_millis(1500));
+        assert_eq!(def.timeout(), std::time::Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn new_leaves_the_input_empty() {
+        let def = TaskDefinition::new("t", std::time::Duration::from_secs(1));
+        assert!(def.input().is_empty());
+    }
+
+    /// The payload is a single value, not an accumulating buffer: a second call must not append to
+    /// what the first one attached.
+    #[test]
+    fn with_input_replaces_the_payload() {
+        let def = TaskDefinition::new("t", std::time::Duration::from_secs(1))
+            .with_input(vec![1, 2])
+            .with_input(vec![3]);
+        assert_eq!(def.input(), &[3]);
+    }
+
+    #[test]
+    fn validate_rejects_zero_timeout() {
+        let def = TaskDefinition::new("t", std::time::Duration::ZERO);
+        let error = def.validate(TaskLimits::default()).unwrap_err();
+        assert!(error.to_string().contains("must be positive"), "got: {error}");
+    }
+
+    /// The stored state carries the timeout as milliseconds in an `i64`, so a definition above that
+    /// range cannot round-trip and is refused rather than silently truncated.
+    #[test]
+    fn validate_rejects_timeout_beyond_millisecond_range() {
+        let def = TaskDefinition::new("t", std::time::Duration::MAX);
+        let error = def.validate(TaskLimits::default()).unwrap_err();
+        assert!(error.to_string().contains("too large"), "got: {error}");
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_attempts() {
+        let def = TaskDefinition::new("t", std::time::Duration::from_secs(1)).with_max_attempts(0);
+        let error = def.validate(TaskLimits::default()).unwrap_err();
+        assert!(error.to_string().contains("max attempts"), "got: {error}");
+    }
+
+    #[test]
+    fn validate_rejects_input_above_the_limit() {
+        let limits = TaskLimits {
+            max_input_bytes: 4,
+            max_output_bytes: 10,
+        };
+        let def = TaskDefinition::new("t", std::time::Duration::from_secs(1)).with_input(vec![0; 5]);
+        let error = def.validate(limits).unwrap_err();
+        assert!(error.to_string().contains("input size"), "got: {error}");
+    }
+
+    #[test]
+    fn validate_accepts_input_at_the_limit() {
+        let limits = TaskLimits {
+            max_input_bytes: 4,
+            max_output_bytes: 10,
+        };
+        let def = TaskDefinition::new("t", std::time::Duration::from_secs(1))
+            .with_input(vec![0; 4])
+            .with_max_attempts(2);
+        assert!(def.validate(limits).is_ok());
+    }
+
+    /// The task carries the deadline budget the definition declared: a definition in milliseconds
+    /// must not be rounded to whole seconds on its way into the task.
+    #[test]
+    fn task_carries_the_definition_timeout() {
+        let def = TaskDefinition::new("t", std::time::Duration::from_millis(1500));
+        let task = Task::new(Uuid::from_u128(2), Uuid::from_u128(1), &def, Vec::new());
+        assert_eq!(task.timeout(), Duration::milliseconds(1500));
+    }
+
+    /// Blocking used to be assigned after construction; the constructor now owns it, so the rule
+    /// keeps a test of its own.
+    #[test]
+    fn new_blocks_a_task_that_declares_dependencies() {
+        let def = TaskDefinition::new("t", std::time::Duration::from_secs(1));
+
+        let blocked = Task::new(Uuid::from_u128(2), Uuid::from_u128(1), &def, vec![Uuid::from_u128(3)]);
+        let free = Task::new(Uuid::from_u128(4), Uuid::from_u128(1), &def, Vec::new());
+
+        assert_eq!(*blocked.status(), TaskStatus::Blocked);
+        assert_eq!(*free.status(), TaskStatus::Todo);
     }
 }

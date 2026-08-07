@@ -109,6 +109,9 @@ iteration. The mechanics are documented on the types themselves; what follows is
 
 - Run targeted tests for the affected functionality, and report which test commands were run and
   which required tests were not.
+- Re-read every comment the change added and delete the ones that fail the acid test and the budget
+  in [RUST.md](docs/RUST.md). This pass is a separate step because a comment that restates the code
+  is written far more easily than it is noticed afterwards.
 - Ensure each file ends with a single trailing newline.
 
 @docs/RUST.md

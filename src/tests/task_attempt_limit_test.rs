@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering},
@@ -7,15 +6,14 @@ use std::{
     time::Duration,
 };
 
-use chrono::Duration as ChronoDuration;
 use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
 use crate::core::task::DEFAULT_MAX_ATTEMPTS;
 use crate::storage::in_memory::InMemoryStorage;
 use crate::{
-    Error, JobCode, JobDefinition, JobRegistry, JobStatus, JobsManagerConfig, Storage, TaskCode, TaskDefinition,
-    TaskExecutorFn, WorkerConfig,
+    Error, JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStatus, JobsManagerConfig, Storage, TaskCode,
+    TaskDefinition, TaskExecutor, TaskLimits, TaskOutcome, task_fn,
 };
 
 /// Attempt budget the failing task is given explicitly in the dependency test.
@@ -30,25 +28,22 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 fn manager_config() -> JobsManagerConfig {
     JobsManagerConfig {
         worker_count: 1,
-        worker_config: WorkerConfig {
-            poll_interval: Duration::from_millis(20),
-            poll_interval_randomization: Duration::from_millis(5),
-            max_poll_interval: Duration::from_millis(50),
-            ..Default::default()
-        },
+        worker_config: super::common::build_worker_config(Duration::from_millis(20), Duration::from_millis(5))
+            .with_max_poll_interval(Duration::from_millis(50))
+            .expect("a ceiling above the poll interval is accepted"),
         ..Default::default()
     }
 }
 
 /// An executor that always fails, counting how many times it was invoked.
-fn failing_executor(attempts: &Arc<AtomicU32>) -> TaskExecutorFn {
+fn failing_executor(attempts: &Arc<AtomicU32>) -> Arc<dyn TaskExecutor> {
     let attempts = Arc::clone(attempts);
-    Arc::new(move |_task, _manager, _cancel_token| {
+    task_fn(move |_ctx| {
         let attempts = Arc::clone(&attempts);
-        Box::pin(async move {
+        async move {
             attempts.fetch_add(1, Ordering::SeqCst);
-            Err(Error::Other("always fails".to_string()))
-        })
+            Err(Error::Other("always fails".to_string()).into())
+        }
     })
 }
 
@@ -87,42 +82,42 @@ async fn test_exhausted_task_fails_iteration_and_next_iteration_starts() -> Resu
     let failing_attempts = Arc::new(AtomicU32::new(0));
     let dependent_attempts = Arc::new(AtomicU32::new(0));
 
-    let plan_executor: TaskExecutorFn = Arc::new(move |task, manager, _cancel_token| {
-        let task_id = *task.id();
-        Box::pin(async move {
-            let failing_def = TaskDefinition::new(TaskCode::new("failing"), Vec::new(), ChronoDuration::seconds(5))?
-                .with_max_attempts(MAX_ATTEMPTS)?;
-            let failing_id = manager.add_task(failing_def)?;
+    let plan_executor = task_fn(move |ctx| async move {
+        let failing_def =
+            TaskDefinition::new(TaskCode::new("failing"), Duration::from_secs(5)).with_max_attempts(MAX_ATTEMPTS);
+        let failing_task = ctx.job().add_task(failing_def)?;
 
-            let dependent_def =
-                TaskDefinition::new(TaskCode::new("dependent"), Vec::new(), ChronoDuration::seconds(5))?
-                    .with_dependencies(vec![failing_id]);
-            manager.add_task(dependent_def)?;
+        let dependent_def = TaskDefinition::new(TaskCode::new("dependent"), Duration::from_secs(5))
+            .with_dependencies(vec![failing_task]);
+        ctx.job().add_task(dependent_def)?;
 
-            manager.complete_task(&task_id, Vec::new())
-        })
+        Ok(TaskOutcome::empty())
     });
 
     let dependent_attempts_clone = Arc::clone(&dependent_attempts);
-    let dependent_executor: TaskExecutorFn = Arc::new(move |task, manager, _cancel_token| {
+    let dependent_executor = task_fn(move |_ctx| {
         let dependent_attempts = Arc::clone(&dependent_attempts_clone);
-        let task_id = *task.id();
-        Box::pin(async move {
+        async move {
             dependent_attempts.fetch_add(1, Ordering::SeqCst);
-            manager.complete_task(&task_id, Vec::new())
-        })
+            Ok(TaskOutcome::empty())
+        }
     });
 
-    let mut executors = HashMap::new();
-    executors.insert(TaskCode::new("plan"), plan_executor);
-    executors.insert(TaskCode::new("failing"), failing_executor(&failing_attempts));
-    executors.insert(TaskCode::new("dependent"), dependent_executor);
-
-    let plan_def = TaskDefinition::new(TaskCode::new("plan"), Vec::new(), ChronoDuration::seconds(5))?;
-    let job_def = JobDefinition::new(job_code.clone(), vec![plan_def], executors)?
-        // Long enough that the failed iteration is observable before the next one
-        // starts, short enough to keep the test quick.
-        .with_iteration_interval(ChronoDuration::seconds(2))?;
+    let plan_def = TaskDefinition::new(TaskCode::new("plan"), Duration::from_secs(5));
+    let job_def = JobDefinition::new(
+        JobDefinitionId::new(),
+        job_code.clone(),
+        vec![(plan_def, plan_executor)],
+        vec![
+            (TaskCode::new("failing"), failing_executor(&failing_attempts)),
+            (TaskCode::new("dependent"), dependent_executor),
+        ],
+        Vec::new(),
+        TaskLimits::default(),
+    )?
+    // Long enough that the failed iteration is observable before the next one
+    // starts, short enough to keep the test quick.
+    .with_iteration_interval(Duration::from_secs(2))?;
 
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
     let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
@@ -166,11 +161,16 @@ async fn test_default_attempt_limit_applies_without_explicit_budget() -> Result<
     let job_code = JobCode::new("default_attempt_limit_job");
     let failing_attempts = Arc::new(AtomicU32::new(0));
 
-    let mut executors = HashMap::new();
-    executors.insert(TaskCode::new("failing"), failing_executor(&failing_attempts));
-
-    let failing_def = TaskDefinition::new(TaskCode::new("failing"), Vec::new(), ChronoDuration::seconds(5))?;
-    let job_def = JobDefinition::new(job_code.clone(), vec![failing_def], executors)?.with_max_iterations(1)?;
+    let failing_def = TaskDefinition::new(TaskCode::new("failing"), Duration::from_secs(5));
+    let job_def = JobDefinition::new(
+        JobDefinitionId::new(),
+        job_code.clone(),
+        vec![(failing_def, failing_executor(&failing_attempts))],
+        Vec::new(),
+        Vec::new(),
+        TaskLimits::default(),
+    )?
+    .with_max_iterations(1)?;
 
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
     let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());

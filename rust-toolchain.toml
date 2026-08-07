@@ -1,4 +1,3 @@
-# Rust toolchain configuration for IceGate
 # This file pins the Rust toolchain version for consistent builds
 
 [toolchain]

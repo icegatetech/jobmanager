@@ -4,7 +4,8 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{Error, ImmutableTask, JobError, Task, TaskCode, TaskDefinition, TaskExecutorFn, TaskStatus};
+use crate::core::task::TaskRefKind;
+use crate::{Error, ImmutableTask, JobError, Task, TaskCode, TaskDefinition, TaskExecutor, TaskRef, TaskStatus};
 
 /// Job identifier used to select a job definition and persisted state.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -14,8 +15,8 @@ pub struct JobCode(String);
 impl JobCode {
     /// Wraps a raw code as-is; nothing is validated here.
     ///
-    /// Emptiness and uniqueness are enforced later, when the owning [`JobDefinition`] is passed
-    /// to [`JobRegistry::new`](crate::JobRegistry::new).
+    /// Emptiness and uniqueness are enforced later, by
+    /// [`JobsManagerBuilder::build`](crate::JobsManagerBuilder::build).
     pub fn new(code: impl Into<String>) -> Self {
         Self(code.into())
     }
@@ -129,10 +130,10 @@ pub(crate) enum TaskPickup {
 /// Payload size caps applied to every task of a job.
 ///
 /// Oversized payloads are rejected with an error, never truncated: an input above the cap fails
-/// job creation or `JobManager::add_task`, an output above the cap fails `complete_task` and
-/// leaves the task unfinished. Since the limits are not persisted with the job state but re-read
-/// from the [`JobDefinition`] on every load, changing them also affects jobs that already exist
-/// in storage.
+/// job creation or [`JobHandle::add_task`](crate::JobHandle::add_task), an output above the cap
+/// fails `complete_task` and leaves the task unfinished. Since the limits are not persisted with
+/// the job state but re-read from the job's description on every load, changing them also affects
+/// jobs that already exist in storage.
 #[derive(Debug, Clone, Copy)]
 pub struct TaskLimits {
     /// Maximum size of a task input payload. Defaults to 10 `MiB`.
@@ -154,7 +155,7 @@ impl Default for TaskLimits {
 ///
 /// Sized so an operator can still inspect the recent history of a job while the tail of a
 /// long-running job does not grow without bound. Override per job with
-/// [`JobDefinition::with_iteration_retention`].
+/// [`JobBuilder::keep_iterations`](crate::JobBuilder::keep_iterations).
 pub const DEFAULT_ITERATION_RETENTION: u64 = 100;
 
 /// Smallest accepted [`JobDefinition::with_iteration_retention`] value.
@@ -163,58 +164,85 @@ pub const DEFAULT_ITERATION_RETENTION: u64 = 100;
 /// iteration; see the builder's doc comment for what a too-narrow window costs.
 const MIN_ITERATION_RETENTION: u64 = 5;
 
+/// Identity of a job description, distinct from that of every other description.
+///
+/// A [`TaskRef`] to an initial task names a position, and a position only means something together
+/// with the description it belongs to. This is what carries that "which description" part, so a
+/// reference handed out by one job cannot be resolved against another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct JobDefinitionId(Uuid);
+
+impl JobDefinitionId {
+    /// Mints an identity no other description carries.
+    pub(crate) fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
 /// Immutable job definition with initial tasks and executors.
 #[derive(Clone)]
 pub struct JobDefinition {
     code: JobCode,
     initial_tasks: Vec<TaskDefinition>,
-    task_executors: HashMap<TaskCode, TaskExecutorFn>,
+    task_executors: HashMap<TaskCode, Arc<dyn TaskExecutor>>,
     max_iterations: Option<u64>, // None = unlimited
-    iteration_interval: Option<Duration>,
+    iteration_interval: Option<std::time::Duration>,
     task_limits: TaskLimits,
     iteration_retention: u64,
 }
 
 impl JobDefinition {
-    /// Builds a definition with unlimited iterations, no iteration interval and default
-    /// [`TaskLimits`]; use the `with_*` builders to override them.
+    /// Builds a validated definition with unlimited iterations and no iteration interval; use the
+    /// `with_*` builders to override those.
     ///
-    /// `task_executors` must cover more than the initial tasks: executors created at runtime via
-    /// `JobManager::add_task` are resolved from the same map, and a task whose code is missing
-    /// there fails at execution time, not here.
+    /// This is the only place an initial task definition is checked, so a definition that cannot
+    /// produce a legal task is rejected before any worker runs. An initial task is described
+    /// together with the executor that runs it; `runtime_executors` covers the codes a task created
+    /// through [`JobHandle::add_task`](crate::JobHandle::add_task) may use, and a runtime task
+    /// whose code is missing there fails at execution time, not here.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Other`] if `initial_tasks` or `task_executors` is empty, or if some
-    /// initial task has no executor registered under its code.
-    pub fn new(
+    /// Returns [`Error::Other`].
+    pub(crate) fn new(
+        id: JobDefinitionId,
         code: JobCode,
-        initial_tasks: Vec<TaskDefinition>,
-        task_executors: HashMap<TaskCode, TaskExecutorFn>,
+        initial_tasks: Vec<(TaskDefinition, Arc<dyn TaskExecutor>)>,
+        runtime_executors: Vec<(TaskCode, Arc<dyn TaskExecutor>)>,
+        declared_dependencies: Vec<(TaskRef, Vec<TaskRef>)>,
+        task_limits: TaskLimits,
     ) -> Result<Self, Error> {
         if initial_tasks.is_empty() {
-            return Err(Error::Other("initial tasks cannot be empty".into()));
-        }
-        if task_executors.is_empty() {
-            return Err(Error::Other("task executors cannot be empty".into()));
+            return Err(Error::Other(format!(
+                "job '{code}' has no initial task: declare at least one with add_task()"
+            )));
         }
 
-        for task in &initial_tasks {
-            if !task_executors.contains_key(task.code()) {
-                return Err(Error::Other(format!(
-                    "cannot find task executor for initial task {}",
-                    task.code()
-                )));
-            }
+        let mut task_executors: HashMap<TaskCode, Arc<dyn TaskExecutor>> = HashMap::new();
+        let mut initial_definitions = Vec::with_capacity(initial_tasks.len());
+        for (position, (definition, executor)) in initial_tasks.into_iter().enumerate() {
+            definition
+                .validate(task_limits)
+                .map_err(|e| Error::Other(format!("job '{code}' initial task {position}: {e}")))?;
+            Self::register_executor(&mut task_executors, &code, definition.code().clone(), executor)?;
+            initial_definitions.push(definition);
         }
+
+        for (task_code, executor) in runtime_executors {
+            Self::register_executor(&mut task_executors, &code, task_code, executor)?;
+        }
+
+        let initial_definitions =
+            Self::merge_declared_dependencies(id, &code, initial_definitions, declared_dependencies)?;
+        Self::validate_initial_task_dependencies(id, &code, &initial_definitions)?;
 
         Ok(Self {
             code,
-            initial_tasks,
+            initial_tasks: initial_definitions,
             task_executors,
             max_iterations: None,
             iteration_interval: None,
-            task_limits: TaskLimits::default(),
+            task_limits,
             iteration_retention: DEFAULT_ITERATION_RETENTION,
         })
     }
@@ -237,7 +265,7 @@ impl JobDefinition {
     ///
     /// Covers both initial and dynamically added tasks; a task whose code is absent here can be
     /// created but never executed.
-    pub fn task_executors(&self) -> &HashMap<TaskCode, TaskExecutorFn> {
+    pub fn task_executors(&self) -> &HashMap<TaskCode, Arc<dyn TaskExecutor>> {
         &self.task_executors
     }
 
@@ -248,7 +276,7 @@ impl JobDefinition {
 
     /// Minimum delay between the start of consecutive iterations, or `None` to start the next
     /// iteration as soon as the previous one finishes.
-    pub const fn iteration_interval(&self) -> Option<Duration> {
+    pub const fn iteration_interval(&self) -> Option<std::time::Duration> {
         self.iteration_interval
     }
 
@@ -280,7 +308,7 @@ impl JobDefinition {
     /// # Errors
     ///
     /// Returns [`Error::Other`] if `max_iterations` is zero.
-    pub fn with_max_iterations(mut self, max_iterations: u64) -> Result<Self, Error> {
+    pub(crate) fn with_max_iterations(mut self, max_iterations: u64) -> Result<Self, Error> {
         if max_iterations == 0 {
             return Err(Error::Other("job max iterations must be positive".into()));
         }
@@ -303,7 +331,7 @@ impl JobDefinition {
     /// # Errors
     ///
     /// Returns [`Error::Other`] if `iteration_retention` is below 5.
-    pub fn with_iteration_retention(mut self, iteration_retention: u64) -> Result<Self, Error> {
+    pub(crate) fn with_iteration_retention(mut self, iteration_retention: u64) -> Result<Self, Error> {
         if iteration_retention < MIN_ITERATION_RETENTION {
             return Err(Error::Other(format!(
                 "job iteration retention must be at least {MIN_ITERATION_RETENTION}"
@@ -317,25 +345,201 @@ impl JobDefinition {
     /// may begin, so a long iteration does not extend the schedule.
     ///
     /// The anchor is the persisted start time, which survives process restarts. An explicit
-    /// `JobManager::set_next_start_at` overrides this interval in both directions - it can delay
-    /// the next iteration past the interval or release it earlier.
+    /// [`JobHandle::set_next_start_at`](crate::JobHandle::set_next_start_at) overrides this interval
+    /// in both directions - it can delay the next iteration past the interval or release it earlier.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Other`] if `iteration_interval` is zero or negative.
-    pub fn with_iteration_interval(mut self, iteration_interval: Duration) -> Result<Self, Error> {
-        if iteration_interval <= Duration::zero() {
+    /// Returns [`Error::Other`] if `iteration_interval` is zero, or so large that it does not fit
+    /// the millisecond resolution the scheduler uses.
+    pub(crate) fn with_iteration_interval(mut self, iteration_interval: std::time::Duration) -> Result<Self, Error> {
+        if iteration_interval.is_zero() {
             return Err(Error::Other("job iteration interval must be positive".into()));
+        }
+        if Duration::from_std(iteration_interval).is_err() {
+            return Err(Error::Other("job iteration interval is too large".into()));
         }
         self.iteration_interval = Some(iteration_interval);
         Ok(self)
     }
 
-    /// Replaces the default payload caps. See [`TaskLimits`] for how a breach is reported.
-    #[must_use]
-    pub const fn with_task_limits(mut self, task_limits: TaskLimits) -> Self {
-        self.task_limits = task_limits;
-        self
+    /// Binds `task_code` to `executor` within `job_code`, refusing a second, different executor for the
+    /// same code.
+    ///
+    /// Registering the same executor twice is legal - a job may start several tasks sharing a code -
+    /// but two different ones would make which of them runs depend on registration order.
+    fn register_executor(
+        executors_by_code: &mut HashMap<TaskCode, Arc<dyn TaskExecutor>>,
+        job_code: &JobCode,
+        task_code: TaskCode,
+        executor: Arc<dyn TaskExecutor>,
+    ) -> Result<(), Error> {
+        if let Some(registered) = executors_by_code.get(&task_code) {
+            if Arc::ptr_eq(registered, &executor) {
+                return Ok(());
+            }
+            return Err(Error::Other(format!(
+                "job '{job_code}' registers two different executors for task '{task_code}'"
+            )));
+        }
+        executors_by_code.insert(task_code, executor);
+        Ok(())
+    }
+
+    /// Adds every declaration in `declared_dependencies` to the task it names.
+    ///
+    /// The declarations add to what a definition already carries rather than replacing it, so a
+    /// task described through both channels waits for the union of the two lists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Other`] if a declaration names a task this description does not have; the
+    /// dependencies themselves are checked by [`Self::validate_initial_task_dependencies`], which
+    /// sees them once they are merged in.
+    fn merge_declared_dependencies(
+        id: JobDefinitionId,
+        job_code: &JobCode,
+        initial_tasks: Vec<TaskDefinition>,
+        declared_dependencies: Vec<(TaskRef, Vec<TaskRef>)>,
+    ) -> Result<Vec<TaskDefinition>, Error> {
+        let mut dependencies_by_position: Vec<Vec<TaskRef>> =
+            initial_tasks.iter().map(|task| task.depends_on().to_vec()).collect();
+
+        for (task, dependencies) in declared_dependencies {
+            let position = Self::resolve_initial_position(id, job_code, task, initial_tasks.len())?;
+            dependencies_by_position[position].extend(dependencies);
+        }
+
+        Ok(initial_tasks
+            .into_iter()
+            .zip(dependencies_by_position)
+            .map(|(definition, dependencies)| {
+                if dependencies == definition.depends_on() {
+                    return definition;
+                }
+                definition.with_dependencies(dependencies)
+            })
+            .collect())
+    }
+
+    /// Checks the dependency graph a job description declares.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Other`] if an initial task depends on a task of another description or on
+    /// one created at runtime, if a positional reference names a position the description does not
+    /// have, or if the references form a cycle - any of which would leave a task waiting for
+    /// something that never completes.
+    fn validate_initial_task_dependencies(
+        id: JobDefinitionId,
+        job_code: &JobCode,
+        initial_tasks: &[TaskDefinition],
+    ) -> Result<(), Error> {
+        let mut positions_by_task = Vec::with_capacity(initial_tasks.len());
+        for task in initial_tasks {
+            let mut positions = Vec::with_capacity(task.depends_on().len());
+            for dependency in task.depends_on() {
+                positions.push(Self::resolve_initial_position(
+                    id,
+                    job_code,
+                    *dependency,
+                    initial_tasks.len(),
+                )?);
+            }
+            positions_by_task.push(positions);
+        }
+
+        if let Some(position) = Self::find_dependency_cycle(&positions_by_task) {
+            return Err(Error::Other(format!(
+                "job '{job_code}' has a dependency cycle through initial task {position}"
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Position `task` names among the `initial_task_count` initial tasks of this description.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Other`] if the reference was handed out by another job description or by
+    /// [`JobHandle::add_task`](crate::JobHandle::add_task) - neither of which names a task of this
+    /// description - or if it names a position the description does not have.
+    fn resolve_initial_position(
+        id: JobDefinitionId,
+        job_code: &JobCode,
+        task: TaskRef,
+        initial_task_count: usize,
+    ) -> Result<usize, Error> {
+        match task.kind() {
+            TaskRefKind::Initial {
+                job_definition,
+                position,
+            } => {
+                if job_definition != id {
+                    return Err(Error::Other(format!(
+                        "job '{job_code}' declares a dependency on a task outside its own job"
+                    )));
+                }
+                if position >= initial_task_count {
+                    return Err(Error::Other(format!(
+                        "job '{job_code}' declares a dependency on initial task position \
+                         {position}, which it does not have"
+                    )));
+                }
+                Ok(position)
+            }
+            // Reported apart from a reference to another description, and in the same words a
+            // runtime task's own rejection uses: a task created at runtime belongs to no
+            // description at all, so pointing at the job layout would send the reader looking for
+            // an error that is not there.
+            TaskRefKind::Created(task_id) => Err(Error::Other(format!(
+                "job '{job_code}' declares an initial task depending on task '{task_id}' created at runtime"
+            ))),
+        }
+    }
+
+    /// Position of a task that lies on a dependency cycle, or `None` when the graph is acyclic.
+    ///
+    /// Depth-first search with three states: a position reached while it is still on the stack closes a
+    /// cycle. Called only after every reference is known to be in range.
+    fn find_dependency_cycle(positions_by_task: &[Vec<usize>]) -> Option<usize> {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Visit {
+            Unseen,
+            OnStack,
+            Done,
+        }
+
+        // TODO(med): optimize
+        let mut states = vec![Visit::Unseen; positions_by_task.len()];
+        // Explicit stack rather than recursion: a job may declare arbitrarily many initial tasks, and
+        // the depth of the graph is not bounded by anything the description's author controls.
+        for start in 0..positions_by_task.len() {
+            if states[start] != Visit::Unseen {
+                continue;
+            }
+            let mut stack = vec![(start, 0usize)];
+            states[start] = Visit::OnStack;
+            while let Some((position, next_edge)) = stack.pop() {
+                match positions_by_task[position].get(next_edge) {
+                    Some(&dependency) => {
+                        stack.push((position, next_edge + 1));
+                        match states[dependency] {
+                            Visit::OnStack => return Some(dependency),
+                            Visit::Unseen => {
+                                states[dependency] = Visit::OnStack;
+                                stack.push((dependency, 0));
+                            }
+                            Visit::Done => {}
+                        }
+                    }
+                    None => states[position] = Visit::Done,
+                }
+            }
+        }
+
+        None
     }
 }
 
@@ -355,31 +559,59 @@ pub(crate) struct Job {
     next_start_at: Option<DateTime<Utc>>,
     metadata: HashMap<String, serde_json::Value>,
     version: String,
-    max_iterations: Option<u64>,          // None = unlimited
-    iteration_interval: Option<Duration>, // None = unlimited
+    max_iterations: Option<u64>,                     // None = unlimited
+    iteration_interval: Option<std::time::Duration>, // None = unlimited
     task_limits: TaskLimits,
 }
 
 impl Job {
+    /// Creates the first iteration of a job from its description.
+    ///
+    /// Takes the description rather than its parts: a [`JobDefinition`] exists only after
+    /// [`JobDefinition::new`] validated it, so the definitions reaching here are not re-validated
+    /// against the job's limits. The reference checks below are the domain constructor's own guard
+    /// against a description assembled past that validation, and are unreachable in normal use. A
+    /// runtime task has no such guarantee and is validated in [`Self::add_task`].
     pub(crate) fn new(
-        code: JobCode,
-        task_defs: Vec<TaskDefinition>,
+        job_def: &JobDefinition,
         metadata: HashMap<String, serde_json::Value>,
         worker_id: Uuid,
-        max_iterations: Option<u64>,
-        iteration_interval: Option<Duration>,
-        task_limits: TaskLimits,
     ) -> Result<Self, JobError> {
-        let mut tasks_by_id = HashMap::new();
-        for task_def in task_defs {
-            Self::validate_task_input(task_def.input(), task_limits)?;
-            let task = Task::new(worker_id, &task_def);
-            tasks_by_id.insert(*task.id(), Arc::new(task));
+        let task_defs = job_def.initial_tasks();
+        // Every task gets its identifier first: a positional reference cannot be resolved before
+        // the task it points at has one.
+        let ids_by_position: Vec<Uuid> = task_defs.iter().map(|_| Uuid::new_v4()).collect();
+
+        let mut tasks_by_id = HashMap::with_capacity(task_defs.len());
+        for (position, task_def) in task_defs.iter().enumerate() {
+            let mut resolved = Vec::with_capacity(task_def.depends_on().len());
+            for dependency in task_def.depends_on() {
+                match dependency.kind() {
+                    // The range is guaranteed by `JobDefinition::new`; the fallback only stands in
+                    // for the lint-forbidden `unwrap`.
+                    TaskRefKind::Initial { position, .. } => {
+                        let dependency_id = ids_by_position.get(position).ok_or_else(|| {
+                            JobError::Other(format!("dependency reference {position} is out of range"))
+                        })?;
+                        resolved.push(*dependency_id);
+                    }
+                    TaskRefKind::Created(id) => {
+                        return Err(JobError::Other(format!(
+                            "initial task cannot depend on task '{id}' created at runtime"
+                        )));
+                    }
+                }
+            }
+
+            let id = *ids_by_position
+                .get(position)
+                .ok_or_else(|| JobError::Other(format!("initial task {position} has no identifier")))?;
+            tasks_by_id.insert(id, Arc::new(Task::new(id, worker_id, task_def, resolved)));
         }
 
         Ok(Self {
             id: Uuid::new_v4(),
-            code,
+            code: job_def.code().clone(),
             iter_num: 1,
             status: JobStatus::Started,
             tasks_by_id,
@@ -390,9 +622,9 @@ impl Job {
             next_start_at: None,
             metadata,
             version: String::new(),
-            max_iterations,
-            iteration_interval,
-            task_limits,
+            max_iterations: job_def.max_iterations(),
+            iteration_interval: job_def.iteration_interval(),
+            task_limits: job_def.task_limits(),
         })
     }
 
@@ -411,7 +643,7 @@ impl Job {
         next_start_at: Option<DateTime<Utc>>,
         metadata: HashMap<String, serde_json::Value>,
         max_iterations: Option<u64>,
-        iteration_interval: Option<Duration>,
+        iteration_interval: Option<std::time::Duration>,
         task_limits: TaskLimits,
     ) -> Self {
         let mut tasks_by_id = HashMap::new();
@@ -439,7 +671,7 @@ impl Job {
     }
 
     // Prepares the job for the next iteration
-    pub(crate) fn next_iteration(&mut self, task_defs: Vec<TaskDefinition>, worker_id: Uuid) -> Result<(), JobError> {
+    pub(crate) fn next_iteration(&mut self, job_def: &JobDefinition, worker_id: Uuid) -> Result<(), JobError> {
         if !self.is_ready_to_next_iteration() {
             return Err(JobError::Other("job is not ready to next iteration".into()));
         }
@@ -450,15 +682,7 @@ impl Job {
         let old_iter_num = self.iter_num;
         let old_metadata = self.metadata.clone();
 
-        let mut new_job = Self::new(
-            self.code.clone(),
-            task_defs,
-            old_metadata,
-            worker_id,
-            self.max_iterations,
-            self.iteration_interval,
-            self.task_limits,
-        )?;
+        let mut new_job = Self::new(job_def, old_metadata, worker_id)?;
         new_job.id = old_id;
         // TODO(low): in the future, a mechanism for restarting the sequence is needed (currently the maximum sequence is 10^20).
         // Sequential uuid will not work, as there may be a race when creating a new job by different workers.
@@ -470,24 +694,30 @@ impl Job {
     }
 
     pub(crate) fn add_task(&mut self, task_def: &TaskDefinition, worker_id: Uuid) -> Result<Uuid, JobError> {
-        Self::validate_task_input(task_def.input(), self.task_limits)?;
-        let task = Task::new(worker_id, task_def);
+        task_def.validate(self.task_limits)?;
 
-        if self.tasks_by_id.contains_key(task.id()) {
-            return Err(JobError::Other(format!(
-                "task with id {} already registered in job",
-                task.id()
-            )));
-        }
-
-        // Validate dependencies exist
-        for dep_id in task_def.depends_on() {
-            if !self.tasks_by_id.contains_key(dep_id) {
-                return Err(JobError::Other(format!("dependency task '{dep_id}' not found")));
+        // Resolve the dependencies before the task exists. A positional reference cannot appear
+        // here: it names a slot in the job description, and a task created at runtime is outside
+        // that description.
+        let mut resolved = Vec::with_capacity(task_def.depends_on().len());
+        for dependency in task_def.depends_on() {
+            match dependency.kind() {
+                TaskRefKind::Initial { position, .. } => {
+                    return Err(JobError::Other(format!(
+                        "task created at runtime cannot depend on initial task position {position}"
+                    )));
+                }
+                TaskRefKind::Created(dependency_id) => {
+                    if !self.tasks_by_id.contains_key(&dependency_id) {
+                        return Err(JobError::Other(format!("dependency task '{dependency_id}' not found")));
+                    }
+                    resolved.push(dependency_id);
+                }
             }
         }
 
-        let task_id = *task.id();
+        let task_id = Uuid::new_v4();
+        let task = Task::new(task_id, worker_id, task_def, resolved);
         self.tasks_by_id.insert(task_id, Arc::new(task));
         Ok(task_id)
     }
@@ -663,8 +893,12 @@ impl Job {
             return Utc::now() > next_start;
         }
 
-        self.iteration_interval
-            .is_none_or(|interval| Utc::now() >= self.started_at + interval)
+        // A failed conversion holds the next iteration back rather than releasing it: the interval
+        // is validated in `JobDefinition::with_iteration_interval`, so this cannot happen, and
+        // starting early would be the more damaging way to be wrong.
+        self.iteration_interval.is_none_or(|interval| {
+            Duration::from_std(interval).is_ok_and(|interval| Utc::now() >= self.started_at + interval)
+        })
     }
 
     // State mutations
@@ -674,17 +908,6 @@ impl Job {
 
     pub(crate) const fn set_next_start_at(&mut self, next_start_at: DateTime<Utc>) {
         self.next_start_at = Some(next_start_at);
-    }
-
-    fn validate_task_input(input: &[u8], task_limits: TaskLimits) -> Result<(), JobError> {
-        if input.len() > task_limits.max_input_bytes {
-            return Err(JobError::Other(format!(
-                "task input size {} exceeds limit {}",
-                input.len(),
-                task_limits.max_input_bytes
-            )));
-        }
-        Ok(())
     }
 
     fn validate_task_output(output: &[u8], task_limits: TaskLimits) -> Result<(), JobError> {
@@ -915,13 +1138,58 @@ impl Job {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, LazyLock},
+    };
 
     use chrono::{DateTime, Duration, Utc};
     use uuid::Uuid;
 
     use super::*;
     use crate::core::task::DEFAULT_MAX_ATTEMPTS;
+    use crate::{TaskOutcome, TaskRef, task_fn};
+
+    fn noop_executor() -> Arc<dyn TaskExecutor> {
+        task_fn(|_ctx| async { Ok(TaskOutcome::empty()) })
+    }
+
+    fn task_definition(code: &str) -> TaskDefinition {
+        TaskDefinition::new(TaskCode::new(code), std::time::Duration::from_secs(5))
+    }
+
+    /// Identity every description in these tests is built under, so a reference made with
+    /// [`initial_task_ref`] belongs to it. One identity for the whole module, because a minted one
+    /// differs on every call and a reference would then belong to no description at all.
+    fn test_definition_id() -> JobDefinitionId {
+        static ID: LazyLock<JobDefinitionId> = LazyLock::new(JobDefinitionId::new);
+        *ID
+    }
+
+    fn initial_task_ref(position: usize) -> TaskRef {
+        TaskRef::initial(test_definition_id(), position)
+    }
+
+    /// Wraps definitions into a validated description under the default limits, so a test about
+    /// tasks does not have to spell out an executor for each of them. The definitions themselves
+    /// stay in the test - only the executor is supplied here.
+    fn job_definition(tasks: Vec<TaskDefinition>) -> JobDefinition {
+        job_definition_with_limits(tasks, TaskLimits::default())
+    }
+
+    fn job_definition_with_limits(tasks: Vec<TaskDefinition>, limits: TaskLimits) -> JobDefinition {
+        let executor = noop_executor();
+        let initial_tasks = tasks.into_iter().map(|task| (task, Arc::clone(&executor))).collect();
+        JobDefinition::new(
+            test_definition_id(),
+            JobCode::new("job"),
+            initial_tasks,
+            Vec::new(),
+            Vec::new(),
+            limits,
+        )
+        .expect("the test description must be legal")
+    }
 
     fn make_task(id: Uuid, code: &str, status: TaskStatus, depends_on: Vec<Uuid>) -> Task {
         make_task_with_attempts(id, code, status, depends_on, 0, DEFAULT_MAX_ATTEMPTS)
@@ -963,7 +1231,7 @@ mod tests {
         tasks: Vec<Task>,
         iter_num: u64,
         max_iterations: Option<u64>,
-        iteration_interval: Option<Duration>,
+        iteration_interval: Option<std::time::Duration>,
         updated_by_worker_id: Uuid,
         running_at: Option<DateTime<Utc>>,
         completed_at: Option<DateTime<Utc>>,
@@ -1463,9 +1731,11 @@ mod tests {
             metadata.clone(),
         );
 
-        let new_task = TaskDefinition::new(TaskCode::new("new"), Vec::new(), Duration::seconds(5)).unwrap();
+        // The settings of the new iteration come from the description, which is what a worker
+        // re-reads on every load - not from the iteration being replaced.
+        let job_def = job_definition(vec![task_definition("new")]).with_max_iterations(5).unwrap();
         let before = Utc::now();
-        job.next_iteration(vec![new_task], worker_id).unwrap();
+        job.next_iteration(&job_def, worker_id).unwrap();
 
         assert_eq!(job.id, job_id);
         assert_eq!(job.iter_num, 4);
@@ -1495,7 +1765,9 @@ mod tests {
             HashMap::new(),
         );
 
-        let err = job.next_iteration(Vec::new(), Uuid::from_u128(301)).unwrap_err();
+        let err = job
+            .next_iteration(&job_definition(vec![task_definition("t")]), Uuid::from_u128(301))
+            .unwrap_err();
         assert!(matches!(err, JobError::Other(_)));
     }
 
@@ -1516,7 +1788,9 @@ mod tests {
             HashMap::new(),
         );
 
-        let err = job.next_iteration(Vec::new(), Uuid::from_u128(303)).unwrap_err();
+        let err = job
+            .next_iteration(&job_definition(vec![task_definition("t")]), Uuid::from_u128(303))
+            .unwrap_err();
         assert!(matches!(err, JobError::Other(_)));
     }
 
@@ -1537,7 +1811,9 @@ mod tests {
             HashMap::new(),
         );
 
-        let err = job.next_iteration(Vec::new(), Uuid::from_u128(305)).unwrap_err();
+        let err = job
+            .next_iteration(&job_definition(vec![task_definition("t")]), Uuid::from_u128(305))
+            .unwrap_err();
         assert!(matches!(err, JobError::Other(_)));
     }
 
@@ -1558,7 +1834,7 @@ mod tests {
             None,
             HashMap::new(),
             None,
-            Some(Duration::seconds(60)),
+            Some(std::time::Duration::from_mins(1)),
             TaskLimits::default(),
         );
 
@@ -1588,7 +1864,7 @@ mod tests {
             None,
             HashMap::new(),
             None,
-            Some(Duration::seconds(60)),
+            Some(std::time::Duration::from_mins(1)),
             TaskLimits::default(),
         );
 
@@ -1616,7 +1892,7 @@ mod tests {
             None,
             HashMap::new(),
             None,
-            Some(Duration::seconds(60)),
+            Some(std::time::Duration::from_mins(1)),
             TaskLimits::default(),
         );
 
@@ -1661,7 +1937,7 @@ mod tests {
             None,
             HashMap::new(),
             None,
-            Some(Duration::seconds(60)),
+            Some(std::time::Duration::from_mins(1)),
             TaskLimits::default(),
         );
 
@@ -1692,8 +1968,8 @@ mod tests {
         );
         job.set_next_start_at(Utc::now() - Duration::seconds(1));
 
-        let new_task = TaskDefinition::new(TaskCode::new("new"), Vec::new(), Duration::seconds(5)).unwrap();
-        job.next_iteration(vec![new_task], worker_id).unwrap();
+        let new_task = TaskDefinition::new(TaskCode::new("new"), std::time::Duration::from_secs(5));
+        job.next_iteration(&job_definition(vec![new_task]), worker_id).unwrap();
 
         assert_eq!(job.id, job_id);
         assert_eq!(job.updated_by_worker_id, worker_id);
@@ -1723,8 +1999,8 @@ mod tests {
             HashMap::new(),
         );
 
-        let new_task = TaskDefinition::new(TaskCode::new("new"), Vec::new(), Duration::seconds(5)).unwrap();
-        job.next_iteration(vec![new_task], worker_id).unwrap();
+        let new_task = TaskDefinition::new(TaskCode::new("new"), std::time::Duration::from_secs(5));
+        job.next_iteration(&job_definition(vec![new_task]), worker_id).unwrap();
 
         assert_eq!(job.id, job_id);
         assert_eq!(job.updated_by_worker_id, worker_id);
@@ -1735,7 +2011,8 @@ mod tests {
     fn test_next_iteration_error_keeps_state_unchanged() {
         let old_task_id = Uuid::from_u128(43);
         let old_task = make_task(old_task_id, "old", TaskStatus::Completed, Vec::new());
-        let next_start_at = Utc::now() - Duration::seconds(1);
+        // Holds the next iteration back, which is what makes `next_iteration` fail here.
+        let next_start_at = Utc::now() + Duration::seconds(60);
         let metadata_key = "k".to_string();
         let metadata_value = serde_json::Value::String("v".to_string());
         let mut metadata = HashMap::new();
@@ -1755,7 +2032,7 @@ mod tests {
             Some(next_start_at),
             metadata.clone(),
             Some(9),
-            Some(Duration::seconds(2)),
+            Some(std::time::Duration::from_secs(2)),
             TaskLimits {
                 max_input_bytes: 4,
                 max_output_bytes: 8,
@@ -1769,8 +2046,9 @@ mod tests {
         let old_updated_by_worker_id = job.updated_by_worker_id();
         let old_task_ids: Vec<Uuid> = job.tasks_as_iter().map(|task| *task.id()).collect();
 
-        let too_big = TaskDefinition::new(TaskCode::new("too_big"), vec![1, 2, 3, 4, 5], Duration::seconds(5)).unwrap();
-        let err = job.next_iteration(vec![too_big], Uuid::from_u128(312)).unwrap_err();
+        let err = job
+            .next_iteration(&job_definition(vec![task_definition("new")]), Uuid::from_u128(312))
+            .unwrap_err();
         assert!(matches!(err, JobError::Other(_)));
 
         assert!(matches!(job.status(), JobStatus::Completed));
@@ -1785,6 +2063,95 @@ mod tests {
             job.tasks_as_iter().map(|task| *task.id()).collect::<Vec<_>>(),
             old_task_ids
         );
+    }
+
+    /// An initial task names its dependency by position, because identifiers are minted per
+    /// iteration; planning the iteration is what turns that position into an id.
+    #[test]
+    fn test_job_new_resolves_dependency_refs_into_task_ids() {
+        let first = TaskDefinition::new(TaskCode::new("first"), std::time::Duration::from_secs(5));
+        let second = TaskDefinition::new(TaskCode::new("second"), std::time::Duration::from_secs(5))
+            .with_dependencies(vec![initial_task_ref(0)]);
+
+        let job = Job::new(&job_definition(vec![first, second]), HashMap::new(), Uuid::from_u128(1)).unwrap();
+
+        let first_id = *job.get_tasks_by_code(&TaskCode::new("first")).first().unwrap().id();
+        let second_id = *job.get_tasks_by_code(&TaskCode::new("second")).first().unwrap().id();
+
+        assert_eq!(job.get_task(&second_id).unwrap().depends_on(), &[first_id]);
+        // The status is not on `ImmutableTask`; this test lives inside the module, so it reads the
+        // stored task directly rather than widening the public surface for an assertion.
+        assert_eq!(*job.tasks_by_id[&second_id].status(), TaskStatus::Blocked);
+        assert_eq!(*job.tasks_by_id[&first_id].status(), TaskStatus::Todo);
+    }
+
+    /// Every iteration mints fresh identifiers, so the same definition must resolve to the ids of
+    /// the tasks the *new* iteration created, never to the previous ones.
+    #[test]
+    fn test_next_iteration_resolves_dependency_refs_against_its_own_tasks() {
+        let first = TaskDefinition::new(TaskCode::new("first"), std::time::Duration::from_secs(5));
+        let second = TaskDefinition::new(TaskCode::new("second"), std::time::Duration::from_secs(5))
+            .with_dependencies(vec![initial_task_ref(0)]);
+        let job_def = job_definition(vec![first, second]);
+
+        let mut job = Job::new(&job_def, HashMap::new(), Uuid::from_u128(1)).unwrap();
+        let first_iteration_ids: Vec<Uuid> = job.tasks_as_iter().map(|task| *task.id()).collect();
+        job.status = JobStatus::Completed;
+
+        job.next_iteration(&job_def, Uuid::from_u128(2)).unwrap();
+
+        let first_id = *job.get_tasks_by_code(&TaskCode::new("first")).first().unwrap().id();
+        let second_id = *job.get_tasks_by_code(&TaskCode::new("second")).first().unwrap().id();
+        assert_eq!(job.get_task(&second_id).unwrap().depends_on(), &[first_id]);
+        assert!(
+            first_iteration_ids.iter().all(|id| *id != first_id),
+            "the second iteration must resolve to its own tasks"
+        );
+    }
+
+    #[test]
+    fn new_rejects_a_dependency_on_a_position_that_does_not_exist() {
+        let only = TaskDefinition::new(TaskCode::new("only"), std::time::Duration::from_secs(5))
+            .with_dependencies(vec![initial_task_ref(7)]);
+
+        let error = JobDefinition::new(
+            test_definition_id(),
+            JobCode::new("job"),
+            vec![(only, noop_executor())],
+            Vec::new(),
+            Vec::new(),
+            TaskLimits::default(),
+        )
+        .err()
+        .expect("an unresolvable reference must be refused");
+
+        assert!(error.to_string().contains("which it does not have"), "got: {error}");
+    }
+
+    /// A runtime task addresses its dependencies by id; a position names a slot of the job
+    /// definition, which such a task is not part of.
+    #[test]
+    fn test_add_task_rejects_a_positional_dependency() {
+        let root = make_task(Uuid::from_u128(41), "root", TaskStatus::Todo, Vec::new());
+        let mut job = restore_job(
+            Uuid::from_u128(403),
+            JobStatus::Started,
+            vec![root],
+            1,
+            Some(1),
+            None,
+            Uuid::from_u128(402),
+            None,
+            None,
+            None,
+            HashMap::new(),
+        );
+
+        let task_def = TaskDefinition::new(TaskCode::new("child"), std::time::Duration::from_secs(5))
+            .with_dependencies(vec![initial_task_ref(0)]);
+        let error = job.add_task(&task_def, Uuid::from_u128(403)).unwrap_err();
+
+        assert!(error.to_string().contains("initial task position"), "got: {error}");
     }
 
     #[test]
@@ -1806,9 +2173,9 @@ mod tests {
             HashMap::new(),
         );
 
-        let task_def = TaskDefinition::new(TaskCode::new("child"), vec![1, 2, 3], Duration::seconds(5))
-            .unwrap()
-            .with_dependencies(vec![dep_id]);
+        let task_def = TaskDefinition::new(TaskCode::new("child"), std::time::Duration::from_secs(5))
+            .with_input(vec![1, 2, 3])
+            .with_dependencies(vec![TaskRef::created(dep_id)]);
         let task_id = job.add_task(&task_def, Uuid::from_u128(401)).unwrap();
 
         let task = job.get_task_arc(&task_id).unwrap();
@@ -1834,9 +2201,8 @@ mod tests {
             HashMap::new(),
         );
 
-        let task_def = TaskDefinition::new(TaskCode::new("child"), Vec::new(), Duration::seconds(5))
-            .unwrap()
-            .with_dependencies(vec![Uuid::from_u128(999)]);
+        let task_def = TaskDefinition::new(TaskCode::new("child"), std::time::Duration::from_secs(5))
+            .with_dependencies(vec![TaskRef::created(Uuid::from_u128(999))]);
         let err = job.add_task(&task_def, Uuid::from_u128(403)).unwrap_err();
         assert!(matches!(err, JobError::Other(_)));
     }
@@ -2718,38 +3084,28 @@ mod tests {
 
     #[test]
     fn test_job_definition_new_success_with_defaults_and_builders() {
-        let mut executors = HashMap::new();
-        let executor: crate::TaskExecutorFn = Arc::new(|_, _, _| Box::pin(async { Ok(()) }));
-        executors.insert(TaskCode::new("task_a"), Arc::clone(&executor));
-        executors.insert(TaskCode::new("task_b"), executor);
-        let task_a = TaskDefinition::new(TaskCode::new("task_a"), Vec::new(), Duration::seconds(5)).unwrap();
-        let task_b = TaskDefinition::new(TaskCode::new("task_b"), Vec::new(), Duration::seconds(5)).unwrap();
+        let task_a = task_definition("task_a");
+        let task_b = task_definition("task_b");
         let task_limits = TaskLimits {
             max_input_bytes: 1,
             max_output_bytes: 2,
         };
 
-        let job_def = JobDefinition::new(JobCode::new("job"), vec![task_a, task_b], executors)
-            .unwrap()
+        let job_def = job_definition_with_limits(vec![task_a, task_b], task_limits)
             .with_max_iterations(3)
             .unwrap()
-            .with_iteration_interval(Duration::seconds(7))
-            .unwrap()
-            .with_task_limits(task_limits);
+            .with_iteration_interval(std::time::Duration::from_secs(7))
+            .unwrap();
 
         assert_eq!(job_def.max_iterations(), Some(3));
-        assert_eq!(job_def.iteration_interval(), Some(Duration::seconds(7)));
+        assert_eq!(job_def.iteration_interval(), Some(std::time::Duration::from_secs(7)));
         assert_eq!(job_def.task_limits().max_input_bytes, 1);
         assert_eq!(job_def.task_limits().max_output_bytes, 2);
     }
 
     #[test]
     fn test_job_definition_new_defaults_without_builders() {
-        let mut executors = HashMap::new();
-        let executor: crate::TaskExecutorFn = Arc::new(|_, _, _| Box::pin(async { Ok(()) }));
-        executors.insert(TaskCode::new("noop"), executor);
-        let task_def = TaskDefinition::new(TaskCode::new("noop"), Vec::new(), Duration::seconds(5)).unwrap();
-        let job_def = JobDefinition::new(JobCode::new("job"), vec![task_def], executors).unwrap();
+        let job_def = job_definition(vec![task_definition("noop")]);
 
         assert_eq!(job_def.max_iterations(), None);
         assert_eq!(job_def.iteration_interval(), None);
@@ -2768,39 +3124,243 @@ mod tests {
 
     #[test]
     fn test_job_definition_new_rejects_empty_initial_tasks() {
-        let mut executors = HashMap::new();
-        let executor: crate::TaskExecutorFn = Arc::new(|_, _, _| Box::pin(async { Ok(()) }));
-        executors.insert(TaskCode::new("noop"), executor);
-
-        let result = JobDefinition::new(JobCode::new("job"), Vec::new(), executors);
+        let result = JobDefinition::new(
+            test_definition_id(),
+            JobCode::new("job"),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            TaskLimits::default(),
+        );
         assert!(matches!(result, Err(Error::Other(_))));
     }
 
+    /// The limits belong to the job, so a definition that cannot produce a legal task under them
+    /// is refused where the description is assembled, not when a worker plans an iteration.
     #[test]
-    fn test_job_definition_new_rejects_empty_executors() {
-        let task_def = TaskDefinition::new(TaskCode::new("noop"), Vec::new(), Duration::seconds(5)).unwrap();
-        let result = JobDefinition::new(JobCode::new("job"), vec![task_def], HashMap::new());
-        assert!(matches!(result, Err(Error::Other(_))));
+    fn new_rejects_a_definition_above_the_input_limit() {
+        let too_big = task_definition("noop").with_input(vec![0; 5]);
+
+        let error = JobDefinition::new(
+            test_definition_id(),
+            JobCode::new("job"),
+            vec![(too_big, noop_executor())],
+            Vec::new(),
+            Vec::new(),
+            TaskLimits {
+                max_input_bytes: 4,
+                max_output_bytes: 10,
+            },
+        )
+        .err()
+        .expect("an oversized input must not describe a job");
+
+        assert!(error.to_string().contains("input size"), "got: {error}");
     }
 
+    /// Which executor runs a task would otherwise depend on registration order.
     #[test]
-    fn test_job_definition_new_rejects_missing_executor_for_initial_task() {
-        let mut executors = HashMap::new();
-        let executor: crate::TaskExecutorFn = Arc::new(|_, _, _| Box::pin(async { Ok(()) }));
-        executors.insert(TaskCode::new("present"), executor);
-        let task_def = TaskDefinition::new(TaskCode::new("missing"), Vec::new(), Duration::seconds(5)).unwrap();
+    fn new_rejects_two_different_executors_for_one_task_code() {
+        let error = JobDefinition::new(
+            test_definition_id(),
+            JobCode::new("job"),
+            vec![(task_definition("noop"), noop_executor())],
+            vec![(TaskCode::new("noop"), noop_executor())],
+            Vec::new(),
+            TaskLimits::default(),
+        )
+        .err()
+        .expect("two executors for one code must not describe a job");
 
-        let result = JobDefinition::new(JobCode::new("job"), vec![task_def], executors);
-        assert!(matches!(result, Err(Error::Other(_))));
+        assert!(error.to_string().contains("two different executors"), "got: {error}");
+    }
+
+    /// A job may start several tasks sharing a code, so the same executor arriving twice is not a
+    /// mistake.
+    #[test]
+    fn new_accepts_the_same_executor_registered_twice() {
+        let executor = noop_executor();
+
+        let job_def = JobDefinition::new(
+            test_definition_id(),
+            JobCode::new("job"),
+            vec![
+                (task_definition("noop"), Arc::clone(&executor)),
+                (task_definition("noop"), executor),
+            ],
+            Vec::new(),
+            Vec::new(),
+            TaskLimits::default(),
+        );
+
+        assert!(job_def.is_ok(), "the same executor twice must describe a job");
+    }
+
+    /// A reference is a position, and a position only means something within the description that
+    /// handed it out: resolved against another description it would silently name whatever sits
+    /// there. The reference travels on the task definition here, which is the channel that used to
+    /// carry it past the check.
+    #[test]
+    fn new_rejects_a_task_definition_depending_on_another_descriptions_task() {
+        let foreign = TaskRef::initial(JobDefinitionId::new(), 0);
+        let task = task_definition("noop").with_dependencies(vec![foreign]);
+
+        let error = JobDefinition::new(
+            test_definition_id(),
+            JobCode::new("job"),
+            vec![(task, noop_executor())],
+            Vec::new(),
+            Vec::new(),
+            TaskLimits::default(),
+        )
+        .err()
+        .expect("a reference from another description must not describe a job");
+
+        assert!(error.to_string().contains("outside its own job"), "got: {error}");
+    }
+
+    /// The same reference arriving as a declaration rather than on the definition is refused by
+    /// the same rule, in the dependency position and in the target position alike.
+    #[test]
+    fn new_rejects_a_declaration_naming_another_descriptions_task() {
+        let foreign = TaskRef::initial(JobDefinitionId::new(), 0);
+
+        for (task, dependencies) in [
+            (initial_task_ref(0), vec![foreign]),
+            (foreign, vec![initial_task_ref(0)]),
+        ] {
+            let error = JobDefinition::new(
+                test_definition_id(),
+                JobCode::new("job"),
+                vec![(task_definition("noop"), noop_executor())],
+                Vec::new(),
+                vec![(task, dependencies)],
+                TaskLimits::default(),
+            )
+            .err()
+            .expect("a declaration naming another description must not describe a job");
+
+            assert!(error.to_string().contains("outside its own job"), "got: {error}");
+        }
+    }
+
+    /// The two declaration channels add up rather than replace each other, and the merged list is
+    /// what the iteration is planned from.
+    #[test]
+    fn new_merges_declared_dependencies_into_the_task_definition() {
+        let first = task_definition("first");
+        let second = task_definition("second");
+        let third = task_definition("third").with_dependencies(vec![initial_task_ref(0)]);
+
+        let job_def = JobDefinition::new(
+            test_definition_id(),
+            JobCode::new("job"),
+            vec![
+                (first, noop_executor()),
+                (second, noop_executor()),
+                (third, noop_executor()),
+            ],
+            Vec::new(),
+            vec![(initial_task_ref(2), vec![initial_task_ref(1)])],
+            TaskLimits::default(),
+        )
+        .expect("both declaration channels must describe a job");
+
+        assert_eq!(
+            job_def.initial_tasks()[2].depends_on(),
+            &[initial_task_ref(0), initial_task_ref(1)]
+        );
+    }
+
+    /// A cycle closed through the declaration channel is the same cycle, so it is refused even
+    /// though no single task definition declares it.
+    #[test]
+    fn new_rejects_a_dependency_cycle_closed_by_a_declaration() {
+        let first = task_definition("first").with_dependencies(vec![initial_task_ref(1)]);
+        let second = task_definition("second");
+
+        let error = JobDefinition::new(
+            test_definition_id(),
+            JobCode::new("job"),
+            vec![(first, noop_executor()), (second, noop_executor())],
+            Vec::new(),
+            vec![(initial_task_ref(1), vec![initial_task_ref(0)])],
+            TaskLimits::default(),
+        )
+        .err()
+        .expect("a cycle must not describe a job");
+
+        assert!(error.to_string().contains("dependency cycle"), "got: {error}");
+    }
+
+    /// A runtime task exists only inside an iteration, so a description cannot wait for one.
+    #[test]
+    fn new_rejects_an_initial_task_depending_on_a_runtime_task() {
+        let task = task_definition("noop").with_dependencies(vec![TaskRef::created(Uuid::from_u128(9))]);
+
+        let error = JobDefinition::new(
+            test_definition_id(),
+            JobCode::new("job"),
+            vec![(task, noop_executor())],
+            Vec::new(),
+            Vec::new(),
+            TaskLimits::default(),
+        )
+        .err()
+        .expect("a reference to a runtime task must not describe a job");
+
+        assert!(error.to_string().contains("created at runtime"), "got: {error}");
+    }
+
+    /// Every task of a cycle would stay blocked forever, so the description is refused instead.
+    #[test]
+    fn new_rejects_a_dependency_cycle() {
+        let first = task_definition("first").with_dependencies(vec![initial_task_ref(1)]);
+        let second = task_definition("second").with_dependencies(vec![initial_task_ref(0)]);
+
+        let error = JobDefinition::new(
+            test_definition_id(),
+            JobCode::new("job"),
+            vec![(first, noop_executor()), (second, noop_executor())],
+            Vec::new(),
+            Vec::new(),
+            TaskLimits::default(),
+        )
+        .err()
+        .expect("a cycle must not describe a job");
+
+        assert!(error.to_string().contains("dependency cycle"), "got: {error}");
+    }
+
+    /// A diamond is not a cycle: the search must not report one just because a task is reached
+    /// twice by different paths.
+    #[test]
+    fn new_accepts_a_diamond_shaped_graph() {
+        let root = task_definition("root");
+        let left = task_definition("left").with_dependencies(vec![initial_task_ref(0)]);
+        let right = task_definition("right").with_dependencies(vec![initial_task_ref(0)]);
+        let join = task_definition("join").with_dependencies(vec![initial_task_ref(1), initial_task_ref(2)]);
+
+        let job_def = JobDefinition::new(
+            test_definition_id(),
+            JobCode::new("job"),
+            vec![
+                (root, noop_executor()),
+                (left, noop_executor()),
+                (right, noop_executor()),
+                (join, noop_executor()),
+            ],
+            Vec::new(),
+            Vec::new(),
+            TaskLimits::default(),
+        );
+
+        assert!(job_def.is_ok(), "a diamond must describe a job");
     }
 
     #[test]
     fn test_job_definition_with_max_iterations_rejects_zero() {
-        let mut executors = HashMap::new();
-        let executor: crate::TaskExecutorFn = Arc::new(|_, _, _| Box::pin(async { Ok(()) }));
-        executors.insert(TaskCode::new("noop"), executor);
-        let task_def = TaskDefinition::new(TaskCode::new("noop"), Vec::new(), Duration::seconds(5)).unwrap();
-        let job_def = JobDefinition::new(JobCode::new("job"), vec![task_def], executors).unwrap();
+        let job_def = job_definition(vec![task_definition("noop")]);
 
         let result = job_def.with_max_iterations(0);
         assert!(matches!(result, Err(Error::Other(_))));
@@ -2808,11 +3368,7 @@ mod tests {
 
     #[test]
     fn test_job_definition_with_iteration_retention_rejects_below_floor_and_applies_accepted_values() {
-        let mut executors = HashMap::new();
-        let executor: crate::TaskExecutorFn = Arc::new(|_, _, _| Box::pin(async { Ok(()) }));
-        executors.insert(TaskCode::new("noop"), executor);
-        let task_def = TaskDefinition::new(TaskCode::new("noop"), Vec::new(), Duration::seconds(5)).unwrap();
-        let job_def = JobDefinition::new(JobCode::new("job"), vec![task_def], executors).unwrap();
+        let job_def = job_definition(vec![task_definition("noop")]);
 
         let below = job_def.clone().with_iteration_retention(4);
         assert!(matches!(below, Err(Error::Other(_))));
@@ -2827,13 +3383,7 @@ mod tests {
     }
 
     fn build_job_definition_for_retention(iteration_retention: u64) -> JobDefinition {
-        let mut executors = HashMap::new();
-        let executor: crate::TaskExecutorFn = Arc::new(|_, _, _| Box::pin(async { Ok(()) }));
-        executors.insert(TaskCode::new("noop"), executor);
-        let task_def = TaskDefinition::new(TaskCode::new("noop"), Vec::new(), Duration::seconds(5)).unwrap();
-
-        JobDefinition::new(JobCode::new("job"), vec![task_def], executors)
-            .unwrap()
+        job_definition(vec![task_definition("noop")])
             .with_iteration_retention(iteration_retention)
             .unwrap()
     }
@@ -2856,62 +3406,33 @@ mod tests {
     }
 
     #[test]
-    fn test_job_definition_with_iteration_interval_rejects_zero_and_negative() {
-        let mut executors = HashMap::new();
-        let executor: crate::TaskExecutorFn = Arc::new(|_, _, _| Box::pin(async { Ok(()) }));
-        executors.insert(TaskCode::new("noop"), executor);
-        let task_def = TaskDefinition::new(TaskCode::new("noop"), Vec::new(), Duration::seconds(5)).unwrap();
-        let job_def = JobDefinition::new(JobCode::new("job"), vec![task_def], executors).unwrap();
+    /// A negative interval is no longer representable - `std::time::Duration` is unsigned - so the
+    /// remaining boundaries are zero and a value the millisecond-based scheduler cannot hold.
+    fn test_job_definition_with_iteration_interval_rejects_zero_and_oversized() {
+        let job_def = job_definition(vec![task_definition("noop")]);
 
-        let zero = job_def.clone().with_iteration_interval(Duration::zero());
+        let zero = job_def.clone().with_iteration_interval(std::time::Duration::ZERO);
         assert!(matches!(zero, Err(Error::Other(_))));
-        let negative = job_def.with_iteration_interval(Duration::seconds(-1));
-        assert!(matches!(negative, Err(Error::Other(_))));
+        let oversized = job_def.with_iteration_interval(std::time::Duration::MAX);
+        assert!(matches!(oversized, Err(Error::Other(_))));
     }
 
     #[test]
     fn test_job_new_accepts_input_at_limit() {
-        let task_def = TaskDefinition::new(TaskCode::new("fit"), vec![0; 4], Duration::seconds(5)).unwrap();
+        let task_def = task_definition("fit").with_input(vec![0; 4]);
         let limits = TaskLimits {
             max_input_bytes: 4,
             max_output_bytes: 10,
         };
 
         let job = Job::new(
-            JobCode::new("job"),
-            vec![task_def],
+            &job_definition_with_limits(vec![task_def], limits),
             HashMap::new(),
             Uuid::from_u128(1599),
-            None,
-            None,
-            limits,
         )
         .unwrap();
 
         assert_eq!(job.tasks_as_iter().count(), 1);
-    }
-
-    #[test]
-    fn test_job_new_rejects_oversized_input() {
-        let task_def = TaskDefinition::new(TaskCode::new("too_big"), vec![0; 5], Duration::seconds(5)).unwrap();
-        let limits = TaskLimits {
-            max_input_bytes: 4,
-            max_output_bytes: 10,
-        };
-
-        let err = Job::new(
-            JobCode::new("job"),
-            vec![task_def],
-            HashMap::new(),
-            Uuid::from_u128(1600),
-            None,
-            None,
-            limits,
-        )
-        .err()
-        .unwrap();
-
-        assert!(matches!(err, JobError::Other(_)));
     }
 
     #[test]
@@ -2920,19 +3441,17 @@ mod tests {
             max_input_bytes: 4,
             max_output_bytes: 10,
         };
-        let init_def = TaskDefinition::new(TaskCode::new("init"), vec![0; 1], Duration::seconds(5)).unwrap();
+        let init_def =
+            TaskDefinition::new(TaskCode::new("init"), std::time::Duration::from_secs(5)).with_input(vec![0; 1]);
         let mut job = Job::new(
-            JobCode::new("job"),
-            vec![init_def],
+            &job_definition_with_limits(vec![init_def], limits),
             HashMap::new(),
             Uuid::from_u128(1700),
-            None,
-            None,
-            limits,
         )
         .unwrap();
 
-        let task_def = TaskDefinition::new(TaskCode::new("child"), vec![0; 5], Duration::seconds(5)).unwrap();
+        let task_def =
+            TaskDefinition::new(TaskCode::new("child"), std::time::Duration::from_secs(5)).with_input(vec![0; 5]);
         let err = job.add_task(&task_def, Uuid::from_u128(1701)).err().unwrap();
         assert!(matches!(err, JobError::Other(_)));
     }
@@ -2943,19 +3462,17 @@ mod tests {
             max_input_bytes: 4,
             max_output_bytes: 10,
         };
-        let init_def = TaskDefinition::new(TaskCode::new("init"), vec![0; 1], Duration::seconds(5)).unwrap();
+        let init_def =
+            TaskDefinition::new(TaskCode::new("init"), std::time::Duration::from_secs(5)).with_input(vec![0; 1]);
         let mut job = Job::new(
-            JobCode::new("job"),
-            vec![init_def],
+            &job_definition_with_limits(vec![init_def], limits),
             HashMap::new(),
             Uuid::from_u128(1750),
-            None,
-            None,
-            limits,
         )
         .unwrap();
 
-        let task_def = TaskDefinition::new(TaskCode::new("child"), vec![0; 4], Duration::seconds(5)).unwrap();
+        let task_def =
+            TaskDefinition::new(TaskCode::new("child"), std::time::Duration::from_secs(5)).with_input(vec![0; 4]);
         let task_id = job.add_task(&task_def, Uuid::from_u128(1751)).unwrap();
         let task = job.get_task_arc(&task_id).unwrap();
         assert_eq!(task.input().len(), 4);
@@ -2967,15 +3484,12 @@ mod tests {
             max_input_bytes: 4,
             max_output_bytes: 4,
         };
-        let init_def = TaskDefinition::new(TaskCode::new("init"), vec![0; 1], Duration::seconds(5)).unwrap();
+        let init_def =
+            TaskDefinition::new(TaskCode::new("init"), std::time::Duration::from_secs(5)).with_input(vec![0; 1]);
         let mut job = Job::new(
-            JobCode::new("job"),
-            vec![init_def],
+            &job_definition_with_limits(vec![init_def], limits),
             HashMap::new(),
             Uuid::from_u128(1800),
-            None,
-            None,
-            limits,
         )
         .unwrap();
 
@@ -2992,15 +3506,12 @@ mod tests {
             max_input_bytes: 4,
             max_output_bytes: 4,
         };
-        let init_def = TaskDefinition::new(TaskCode::new("init"), vec![0; 1], Duration::seconds(5)).unwrap();
+        let init_def =
+            TaskDefinition::new(TaskCode::new("init"), std::time::Duration::from_secs(5)).with_input(vec![0; 1]);
         let mut job = Job::new(
-            JobCode::new("job"),
-            vec![init_def],
+            &job_definition_with_limits(vec![init_def], limits),
             HashMap::new(),
             Uuid::from_u128(1850),
-            None,
-            None,
-            limits,
         )
         .unwrap();
 
