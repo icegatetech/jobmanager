@@ -560,7 +560,7 @@ pub(crate) struct Job {
     metadata: HashMap<String, serde_json::Value>,
     version: String,
     max_iterations: Option<u64>,                     // None = unlimited
-    iteration_interval: Option<std::time::Duration>, // None = unlimited
+    iteration_interval: Option<std::time::Duration>, // None = no minimum delay between iterations
     task_limits: TaskLimits,
 }
 

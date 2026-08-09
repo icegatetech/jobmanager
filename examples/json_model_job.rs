@@ -10,7 +10,7 @@
 
 #![allow(missing_docs)]
 
-mod support;
+mod harness;
 
 use jobmanager::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -34,7 +34,7 @@ struct TaskOutput {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    support::init_tracing();
+    harness::init_tracing();
 
     tracing::info!("Starting JSON model job example");
 
@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
 
     let job_code = JobCode::new("JSON model job");
     let manager = JobsManager::builder()
-        .s3(support::build_run_scoped_s3_config("json-model"))
+        .s3(harness::build_run_scoped_s3_config("json-model"))
         .job(job_code.clone(), |j| {
             // One iteration is enough to show the shape, and it lets the example exit by itself.
             j.max_iterations(1);

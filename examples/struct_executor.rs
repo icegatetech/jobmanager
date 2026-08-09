@@ -7,7 +7,7 @@
 
 #![allow(missing_docs)]
 
-mod support;
+mod harness;
 
 use std::sync::Arc;
 
@@ -110,7 +110,7 @@ impl TaskExecutor for PublishRatesExecutor {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    support::init_tracing();
+    harness::init_tracing();
 
     // Built once, before the pool: this is the point of a struct executor.
     let store = Arc::new(RateStore::new());
@@ -124,7 +124,7 @@ async fn main() -> Result<()> {
 
     let job_code = JobCode::new("struct-executor");
     let manager = JobsManager::builder()
-        .s3(support::build_run_scoped_s3_config("struct-executor"))
+        .s3(harness::build_run_scoped_s3_config("struct-executor"))
         .workers(2)
         .job(job_code.clone(), |j| {
             j.max_iterations(2);

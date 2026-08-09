@@ -4,7 +4,7 @@
 
 #![allow(missing_docs)]
 
-mod support;
+mod harness;
 
 use jobmanager::prelude::*;
 
@@ -20,12 +20,12 @@ fn step(name: &'static str) -> std::sync::Arc<dyn TaskExecutor> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    support::init_tracing();
+    harness::init_tracing();
 
     tracing::info!("Starting chained job example");
 
     let manager = JobsManager::builder()
-        .s3(support::build_s3_config("chained"))
+        .s3(harness::build_s3_config("chained"))
         .workers(3)
         .job("chained job", |j| {
             // Without an interval the next iteration would start the moment this one ends.

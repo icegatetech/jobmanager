@@ -6,19 +6,19 @@
 
 #![allow(missing_docs)]
 
-mod support;
+mod harness;
 
 use jobmanager::JobStateCodecKind;
 use jobmanager::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    support::init_tracing();
+    harness::init_tracing();
 
     tracing::info!("Starting simple job example with CBOR-encoded state");
 
     let manager = JobsManager::builder()
-        .s3(support::build_s3_config_with_codec(
+        .s3(harness::build_s3_config_with_codec(
             "simple-cbor",
             JobStateCodecKind::Cbor,
         ))

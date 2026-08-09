@@ -4,19 +4,19 @@
 
 #![allow(missing_docs)]
 
-mod support;
+mod harness;
 
 use jobmanager::prelude::*;
 use rand::Rng;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    support::init_tracing();
+    harness::init_tracing();
 
     tracing::info!("Starting simple sequence job example");
 
     let manager = JobsManager::builder()
-        .s3(support::build_s3_config("simple-sequence"))
+        .s3(harness::build_s3_config("simple-sequence"))
         .workers(5)
         .poll_interval(Duration::from_millis(500))
         .job("simple sequence job", |j| {

@@ -1,7 +1,7 @@
 //! Shared setup for the examples: where the store is, how logging is turned on, how a flag is read.
 //!
 //! This is a directory without a `main.rs`, so cargo does not build it as an example of its own.
-//! Every example pulls it in with `mod support;`.
+//! Every example pulls it in with `mod harness;`.
 
 // Not every example uses every helper, and `dead_code` is denied crate-wide.
 #![allow(dead_code)]

@@ -7,7 +7,7 @@
 
 #![allow(missing_docs)]
 
-mod support;
+mod harness;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,14 +29,14 @@ const IDLE_DELAY_SECONDS: i64 = 10;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    support::init_tracing();
+    harness::init_tracing();
 
     // Stands in for a queue depth read from a broker or a table.
     let remaining = Arc::new(AtomicU64::new(QUEUE_DEPTH));
     let job_code = JobCode::new("adaptive-schedule");
 
     let manager = JobsManager::builder()
-        .s3(support::build_run_scoped_s3_config("adaptive-schedule"))
+        .s3(harness::build_run_scoped_s3_config("adaptive-schedule"))
         .job(job_code.clone(), |j| {
             j.every(ITERATION_INTERVAL);
             j.max_iterations(4);

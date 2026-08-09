@@ -1,6 +1,6 @@
 // How to test an executor of your own.
 //
-// `.in_memory()` swaps the S3 backend for a single-job, no-persistence one: no container, no bucket,
+// `.in_memory()` swaps the S3 backend for a no-persistence one: no container, no bucket,
 // nothing to clean up between runs. Cap the job at one iteration and wait for it, and driving the
 // pool becomes an ordinary function call - which is what turns this from a demo into a test.
 //
@@ -17,7 +17,7 @@
 
 #![allow(missing_docs)]
 
-mod support;
+mod harness;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -73,7 +73,7 @@ fn sum_input(total: &AtomicU64, ctx: &TaskContext) -> TaskResult {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    support::init_tracing();
+    harness::init_tracing();
 
     let total = Arc::new(AtomicU64::new(0));
     run_one_iteration(Arc::clone(&total)).await?;

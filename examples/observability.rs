@@ -18,7 +18,7 @@
 
 #![allow(missing_docs)]
 
-mod support;
+mod harness;
 
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -37,8 +37,8 @@ const WORK_DURATION: Duration = Duration::from_millis(200);
 
 /// Records every measurement to the log.
 ///
-/// Only the methods worth seeing are overridden; the trait's remaining methods keep their empty
-/// default bodies, which is why a sink never has to implement all seven.
+/// All seven methods are overridden here to show what each one carries. A sink of your own may
+/// override only the ones it cares about - the rest keep the trait's empty default bodies.
 struct LoggingMetrics;
 
 impl MetricsSink for LoggingMetrics {
@@ -102,11 +102,11 @@ struct WorkInput {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    support::init_tracing();
+    harness::init_tracing();
 
     let job_code = JobCode::new("observability");
     let manager = JobsManager::builder()
-        .s3(support::build_run_scoped_s3_config("observability"))
+        .s3(harness::build_run_scoped_s3_config("observability"))
         .workers(3)
         .metrics(Arc::new(LoggingMetrics))
         .job(job_code.clone(), |j| {

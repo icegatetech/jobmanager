@@ -24,7 +24,7 @@
 
 #![allow(missing_docs)]
 
-mod support;
+mod harness;
 
 use jobmanager::prelude::*;
 
@@ -43,10 +43,10 @@ const RUNS_BEFORE_BUDGET_SPENT: u32 = 5;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    support::init_tracing();
+    harness::init_tracing();
 
     let manager = JobsManager::builder()
-        .s3(support::build_s3_config("graceful-shutdown"))
+        .s3(harness::build_s3_config("graceful-shutdown"))
         .job("graceful shutdown", |j| {
             j.add_task(
                 TaskDefinition::new(TASK_CODE, TASK_TIMEOUT).with_max_attempts(RUNS_BEFORE_BUDGET_SPENT),

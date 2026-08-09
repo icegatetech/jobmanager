@@ -10,7 +10,7 @@
 
 #![allow(missing_docs)]
 
-mod support;
+mod harness;
 
 use jobmanager::prelude::*;
 
@@ -21,11 +21,11 @@ const MAX_ATTEMPTS: u32 = 2;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    support::init_tracing();
+    harness::init_tracing();
 
     let job_code = JobCode::new("attempt-budget");
     let manager = JobsManager::builder()
-        .s3(support::build_run_scoped_s3_config("attempt-budget"))
+        .s3(harness::build_run_scoped_s3_config("attempt-budget"))
         .workers(2)
         .poll_interval(Duration::from_millis(300))
         .job(job_code.clone(), |j| {

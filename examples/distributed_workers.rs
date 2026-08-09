@@ -13,7 +13,7 @@
 
 #![allow(missing_docs)]
 
-mod support;
+mod harness;
 
 use jobmanager::prelude::*;
 
@@ -25,16 +25,16 @@ const TASKS_PER_ITERATION: u32 = 20;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    support::init_tracing();
+    harness::init_tracing();
 
     // Identity of this process, used only for logging: the pool does not need to be told who its
     // peers are, which is the whole point.
-    let node = support::find_argument_value("--node").unwrap_or_else(|| "a".to_string());
+    let node = harness::find_argument_value("--node").unwrap_or_else(|| "a".to_string());
     tracing::info!(%node, "starting node");
 
     let manager = JobsManager::builder()
         // Both nodes must share the prefix - a different prefix is a different job.
-        .s3(support::build_s3_config("distributed-workers"))
+        .s3(harness::build_s3_config("distributed-workers"))
         .workers(2)
         .poll_interval(Duration::from_millis(300))
         .job("distributed job", move |j| {
