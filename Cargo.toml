@@ -60,8 +60,8 @@ serde_json = "1"
 ciborium = "0.2"
 
 # Metrics
-opentelemetry = { version = "0.31.0", features = ["metrics", "trace"] }
-opentelemetry_sdk = { version = "0.31.0", features = ["metrics", "trace", "rt-tokio"] }
+opentelemetry = { version = "0.32.0", features = ["metrics", "trace"] }
+opentelemetry_sdk = { version = "0.32.0", features = ["metrics", "trace", "rt-tokio"] }
 
 # Utilities
 uuid = { version = "1.19", features = ["v7", "v4", "serde"] }
