@@ -16,7 +16,7 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::{
-    Error, Job, JobCode, JobDefinitionRegistry, JobMeta, JobStatus, Metrics, Retrier, RetrierConfig, RetryStep,
+    Error, Job, JobCode, JobDefinitionRegistry, JobMeta, JobStatus, MetricsSink, Retrier, RetrierConfig, RetryStep,
     Storage, StorageError, StorageResult, Task, TaskCode, TaskStatus,
     storage::s3_error::{classify_delete_failures, map_s3_error},
 };
@@ -158,7 +158,8 @@ struct JobJson {
     metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
-/// Configuration for connecting [`S3Storage`] to a bucket.
+/// Connection details of the S3-compatible bucket a pool keeps job state in, passed to
+/// [`JobsManagerBuilder::s3`](crate::JobsManagerBuilder::s3).
 ///
 /// Build with [`S3StorageConfig::new`] and override the optional parts with the `with_*` methods.
 pub struct S3StorageConfig {
@@ -280,7 +281,7 @@ pub struct S3Storage {
     codec: Arc<dyn JobStateCodec>,
     registry: Arc<dyn JobDefinitionRegistry>,
     retrier: Retrier,
-    metrics: Metrics,
+    metrics: Arc<dyn MetricsSink>,
     list_page_size: i32,
     delete_batch_size: usize,
 }
@@ -295,7 +296,7 @@ impl S3Storage {
     pub async fn new(
         config: S3StorageConfig,
         registry: Arc<dyn JobDefinitionRegistry>,
-        metrics: Metrics,
+        metrics: Arc<dyn MetricsSink>,
     ) -> Result<Self, Error> {
         info!("Starting jobmanager with s3 storage {}", config.endpoint);
 
@@ -401,7 +402,7 @@ impl S3Storage {
     }
 
     fn record_s3_ok(&self, operation: &str, start: Instant) {
-        self.metrics.record_s3_operation(operation, "OK", start.elapsed());
+        self.metrics.record_storage_operation(operation, "OK", start.elapsed());
     }
 
     fn record_s3_err<E: std::fmt::Debug>(&self, operation: &str, err: &aws_sdk_s3::error::SdkError<E>, start: Instant) {
@@ -410,7 +411,7 @@ impl S3Storage {
         } else {
             "ERR".to_string()
         };
-        self.metrics.record_s3_operation(operation, &status, start.elapsed());
+        self.metrics.record_storage_operation(operation, &status, start.elapsed());
     }
 
     /// Records an operation whose request succeeded but whose response turned out to be a failure:
@@ -419,7 +420,7 @@ impl S3Storage {
     /// Such a failure has no HTTP status of its own - the status was `200` - so it is labelled
     /// `ERR` rather than a code that would read as if the request itself had failed.
     fn record_s3_response_failure(&self, operation: &str, start: Instant) {
-        self.metrics.record_s3_operation(operation, "ERR", start.elapsed());
+        self.metrics.record_storage_operation(operation, "ERR", start.elapsed());
     }
 
     fn build_job_path(&self, job_code: &JobCode) -> String {
@@ -550,7 +551,7 @@ impl S3Storage {
     fn job_from_json(
         json: JobJson,
         max_iterations: Option<u64>,
-        iteration_interval: Option<chrono::Duration>,
+        iteration_interval: Option<Duration>,
         task_limits: crate::TaskLimits,
         version: &str,
     ) -> Job {
@@ -1054,7 +1055,7 @@ mod tests {
             codec: JobStateCodecKind::Json.build(),
             registry: Arc::new(UnusedJobRegistry),
             retrier: Retrier::new(RetrierConfig::default()),
-            metrics: Metrics::new_disabled(),
+            metrics: Arc::new(crate::NoopMetrics),
             list_page_size: DEFAULT_LIST_PAGE_SIZE,
             delete_batch_size: DEFAULT_DELETE_BATCH_SIZE,
         }

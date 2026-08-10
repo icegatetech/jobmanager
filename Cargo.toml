@@ -39,6 +39,22 @@ multiple_crate_versions = "allow"
 single_match_else = "allow"
 redundant_pub_crate = "allow"
 
+[features]
+# Off by default: `OtelMetrics` takes a `Meter` the caller owns, so anyone else would carry
+# `opentelemetry` unused - or, on another pre-1.0 minor, carry a second copy of it.
+default = []
+# Records measurements through OpenTelemetry. Without it the crate still measures everything, it
+# just needs a `MetricsSink` of the caller's own to record into.
+metrics-otel = ["dep:opentelemetry"]
+
+# This example doubles as its own test: `cargo test --example testing_your_executor` runs the
+# assertions in its `tests` module, which is what keeps a "how to test" example honest. Declaring one
+# example explicitly does not disable auto-discovery of the rest.
+[[example]]
+name = "testing_your_executor"
+path = "examples/testing_your_executor.rs"
+test = true
+
 [dependencies]
 # Error handling
 thiserror = "2"
@@ -47,7 +63,7 @@ thiserror = "2"
 tracing = "0.1"
 
 # Async runtime
-tokio = { version = "1.48.0", features = ["rt", "sync", "time", "macros"] }
+tokio = { version = "1.48.0", features = ["rt", "sync", "time", "macros", "signal"] }
 tokio-util = "0.7"
 
 # AWS S3
@@ -59,9 +75,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ciborium = "0.2"
 
-# Metrics
-opentelemetry = { version = "0.32.0", features = ["metrics", "trace"] }
-opentelemetry_sdk = { version = "0.32.0", features = ["metrics", "trace", "rt-tokio"] }
+# Metrics. The SDK is deliberately absent: the crate records into a `Meter` the caller owns and
+# never builds a provider itself.
+opentelemetry = { version = "0.32.0", features = ["metrics"], optional = true }
 
 # Utilities
 uuid = { version = "1.19", features = ["v7", "v4", "serde"] }

@@ -1,8 +1,8 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use tokio_util::sync::CancellationToken;
-
-use crate::{JobCode, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle, Metrics, Storage};
+use crate::{
+    JobCode, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle, NoopMetrics, Storage,
+};
 
 /// `ManagerEnv` manages `JobsManager` lifecycle for integration tests
 pub struct ManagerEnv {
@@ -19,7 +19,7 @@ impl ManagerEnv {
         job_registry_handle: Arc<JobRegistry>,
         job_registry: Vec<JobDefinition>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let manager = JobsManager::new(storage.clone(), config, job_registry_handle, Metrics::new_disabled())?;
+        let manager = JobsManager::new(storage.clone(), config, job_registry_handle, Arc::new(NoopMetrics))?;
         let manager_handle = manager.start()?;
 
         // Store job definitions for later checking
@@ -32,51 +32,26 @@ impl ManagerEnv {
         })
     }
 
-    /// Wait for all jobs with iteration limits to complete
+    /// Wait until every job with an iteration limit has run it out.
+    ///
+    /// Jobs without a limit are skipped - they never complete by definition. The pool's record of
+    /// finished iterations covers the ones that ended before this call, so the timeout is a
+    /// diagnostic for a job that never finishes, not a race the harness has to win.
     pub async fn wait_for_all_jobs_completion(&self, timeout: Duration) -> Result<(), Box<dyn std::error::Error>> {
-        let start = tokio::time::Instant::now();
-        let cancel_token = CancellationToken::new();
+        let handle = self.manager_handle.as_ref().ok_or("the manager was already stopped")?;
 
-        loop {
-            if start.elapsed() > timeout {
-                return Err("timeout waiting for jobs to complete".into());
-            }
+        let waits = self
+            .job_registry
+            .iter()
+            .filter(|(_, job_def)| job_def.max_iterations().is_some())
+            .map(|(job_code, _)| handle.wait_for_job_completion(job_code));
 
-            // Check all registered jobs
-            let mut all_done = true;
+        tokio::time::timeout(timeout, futures_util::future::try_join_all(waits))
+            .await
+            .map_err(|_| "timeout waiting for jobs to complete")??;
 
-            for (job_code, job_def) in &self.job_registry {
-                // Skip unlimited jobs
-                let Some(max_iterations) = job_def.max_iterations() else {
-                    continue;
-                };
-
-                match self.storage.get_job(job_code, &cancel_token).await {
-                    Ok(job) => {
-                        // Job is not done if:
-                        // 1. Not processed yet, OR
-                        // 2. Hasn't reached the iteration limit
-                        if !job.is_processed() || job.iter_num() < max_iterations {
-                            all_done = false;
-                            break;
-                        }
-                    }
-                    Err(_) => {
-                        // Job doesn't exist yet or error reading it
-                        all_done = false;
-                        break;
-                    }
-                }
-            }
-
-            if all_done {
-                tracing::info!("All jobs completed");
-                return Ok(());
-            }
-
-            // Wait a bit before checking again
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        tracing::info!("All jobs completed");
+        Ok(())
     }
 
     /// Stop the manager

@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -7,153 +6,137 @@ use std::{
     time::Duration,
 };
 
-use chrono::Duration as ChronoDuration;
 use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
-use super::common::s3_container::S3TestContainer;
+use crate::storage::in_memory::InMemoryStorage;
 use crate::{
-    JobCode, JobDefinition, JobRegistry, JobStateCodecKind, JobStatus, JobsManagerConfig, Metrics, RetrierConfig,
-    S3Storage, S3StorageConfig, TaskCode, TaskDefinition, TaskExecutorFn, WorkerConfig,
+    JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStatus, JobsManagerConfig, Storage, TaskCode,
+    TaskDefinition, TaskLimits, TaskOutcome, task_fn,
 };
 
 /// `TestTaskDependencies` verifies that task dependencies are respected.
+///
+/// Blocking on a dependency is a rule of the job's own state, so the in-memory backend stands in
+/// for the object store here.
 #[tokio::test]
 async fn test_task_dependencies() -> Result<(), Box<dyn std::error::Error>> {
     super::common::init_tracing();
 
     let max_iterations = 1u64;
 
-    // 1. Start object storage
-    let store = S3TestContainer::start().await?;
-
-    // 2. Track task execution
+    // 1. Track task execution
     let dep_first_done = Arc::new(AtomicBool::new(false));
     let dep_second_done = Arc::new(AtomicBool::new(false));
     let final_done = Arc::new(AtomicBool::new(false));
+    // What the final task saw of its dependencies when it started. Asserted after the wait: a
+    // failed assertion inside an executor is caught by the worker and would only fail the task.
+    let dependencies_done_before_final = Arc::new(AtomicBool::new(false));
 
-    let init_executor: TaskExecutorFn = Arc::new(move |task, manager, _cancel_token| {
-        let task_id = *task.id();
+    let init_executor = task_fn(move |ctx| async move {
+        let dep_first_def =
+            TaskDefinition::new(TaskCode::new("dep_a"), Duration::from_secs(5)).with_input(b"dep-a".to_vec());
+        let dep_second_def =
+            TaskDefinition::new(TaskCode::new("dep_b"), Duration::from_secs(5)).with_input(b"dep-b".to_vec());
 
-        Box::pin(async move {
-            let dep_first_def =
-                TaskDefinition::new(TaskCode::new("dep_a"), b"dep-a".to_vec(), ChronoDuration::seconds(5))?;
-            let dep_second_def =
-                TaskDefinition::new(TaskCode::new("dep_b"), b"dep-b".to_vec(), ChronoDuration::seconds(5))?;
+        let dep_first_task = ctx.job().add_task(dep_first_def)?;
+        let dep_second_task = ctx.job().add_task(dep_second_def)?;
 
-            let dep_first_id = manager.add_task(dep_first_def)?;
-            let dep_second_id = manager.add_task(dep_second_def)?;
+        let final_def = TaskDefinition::new(TaskCode::new("final_task"), Duration::from_secs(5))
+            .with_input(b"final".to_vec())
+            .with_dependencies(vec![dep_first_task, dep_second_task]);
 
-            let final_def = TaskDefinition::new(
-                TaskCode::new("final_task"),
-                b"final".to_vec(),
-                ChronoDuration::seconds(5),
-            )?
-            .with_dependencies(vec![dep_first_id, dep_second_id]);
-
-            manager.add_task(final_def)?;
-            manager.complete_task(&task_id, b"init-done".to_vec())
-        })
+        ctx.job().add_task(final_def)?;
+        Ok(TaskOutcome::Completed(b"init-done".to_vec()))
     });
 
     let dep_first_done_clone = Arc::clone(&dep_first_done);
-    let dep_first_executor: TaskExecutorFn = Arc::new(move |task, manager, _cancel_token| {
+    let dep_first_executor = task_fn(move |_ctx| {
         let dep_first_done = Arc::clone(&dep_first_done_clone);
-        let task_id = *task.id();
 
-        Box::pin(async move {
+        async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
             dep_first_done.store(true, Ordering::SeqCst);
-            manager.complete_task(&task_id, b"dep-a-done".to_vec())
-        })
+            Ok(TaskOutcome::Completed(b"dep-a-done".to_vec()))
+        }
     });
 
     let dep_second_done_clone = Arc::clone(&dep_second_done);
-    let dep_second_executor: TaskExecutorFn = Arc::new(move |task, manager, _cancel_token| {
+    let dep_second_executor = task_fn(move |_ctx| {
         let dep_second_done = Arc::clone(&dep_second_done_clone);
-        let task_id = *task.id();
 
-        Box::pin(async move {
+        async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
             dep_second_done.store(true, Ordering::SeqCst);
-            manager.complete_task(&task_id, b"dep-b-done".to_vec())
-        })
+            Ok(TaskOutcome::Completed(b"dep-b-done".to_vec()))
+        }
     });
 
     let final_done_clone = Arc::clone(&final_done);
     let dep_first_done_clone = Arc::clone(&dep_first_done);
     let dep_second_done_clone = Arc::clone(&dep_second_done);
-    let final_executor: TaskExecutorFn = Arc::new(move |task, manager, _cancel_token| {
+    let dependencies_done_clone = Arc::clone(&dependencies_done_before_final);
+    let final_executor = task_fn(move |_ctx| {
         let final_done = Arc::clone(&final_done_clone);
         let dep_first_done = Arc::clone(&dep_first_done_clone);
         let dep_second_done = Arc::clone(&dep_second_done_clone);
-        let task_id = *task.id();
+        let dependencies_done = Arc::clone(&dependencies_done_clone);
 
-        Box::pin(async move {
-            assert!(
-                dep_first_done.load(Ordering::SeqCst),
-                "dep_a should be completed before final task runs"
-            );
-            assert!(
-                dep_second_done.load(Ordering::SeqCst),
-                "dep_b should be completed before final task runs"
+        async move {
+            dependencies_done.store(
+                dep_first_done.load(Ordering::SeqCst) && dep_second_done.load(Ordering::SeqCst),
+                Ordering::SeqCst,
             );
             final_done.store(true, Ordering::SeqCst);
-            manager.complete_task(&task_id, b"final-done".to_vec())
-        })
+            Ok(TaskOutcome::Completed(b"final-done".to_vec()))
+        }
     });
 
-    let init_def = TaskDefinition::new(TaskCode::new("init_task"), b"init".to_vec(), ChronoDuration::seconds(5))?;
+    let init_def = TaskDefinition::new(TaskCode::new("init_task"), Duration::from_secs(5)).with_input(b"init".to_vec());
 
-    let mut executors = HashMap::new();
-    executors.insert(TaskCode::new("init_task"), init_executor);
-    executors.insert(TaskCode::new("dep_a"), dep_first_executor);
-    executors.insert(TaskCode::new("dep_b"), dep_second_executor);
-    executors.insert(TaskCode::new("final_task"), final_executor);
+    let job_def = JobDefinition::new(
+        JobDefinitionId::new(),
+        JobCode::new("test_task_dependencies_job"),
+        vec![(init_def, init_executor)],
+        vec![
+            (TaskCode::new("dep_a"), dep_first_executor),
+            (TaskCode::new("dep_b"), dep_second_executor),
+            (TaskCode::new("final_task"), final_executor),
+        ],
+        Vec::new(),
+        TaskLimits::default(),
+    )?
+    .with_max_iterations(max_iterations)?;
 
-    let job_def = JobDefinition::new(JobCode::new("test_task_dependencies_job"), vec![init_def], executors)?
-        .with_max_iterations(max_iterations)?;
-
-    // 3. Create job definitions
+    // 2. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
 
-    // 4. Create storage
-    let storage = S3Storage::new(
-        S3StorageConfig::new(
-            store.endpoint(),
-            store.username(),
-            store.password(),
-            "test-jobs",
-            "us-east-1",
-        )
-        .with_job_state_codec(JobStateCodecKind::Json),
-        job_registry.clone(),
-        Metrics::new_disabled(),
-    )
-    .await?;
-
-    // 5. Start manager
+    // 3. Start manager
     let config = JobsManagerConfig {
         worker_count: 3,
-        worker_config: WorkerConfig {
-            poll_interval: Duration::from_millis(50),
-            poll_interval_randomization: Duration::from_millis(10),
-            retrier_config: RetrierConfig::default(),
-            ..Default::default()
-        },
+        worker_config: super::common::build_worker_config(Duration::from_millis(50), Duration::from_millis(10)),
         ..Default::default()
     };
 
-    let mut manager_env = ManagerEnv::new(Arc::new(storage), config, Arc::clone(&job_registry), vec![job_def])?;
+    let mut manager_env = ManagerEnv::new(
+        Arc::new(InMemoryStorage::new()) as Arc<dyn Storage>,
+        config,
+        Arc::clone(&job_registry),
+        vec![job_def],
+    )?;
 
-    // 6. Wait for completion
+    // 4. Wait for completion
     manager_env.wait_for_all_jobs_completion(Duration::from_secs(15)).await?;
     manager_env.stop().await;
 
-    // 7. Verify
+    // 5. Verify
     assert!(dep_first_done.load(Ordering::SeqCst), "dep_a should execute");
     assert!(dep_second_done.load(Ordering::SeqCst), "dep_b should execute");
     assert!(final_done.load(Ordering::SeqCst), "final task should execute");
+    assert!(
+        dependencies_done_before_final.load(Ordering::SeqCst),
+        "both dependencies should be completed before the final task runs"
+    );
 
     // Verify job state in storage
     let cancel_token = CancellationToken::new();

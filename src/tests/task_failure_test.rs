@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicI32, Ordering},
@@ -7,14 +6,13 @@ use std::{
     time::Duration,
 };
 
-use chrono::Duration as ChronoDuration;
 use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
 use super::common::s3_container::S3TestContainer;
 use crate::{
-    Error, JobCode, JobDefinition, JobRegistry, JobStateCodecKind, JobStatus, JobsManagerConfig, Metrics,
-    RetrierConfig, S3Storage, S3StorageConfig, TaskCode, TaskDefinition, TaskExecutorFn, WorkerConfig,
+    Error, JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStateCodecKind, JobStatus, JobsManagerConfig,
+    NoopMetrics, S3Storage, S3StorageConfig, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, task_fn,
 };
 
 /// `TestTaskFailureAndRetry` verifies that failed tasks are retried
@@ -30,31 +28,34 @@ async fn test_task_failure_and_retry() -> Result<(), Box<dyn std::error::Error>>
 
     let attempt_count_clone = Arc::clone(&attempt_count);
 
-    let executor: TaskExecutorFn = Arc::new(move |task, manager, _cancel_token| {
+    let executor = task_fn(move |_ctx| {
         let count = Arc::clone(&attempt_count_clone);
-        let task_id = *task.id();
 
-        Box::pin(async move {
+        async move {
             let attempt = count.fetch_add(1, Ordering::SeqCst) + 1;
 
             // Fail on first attempt, succeed on second
             if attempt == 1 {
                 tracing::warn!("Attempt {}: simulating failure", attempt);
-                return Err(Error::Other("simulated failure".to_string()));
+                return Err(Error::Other("simulated failure".to_string()).into());
             }
 
             tracing::info!("Attempt {}: succeeding", attempt);
-            manager.complete_task(&task_id, b"success".to_vec())
-        })
+            Ok(TaskOutcome::Completed(b"success".to_vec()))
+        }
     });
 
-    let task_def = TaskDefinition::new(TaskCode::new("flaky_task"), Vec::new(), ChronoDuration::seconds(5))?;
+    let task_def = TaskDefinition::new(TaskCode::new("flaky_task"), Duration::from_secs(5));
 
-    let mut executors = HashMap::new();
-    executors.insert(TaskCode::new("flaky_task"), executor);
-
-    let job_def =
-        JobDefinition::new(JobCode::new("test_retry_job"), vec![task_def], executors)?.with_max_iterations(1)?;
+    let job_def = JobDefinition::new(
+        JobDefinitionId::new(),
+        JobCode::new("test_retry_job"),
+        vec![(task_def, executor)],
+        Vec::new(),
+        Vec::new(),
+        TaskLimits::default(),
+    )?
+    .with_max_iterations(1)?;
 
     // 3. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
@@ -70,19 +71,14 @@ async fn test_task_failure_and_retry() -> Result<(), Box<dyn std::error::Error>>
         )
         .with_job_state_codec(JobStateCodecKind::Json),
         job_registry.clone(),
-        Metrics::new_disabled(),
+        Arc::new(NoopMetrics),
     )
     .await?;
 
     // 5. Start manager
     let config = JobsManagerConfig {
         worker_count: 1,
-        worker_config: WorkerConfig {
-            poll_interval: Duration::from_millis(100),
-            poll_interval_randomization: Duration::from_millis(10),
-            retrier_config: RetrierConfig::default(),
-            ..Default::default()
-        },
+        worker_config: super::common::build_worker_config(Duration::from_millis(100), Duration::from_millis(10)),
         ..Default::default()
     };
 

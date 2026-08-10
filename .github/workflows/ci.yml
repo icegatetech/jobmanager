@@ -55,6 +55,14 @@ jobs:
       - name: Check compilation
         run: cargo check --all-targets
 
+      # Both ends of the feature matrix: the crate has to build with the OpenTelemetry sink and
+      # without it, since the whole point of `MetricsSink` is that the dependency is optional.
+      - name: Check compilation without default features
+        run: cargo check --all-targets --no-default-features
+
+      - name: Check compilation with all features
+        run: cargo check --all-targets --all-features
+
       # Integration tests start an S3-compatible container (RustFS) via testcontainers;
       # Docker is available on ubuntu-latest. --test-threads=1 keeps containers from
       # colliding on ports.

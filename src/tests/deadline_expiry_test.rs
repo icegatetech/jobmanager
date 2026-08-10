@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering},
@@ -7,15 +6,15 @@ use std::{
     time::Duration,
 };
 
-use chrono::Duration as ChronoDuration;
 use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
 use super::common::s3_container::S3TestContainer;
 use crate::storage::Storage;
 use crate::{
-    CachedStorage, JobCode, JobDefinition, JobRegistry, JobStateCodecKind, JobStatus, JobsManagerConfig, Metrics,
-    RetrierConfig, S3Storage, S3StorageConfig, TaskCode, TaskDefinition, TaskExecutorFn, WorkerConfig,
+    CachedStorage, JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStateCodecKind, JobStatus,
+    JobsManagerConfig, NoopMetrics, S3Storage, S3StorageConfig, TaskCode, TaskDefinition, TaskLimits, TaskOutcome,
+    task_fn,
 };
 
 /// `TestTaskDeadlineExpiry` verifies that a task started by one worker is re-picked by another worker after its deadline expires.
@@ -33,11 +32,10 @@ async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
 
     let attempt_count_clone = Arc::clone(&attempt_count);
 
-    let executor: TaskExecutorFn = Arc::new(move |task, manager, _cancel_token| {
+    let executor = task_fn(move |_ctx| {
         let count = Arc::clone(&attempt_count_clone);
-        let task_id = *task.id();
 
-        Box::pin(async move {
+        async move {
             let attempt = count.fetch_add(1, Ordering::SeqCst) + 1;
             tracing::info!("Task attempt {} started", attempt);
 
@@ -47,21 +45,21 @@ async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Complete successfully (first attempt might be stolen).
-            manager.complete_task(&task_id, b"success".to_vec())
-        })
+            Ok(TaskOutcome::Completed(b"success".to_vec()))
+        }
     });
 
-    let task_def = TaskDefinition::new(
-        TaskCode::new("hanging_task"),
+    let task_def = TaskDefinition::new(TaskCode::new("hanging_task"), Duration::from_millis(100));
+
+    let job_def = JobDefinition::new(
+        JobDefinitionId::new(),
+        JobCode::new("test_deadline_job"),
+        vec![(task_def.clone(), executor)],
         Vec::new(),
-        ChronoDuration::milliseconds(100),
-    )?;
-
-    let mut executors = HashMap::new();
-    executors.insert(TaskCode::new("hanging_task"), executor);
-
-    let job_def = JobDefinition::new(JobCode::new("test_deadline_job"), vec![task_def.clone()], executors)?
-        .with_max_iterations(1)?;
+        Vec::new(),
+        TaskLimits::default(),
+    )?
+    .with_max_iterations(1)?;
 
     // 3. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
@@ -79,24 +77,19 @@ async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
             .with_job_state_codec(JobStateCodecKind::Json)
             .with_request_timeout(Duration::from_millis(100)),
             job_registry.clone(),
-            Metrics::new_disabled(),
+            Arc::new(NoopMetrics),
         )
         .await?,
     );
     let storage = Arc::new(CachedStorage::new(
         storage.clone() as Arc<dyn Storage>,
-        Metrics::new_disabled(),
+        Arc::new(NoopMetrics),
     ));
 
     // 5. Start manager
     let config = JobsManagerConfig {
         worker_count: 3, // need more concurrency for small resources system
-        worker_config: WorkerConfig {
-            poll_interval: Duration::from_millis(10),
-            poll_interval_randomization: Duration::from_millis(0),
-            retrier_config: RetrierConfig::default(),
-            ..Default::default()
-        },
+        worker_config: super::common::build_worker_config(Duration::from_millis(10), Duration::ZERO),
         ..Default::default()
     };
 

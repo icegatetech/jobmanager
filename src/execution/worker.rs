@@ -10,37 +10,128 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::execution::job_cleaner::JobIterationStarted;
-use crate::execution::job_manager::JobManagerImpl;
+use crate::execution::job_handle::{JobHandleImpl, JobHandleState};
 use crate::{
-    InternalError, Job, JobCode, JobError, JobRegistry, JobStatus, Metrics, Retrier, RetrierConfig, RetryStep, Storage,
-    StorageError, TaskCode, TaskPickup,
+    Error, InternalError, Job, JobCode, JobError, JobHandle, JobRegistry, JobStatus, MetricsSink, Retrier,
+    RetrierConfig, RetryStep, Storage, StorageError, TaskCode, TaskContext, TaskOutcome, TaskPickup,
 };
 // TODO(low): implement subscription mechanism for job updates between workers - if worker received/saved job, other workers should update their state to reduce races.
 // Can be done via storage wrapper.
 
 /// Polling and retry behavior applied to every worker spawned by a
 /// [`JobsManager`](crate::JobsManager), set through
-/// [`JobsManagerConfig::worker_config`](crate::JobsManagerConfig::worker_config).
+/// [`JobsManagerBuilder::poll_interval`](crate::JobsManagerBuilder::poll_interval),
+/// [`poll_jitter`](crate::JobsManagerBuilder::poll_jitter),
+/// [`max_poll_interval`](crate::JobsManagerBuilder::max_poll_interval) and
+/// [`retrier`](crate::JobsManagerBuilder::retrier).
+///
+/// Every setting is checked as it is set, so an assembled `WorkerConfig` is always a set of
+/// intervals a worker can poll by: there is no separate validation step and no state in between.
 #[derive(Clone)]
 pub struct WorkerConfig {
-    /// Base poll interval for storage.
-    pub poll_interval: Duration,
-    /// Random jitter added to the poll interval.
-    pub poll_interval_randomization: Duration,
-    /// Maximum poll interval when backing off.
-    pub max_poll_interval: Duration,
-    /// Retry policy for storage operations.
-    pub retrier_config: RetrierConfig,
+    poll_interval: Duration,
+    poll_jitter: Duration,
+    max_poll_interval: Option<Duration>,
+    retrier_config: RetrierConfig,
 }
 
 impl Default for WorkerConfig {
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WorkerConfig {
+    const DEFAULT_MAX_POLL_INTERVAL: Duration = Duration::from_secs(2);
+    const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+    const DEFAULT_POLL_JITTER: Duration = Duration::from_millis(50);
+
+    /// Settings a worker polls by unless a `with_*` method replaces one of them.
+    #[must_use]
+    pub fn new() -> Self {
         Self {
-            poll_interval: Duration::from_millis(200),
-            poll_interval_randomization: Duration::from_millis(50),
-            max_poll_interval: Duration::from_secs(2),
+            poll_interval: Self::DEFAULT_POLL_INTERVAL,
+            poll_jitter: Self::DEFAULT_POLL_JITTER,
+            max_poll_interval: None,
             retrier_config: RetrierConfig::default(),
         }
+    }
+
+    /// Replaces the base interval a worker polls storage at after a pass that found work.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Other`] if `interval` is zero - a worker would then poll storage in a loop
+    /// without ever pausing - or if it is above a ceiling already named through
+    /// [`Self::with_max_poll_interval`], which would turn the backoff into a speed-up.
+    pub fn with_poll_interval(mut self, interval: Duration) -> Result<Self, Error> {
+        if interval.is_zero() {
+            return Err(Error::Other("poll interval must be positive".to_string()));
+        }
+        if self.max_poll_interval.is_some_and(|ceiling| ceiling < interval) {
+            return Err(Error::Other(
+                "max poll interval must not be below the poll interval".to_string(),
+            ));
+        }
+
+        self.poll_interval = interval;
+        Ok(self)
+    }
+
+    /// Replaces the upper bound of the random delay added to each poll, which keeps workers from
+    /// polling in lockstep. A zero bound adds nothing.
+    #[must_use]
+    pub const fn with_poll_jitter(mut self, jitter: Duration) -> Self {
+        self.poll_jitter = jitter;
+        self
+    }
+
+    /// Replaces the ceiling the poll interval backs off to while there is no work.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Other`] if `ceiling` is below the poll interval, which would turn the
+    /// backoff into a speed-up.
+    pub fn with_max_poll_interval(mut self, ceiling: Duration) -> Result<Self, Error> {
+        if ceiling < self.poll_interval {
+            return Err(Error::Other(
+                "max poll interval must not be below the poll interval".to_string(),
+            ));
+        }
+
+        self.max_poll_interval = Some(ceiling);
+        Ok(self)
+    }
+
+    /// Replaces the retry policy a worker applies to its storage operations.
+    #[must_use]
+    pub fn with_retrier(mut self, config: RetrierConfig) -> Self {
+        self.retrier_config = config;
+        self
+    }
+
+    /// Base interval a worker polls storage at after a pass that found work.
+    pub const fn poll_interval(&self) -> Duration {
+        self.poll_interval
+    }
+
+    /// Upper bound of the random delay added to each poll.
+    pub const fn poll_jitter(&self) -> Duration {
+        self.poll_jitter
+    }
+
+    /// Ceiling the poll interval backs off to while there is no work.
+    ///
+    /// A ceiling nobody named follows the poll interval whenever that is the larger of the two, so
+    /// a job polled less often than the default ceiling backs off upwards rather than down to it.
+    pub fn max_poll_interval(&self) -> Duration {
+        self.max_poll_interval
+            .unwrap_or_else(|| Self::DEFAULT_MAX_POLL_INTERVAL.max(self.poll_interval))
+    }
+
+    /// Retry policy a worker applies to its storage operations.
+    pub const fn retrier_config(&self) -> &RetrierConfig {
+        &self.retrier_config
     }
 }
 
@@ -77,6 +168,16 @@ fn panic_payload_to_string(panic: &(dyn Any + Send)) -> String {
     }
 }
 
+/// Where a worker publishes the end of a job iteration. What the report is kept in is the pool's
+/// business, not the worker's.
+pub(crate) trait FinishedIterationSink: Send + Sync {
+    /// Records `iter_num` as a finished iteration of `job_code`. Called while a worker is doing its
+    /// own work - both when it finishes an iteration and when it picks up one that already ended -
+    /// so it must neither block nor fail, and must tolerate the same iteration being reported more
+    /// than once.
+    fn record_finished_iteration(&self, job_code: &JobCode, iter_num: u64);
+}
+
 /// Iterates through jobs known to the [`JobRegistry`], polling storage for each and executing
 /// at most one task per job per pass. A single `Worker` runs tasks strictly sequentially;
 /// concurrency across tasks is achieved by running multiple workers (see
@@ -87,11 +188,13 @@ pub(crate) struct Worker {
     storage: Arc<dyn Storage>,
     config: WorkerConfig,
     retrier: Retrier,
-    metrics: Metrics,
+    metrics: Arc<dyn MetricsSink>,
     iteration_notifier: Option<mpsc::Sender<JobIterationStarted>>,
+    finished_iterations: Arc<dyn FinishedIterationSink>,
 
     // Cache to minimize S3 poll requests
     job_cache: RwLock<HashMap<JobCode, JobCacheEntry>>,
+    // TODO(med): combine metrics, iteration_notifier, finished_iterations so that the worker simply publishes the event, and subscribers process the event themselves.
 }
 
 // TODO(med): cancel task if timeout
@@ -101,10 +204,11 @@ impl Worker {
         job_registry: Arc<JobRegistry>,
         storage: Arc<dyn Storage>,
         config: WorkerConfig,
-        metrics: Metrics,
+        metrics: Arc<dyn MetricsSink>,
         cleanup_notifier: Option<mpsc::Sender<JobIterationStarted>>,
+        finished_iterations: Arc<dyn FinishedIterationSink>,
     ) -> Self {
-        let retrier = Retrier::new(config.retrier_config.clone());
+        let retrier = Retrier::new(config.retrier_config().clone());
 
         Self {
             id: Uuid::new_v4(),
@@ -114,6 +218,7 @@ impl Worker {
             retrier,
             metrics,
             iteration_notifier: cleanup_notifier,
+            finished_iterations,
             job_cache: RwLock::new(HashMap::new()),
         }
     }
@@ -122,7 +227,7 @@ impl Worker {
     pub async fn start(&self, cancel_token: CancellationToken) -> Result<(), InternalError> {
         info!("Starting worker {}", self.id);
 
-        let mut poll_interval = self.config.poll_interval;
+        let mut poll_interval = self.config.poll_interval();
         let mut wait_duration = poll_interval;
 
         loop {
@@ -136,25 +241,34 @@ impl Worker {
 
             let work_done = self.process_jobs(&cancel_token).await;
 
-            // Adaptive polling: if no work, increase interval
-            poll_interval = if work_done {
-                self.config.poll_interval
-            } else {
-                std::cmp::min(poll_interval * 2, self.config.max_poll_interval)
-            };
-
-            // Reduce strong concurrency between workers
-            let jitter_ms = if self.config.poll_interval_randomization.is_zero() {
-                self.config.poll_interval
-            } else {
-                #[allow(clippy::cast_possible_truncation)]
-                Duration::from_millis(
-                    rand::rng().random_range(0..self.config.poll_interval_randomization.as_millis() as u64),
-                )
-            };
-
-            wait_duration = jitter_ms + poll_interval;
+            poll_interval = Self::calculate_poll_interval(&self.config, poll_interval, work_done);
+            wait_duration = Self::calculate_wait_duration(&self.config, poll_interval);
         }
+    }
+
+    /// Poll interval for the pass after one that ended with `work_done`: the configured base when
+    /// there was work, and twice `last_poll_interval` - capped at the configured maximum - when
+    /// there was none.
+    fn calculate_poll_interval(config: &WorkerConfig, last_poll_interval: Duration, work_done: bool) -> Duration {
+        if work_done {
+            config.poll_interval()
+        } else {
+            std::cmp::min(last_poll_interval * 2, config.max_poll_interval())
+        }
+    }
+
+    /// How long a worker waits before its next pass: `poll_interval` plus a random share of the
+    /// configured jitter, which is what keeps workers from polling in lockstep. A zero jitter adds
+    /// nothing, so the wait is the poll interval itself.
+    fn calculate_wait_duration(config: &WorkerConfig, poll_interval: Duration) -> Duration {
+        let max_jitter_nanos = u64::try_from(config.poll_jitter().as_nanos()).unwrap_or(u64::MAX);
+        let jitter = if max_jitter_nanos == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_nanos(rand::rng().random_range(0..max_jitter_nanos))
+        };
+
+        poll_interval + jitter
     }
 
     async fn process_jobs(&self, cancel_token: &CancellationToken) -> bool {
@@ -225,17 +339,8 @@ impl Worker {
     #[tracing::instrument(skip(self, cancel_token), fields(worker_id = %self.id, job_code = %code))]
     async fn create_new_job(&self, code: &JobCode, cancel_token: &CancellationToken) -> Result<Job, InternalError> {
         let job_def = self.job_registry.get_job(code)?;
-        let task_defs = job_def.initial_tasks().to_vec();
 
-        let job = Job::new(
-            code.clone(),
-            task_defs,
-            HashMap::new(),
-            self.id,
-            job_def.max_iterations(),
-            job_def.iteration_interval(),
-            job_def.task_limits(),
-        )?;
+        let job = Job::new(&job_def, HashMap::new(), self.id)?;
 
         let (job, outcome) = self
             .save_job_state(job, cancel_token, move |ctx| {
@@ -269,6 +374,14 @@ impl Worker {
         )
     )]
     async fn try_process_job(&self, mut job: Job, cancel_token: &CancellationToken) -> bool {
+        // An iteration this worker did not finish itself - one from a previous run of the pool, or
+        // one another worker completed - is only observable here, on the pickup. Reporting it
+        // before the branches below, because starting the next iteration overwrites the number and
+        // a job that spent its iteration budget stops being polled at all.
+        if job.is_processed() {
+            self.report_finished_iteration(&job);
+        }
+
         // The next-iteration gate anchors on the persisted started_at of the current
         // iteration, which survives process restarts. Log the inputs so a restart that
         // appears to "shift" the schedule can be traced back to the actual anchor.
@@ -339,9 +452,8 @@ impl Worker {
         cancel_token: &CancellationToken,
     ) -> Result<Job, InternalError> {
         let job_def = self.job_registry.get_job(job.code())?;
-        let task_defs = job_def.initial_tasks().to_vec();
 
-        job.next_iteration(task_defs, self.id)?;
+        job.next_iteration(&job_def, self.id)?;
 
         let (job, outcome) = self
             .save_job_state(job, cancel_token, move |ctx| {
@@ -493,33 +605,54 @@ impl Worker {
 
         let executor = self.job_registry.get_task_executor(job.code(), &task.code().clone())?;
 
-        // Execute task (wrap Job with moving)
-        let wrapper_job = RwLock::new(job);
-        let result = {
-            let job_manager = JobManagerImpl::new(&wrapper_job, self.id);
-            AssertUnwindSafe(executor(task, &job_manager, cancel_token.clone()))
-                .catch_unwind()
-                .await
+        // The handle the executor is given owns the job, so it can be moved into an async closure.
+        // Ownership comes back below, once the handle is closed and dropped.
+        let shared_state = Arc::new(RwLock::new(JobHandleState::new(job)));
+        let job_handle = Arc::new(JobHandleImpl::new(Arc::clone(&shared_state), self.id));
+        let outcome = {
+            let ctx = TaskContext::new(
+                task,
+                Arc::clone(&job_handle) as Arc<dyn JobHandle>,
+                cancel_token.clone(),
+            );
+            AssertUnwindSafe(executor.execute(ctx)).catch_unwind().await
         };
-        let result = match result {
-            Ok(result) => result.map_err(InternalError::from),
+        job_handle.close();
+        // Dropping the worker's own reference is what makes the reclaim below succeed; without it
+        // the strong count never reaches one and every execution would take the clone path.
+        drop(job_handle);
+
+        // A shutdown requested while the executor was running leaves the task untouched, exactly as
+        // a cancelled storage call does: nothing is persisted and the task is picked up again
+        // later. The outcome the executor did return is dropped with it.
+        if cancel_token.is_cancelled() {
+            return Err(InternalError::Cancelled);
+        }
+
+        let mut job = match Arc::try_unwrap(shared_state) {
+            Ok(lock) => lock.into_inner().into_job(),
+            // The executor moved the handle into a task that outlived its own call. The handle is
+            // already closed, so the escaped copy can no longer mutate anything; copying the state
+            // out from under the lock is enough to carry on.
+            Err(shared) => {
+                warn!("Executor of task '{}' outlived its own call", task_id);
+                shared.read().job().clone()
+            }
+        };
+
+        let result = match outcome {
+            // The worker closes the task itself, so an executor cannot leave one hanging by
+            // forgetting to.
+            Ok(Ok(TaskOutcome::Completed(output))) => job.complete_task(&task_id, output).map_err(InternalError::from),
+            // The executor resolved the task through its handle; touching it again would fail.
+            Ok(Ok(TaskOutcome::Deferred)) => Self::check_task_resolution(&job, &task_id),
+            Ok(Ok(TaskOutcome::Cancelled)) => return Err(InternalError::Cancelled),
+            Ok(Err(e)) => Err(InternalError::Other(e.to_string())),
             Err(panic) => Err(InternalError::Other(format!(
                 "executor panicked: {}",
                 panic_payload_to_string(&*panic)
             ))),
         };
-
-        if matches!(result, Err(InternalError::Cancelled)) {
-            return Err(InternalError::Cancelled);
-        }
-
-        if cancel_token.is_cancelled() {
-            return Err(InternalError::Cancelled);
-        }
-
-        // Recover ownership. Since executor is done and dropped (it was awaited), and job_manager is local,
-        // we should satisfy unique access.
-        let mut job = wrapper_job.into_inner();
 
         // TODO(low): think about to fail the task when expired
         if result.is_ok() && job.get_task(&task_id)?.is_expired() {
@@ -753,6 +886,7 @@ impl Worker {
 
         if outcome == SaveOutcome::Saved {
             self.record_job_iteration(&job, &JobStatus::Failed);
+            self.report_finished_iteration(&job);
         }
 
         Ok(true)
@@ -761,6 +895,12 @@ impl Worker {
     fn job_completed(&self, job: &Job) {
         info!("Job {} completed (iter: {})", job.code(), job.iter_num());
         self.record_job_iteration(job, &JobStatus::Completed);
+        self.report_finished_iteration(job);
+    }
+
+    /// Publishes the end of an iteration to whoever is waiting for it.
+    fn report_finished_iteration(&self, job: &Job) {
+        self.finished_iterations.record_finished_iteration(job.code(), job.iter_num());
     }
 
     /// Record the duration of a finished job iteration under its final `status`.
@@ -783,9 +923,208 @@ impl Worker {
         cache.insert(
             job_code,
             JobCacheEntry {
-                next_poll: std::time::Instant::now() + self.config.poll_interval,
+                next_poll: std::time::Instant::now() + self.config.poll_interval(),
                 exhausted,
             },
         );
+    }
+
+    /// Checks that the task an executor returned [`TaskOutcome::Deferred`] for is no longer open.
+    /// Completing and failing are the only ways to resolve one, so anything else was left for
+    /// nobody to close.
+    fn check_task_resolution(job: &Job, task_id: &Uuid) -> Result<(), InternalError> {
+        let task = job.get_task(task_id)?;
+        if task.is_completed() || task.is_failed() {
+            return Ok(());
+        }
+
+        Err(InternalError::Other(format!(
+            "executor returned Deferred without resolving task '{task_id}': complete or fail it through \
+         the job handle, or return the outcome instead"
+        )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// How many draws a test takes when it asserts on the spread of the jitter rather than on a
+    /// single value. A range of milliseconds has millions of nanoseconds in it, so this many equal
+    /// draws does not happen for any reason other than a jitter that is not drawn at all.
+    const JITTER_DRAWS: usize = 50;
+
+    fn config_with_jitter(jitter: Duration) -> WorkerConfig {
+        config_polled_every(Duration::from_millis(100)).with_poll_jitter(jitter)
+    }
+
+    fn config_polled_every(interval: Duration) -> WorkerConfig {
+        WorkerConfig::new()
+            .with_poll_interval(interval)
+            .expect("a positive poll interval is accepted")
+    }
+
+    /// Turning the jitter off must leave the poll interval as it is - a worker that waits longer
+    /// than it was configured to polls storage at half the rate its settings promise.
+    #[test]
+    fn a_zero_jitter_leaves_the_poll_interval_alone() {
+        let config = config_with_jitter(Duration::ZERO);
+
+        assert_eq!(
+            Worker::calculate_wait_duration(&config, Duration::from_millis(100)),
+            Duration::from_millis(100)
+        );
+    }
+
+    /// The bound of the jitter is a `Duration` the caller picks freely, so the three cases around
+    /// the millisecond it used to be counted in: below it, exactly it, and above it.
+    #[test]
+    fn a_sub_millisecond_jitter_stays_within_its_bound() {
+        assert_jitter_within_bound(Duration::from_micros(500));
+    }
+
+    #[test]
+    fn a_jitter_of_exactly_one_millisecond_stays_within_its_bound() {
+        assert_jitter_within_bound(Duration::from_millis(1));
+    }
+
+    #[test]
+    fn a_multi_millisecond_jitter_stays_within_its_bound() {
+        assert_jitter_within_bound(Duration::from_millis(5));
+    }
+
+    /// Draws repeatedly, because one draw says nothing about a bound: it asserts that every wait
+    /// lands in `[poll_interval, poll_interval + bound)` and that the jitter is really drawn.
+    fn assert_jitter_within_bound(bound: Duration) {
+        let poll_interval = Duration::from_millis(100);
+        let config = config_with_jitter(bound);
+
+        let waits: Vec<Duration> = (0..JITTER_DRAWS)
+            .map(|_| Worker::calculate_wait_duration(&config, poll_interval))
+            .collect();
+
+        for wait in &waits {
+            assert!(
+                (poll_interval..poll_interval + bound).contains(wait),
+                "a wait of {wait:?} is outside the bound of {bound:?} on top of {poll_interval:?}"
+            );
+        }
+        assert!(
+            waits.iter().any(|wait| *wait != waits[0]),
+            "every draw returned {:?}, so no jitter was added",
+            waits[0]
+        );
+    }
+
+    #[test]
+    fn a_pass_that_found_work_polls_again_at_the_configured_interval() {
+        let config = config_with_jitter(Duration::ZERO);
+
+        assert_eq!(
+            Worker::calculate_poll_interval(&config, Duration::from_millis(800), true),
+            config.poll_interval()
+        );
+    }
+
+    #[test]
+    fn a_pass_without_work_doubles_the_poll_interval() {
+        let config = config_with_jitter(Duration::ZERO);
+
+        assert_eq!(
+            Worker::calculate_poll_interval(&config, Duration::from_millis(100), false),
+            Duration::from_millis(200)
+        );
+    }
+
+    /// The backoff is what the maximum poll interval is a ceiling for, so it must stop there
+    /// instead of doubling past it.
+    #[test]
+    fn the_backoff_stops_at_the_maximum_poll_interval() {
+        let config = config_with_jitter(Duration::ZERO)
+            .with_max_poll_interval(Duration::from_millis(300))
+            .expect("a ceiling above the base interval is accepted");
+
+        assert_eq!(
+            Worker::calculate_poll_interval(&config, Duration::from_millis(200), false),
+            Duration::from_millis(300)
+        );
+    }
+
+    /// A worker given a zero interval polls storage without ever pausing, which saturates a core
+    /// and bills for an unbounded number of requests.
+    #[test]
+    fn a_zero_poll_interval_is_rejected() {
+        let Err(error) = WorkerConfig::new().with_poll_interval(Duration::ZERO) else {
+            panic!("a zero poll interval must be rejected")
+        };
+
+        assert!(
+            error.to_string().contains("poll interval must be positive"),
+            "got: {error}"
+        );
+    }
+
+    /// The maximum is the ceiling the backoff climbs to, so a value below the base would turn the
+    /// backoff into a speed-up.
+    #[test]
+    fn a_maximum_poll_interval_below_the_poll_interval_is_rejected() {
+        let Err(error) =
+            config_polled_every(Duration::from_millis(200)).with_max_poll_interval(Duration::from_millis(100))
+        else {
+            panic!("a ceiling below the base interval must be rejected")
+        };
+
+        assert!(
+            error.to_string().contains("max poll interval must not be below"),
+            "got: {error}"
+        );
+    }
+
+    /// The same pair named in the other order: a config accepting it either way would depend on
+    /// which setting its caller happened to name first.
+    #[test]
+    fn a_poll_interval_above_a_named_maximum_is_rejected() {
+        let named_ceiling = config_polled_every(Duration::from_millis(50))
+            .with_max_poll_interval(Duration::from_millis(100))
+            .expect("a ceiling above the base interval is accepted");
+
+        let Err(error) = named_ceiling.with_poll_interval(Duration::from_millis(200)) else {
+            panic!("a base interval above the named ceiling must be rejected")
+        };
+
+        assert!(
+            error.to_string().contains("max poll interval must not be below"),
+            "got: {error}"
+        );
+    }
+
+    /// A ceiling equal to the base is what a job polled exactly as rarely as it backs off asks for,
+    /// so it has to pass rather than sit on the wrong side of the comparison.
+    #[test]
+    fn a_maximum_poll_interval_equal_to_the_poll_interval_is_accepted() {
+        let config = config_polled_every(Duration::from_secs(10))
+            .with_max_poll_interval(Duration::from_secs(10))
+            .expect("a ceiling equal to the base interval is accepted");
+
+        assert_eq!(config.max_poll_interval(), Duration::from_secs(10));
+    }
+
+    /// The default ceiling is two seconds, so a pool polled less often than that would otherwise be
+    /// held to a setting its caller never named - and its backoff would shorten the wait instead of
+    /// lengthening it.
+    #[test]
+    fn an_unnamed_maximum_poll_interval_follows_a_poll_interval_above_the_default() {
+        let config = config_polled_every(Duration::from_secs(10));
+
+        assert_eq!(config.max_poll_interval(), Duration::from_secs(10));
+    }
+
+    /// Below the default the ceiling stays where it is: the backoff is what lets a worker polled
+    /// often fall back to a rare poll while there is no work.
+    #[test]
+    fn an_unnamed_maximum_poll_interval_keeps_the_default_above_the_poll_interval() {
+        let config = config_polled_every(Duration::from_millis(10));
+
+        assert_eq!(config.max_poll_interval(), WorkerConfig::new().max_poll_interval());
     }
 }

@@ -14,7 +14,8 @@ production function.
   visibility; the visibility boundary is the contract and the test location follows from it.
 - The harness already exists — use it rather than rolling your own: `S3TestContainer` (starts and
   tears down the store), `ManagerEnv` (manager lifecycle, bounded wait, aborts workers on drop),
-  `CountingStorage` (counts backend calls), `InMemoryStorage` (single job, counts reads),
+  `CountingStorage` (counts backend calls), `InMemoryStorage` (current iteration of every job,
+  conditional writes, no persistence),
   `init_tracing`.
 
 ## Choosing the boundary
@@ -24,9 +25,9 @@ Use the lowest boundary that still contains the behavior and its risk.
 - **Unit** — pure state rules: transitions, dependency resolution, attempt accounting, pickup
   selection, merge decisions, key construction, delay calculation. No I/O. Use `Job::restore` /
   `Task::restore` to build a state no legal call sequence reaches (a task already at its cap).
-- **Component** — orchestration where the object store is not the point. `InMemoryStorage` and
-  `CountingStorage` make "how many requests" assertable. A test double implements the production
-  `Storage` trait, never a parallel interface.
+- **Component** — orchestration where the object store is not the point. `InMemoryStorage` stands in
+  for the backend, and `CountingStorage` wrapped around either backend makes "how many requests"
+  assertable. A test double implements the production `Storage` trait, never a parallel interface.
 - **Integration** — required, and mocks are **not** sufficient, for conditional writes and their
   `412` → conflict mapping, key ordering and iteration discovery, request counts, and persisted-state
   round-trips. A change to the stored format is covered for **both** `Json` and `Cbor` through real

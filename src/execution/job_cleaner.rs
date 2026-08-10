@@ -10,7 +10,7 @@ use crate::{
 };
 
 /// Behavior of the background cleanup that deletes iterations which fell out of a job's retention
-/// window, set through [`JobsManagerConfig::cleaner_config`](crate::JobsManagerConfig::cleaner_config).
+/// window, set through [`JobsManagerBuilder::cleaner`](crate::JobsManagerBuilder::cleaner).
 #[derive(Clone)]
 pub struct JobCleanerConfig {
     /// Whether the cleaner runs at all. Enabled by default; turning it off leaves every
@@ -292,13 +292,9 @@ impl JobCleaner {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
-    use chrono::Duration as ChronoDuration;
-
     use super::*;
     use crate::storage::in_memory::InMemoryStorage;
-    use crate::{Job, JobDefinition, TaskCode, TaskDefinition, TaskExecutorFn};
+    use crate::{Job, JobDefinition, JobDefinitionId, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, task_fn};
 
     /// Storage whose deletes always fail with the given error; every other call is delegated, so
     /// the double stays an implementation of the production trait.
@@ -347,19 +343,20 @@ mod tests {
     }
 
     fn build_job_definition(job_code: &JobCode, iteration_retention: u64) -> JobDefinition {
-        let executor: TaskExecutorFn = Arc::new(|task, manager, _cancel_token| {
-            let task_id = *task.id();
-            Box::pin(async move { manager.complete_task(&task_id, b"done".to_vec()) })
-        });
-        let task_def = TaskDefinition::new(TaskCode::new("cleanup_task"), Vec::new(), ChronoDuration::seconds(5))
-            .expect("task definition must build");
-        let mut executors = HashMap::new();
-        executors.insert(TaskCode::new("cleanup_task"), executor);
+        let executor = task_fn(|_ctx| async { Ok(TaskOutcome::Completed(b"done".to_vec())) });
+        let task_def = TaskDefinition::new(TaskCode::new("cleanup_task"), Duration::from_secs(5));
 
-        JobDefinition::new(job_code.clone(), vec![task_def], executors)
-            .expect("job definition must build")
-            .with_iteration_retention(iteration_retention)
-            .expect("iteration retention must be accepted")
+        JobDefinition::new(
+            JobDefinitionId::new(),
+            job_code.clone(),
+            vec![(task_def, executor)],
+            Vec::new(),
+            Vec::new(),
+            TaskLimits::default(),
+        )
+        .expect("job definition must build")
+        .with_iteration_retention(iteration_retention)
+        .expect("iteration retention must be accepted")
     }
 
     #[tokio::test]

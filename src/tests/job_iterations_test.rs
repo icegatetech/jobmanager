@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicI64, AtomicU64, Ordering},
@@ -14,8 +13,8 @@ use super::common::manager_env::ManagerEnv;
 use super::common::s3_container::S3TestContainer;
 use crate::storage::in_memory::InMemoryStorage;
 use crate::{
-    JobCode, JobDefinition, JobRegistry, JobStateCodecKind, JobStatus, JobsManagerConfig, Metrics, RetrierConfig,
-    S3Storage, S3StorageConfig, TaskCode, TaskDefinition, TaskExecutorFn, WorkerConfig,
+    JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStateCodecKind, JobStatus, JobsManagerConfig, NoopMetrics,
+    S3Storage, S3StorageConfig, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, task_fn,
 };
 
 /// `TestJobIterations` verifies that a job can complete and restart for multiple iterations
@@ -32,26 +31,29 @@ async fn test_job_iterations() -> Result<(), Box<dyn std::error::Error>> {
 
     let iteration_count_clone = Arc::clone(&iteration_count);
 
-    let executor: TaskExecutorFn = Arc::new(move |task, manager, _cancel_token| {
+    let executor = task_fn(move |_ctx| {
         let count = Arc::clone(&iteration_count_clone);
-        let task_id = *task.id();
 
-        Box::pin(async move {
+        async move {
             let current = count.fetch_add(1, Ordering::SeqCst) + 1;
             tracing::info!("Executing iteration {}", current);
 
             // Complete the task - job will automatically restart for next iteration
-            manager.complete_task(&task_id, b"done".to_vec())
-        })
+            Ok(TaskOutcome::Completed(b"done".to_vec()))
+        }
     });
 
-    let task_def = TaskDefinition::new(TaskCode::new("iteration_task"), Vec::new(), ChronoDuration::seconds(5))?;
+    let task_def = TaskDefinition::new(TaskCode::new("iteration_task"), Duration::from_secs(5));
 
-    let mut executors = HashMap::new();
-    executors.insert(TaskCode::new("iteration_task"), executor);
-
-    let job_def = JobDefinition::new(JobCode::new("test_iterations_job"), vec![task_def], executors)?
-        .with_max_iterations(expected_iterations)?;
+    let job_def = JobDefinition::new(
+        JobDefinitionId::new(),
+        JobCode::new("test_iterations_job"),
+        vec![(task_def, executor)],
+        Vec::new(),
+        Vec::new(),
+        TaskLimits::default(),
+    )?
+    .with_max_iterations(expected_iterations)?;
 
     // 3. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
@@ -67,19 +69,14 @@ async fn test_job_iterations() -> Result<(), Box<dyn std::error::Error>> {
         )
         .with_job_state_codec(JobStateCodecKind::Json),
         job_registry.clone(),
-        Metrics::new_disabled(),
+        Arc::new(NoopMetrics),
     )
     .await?;
 
     // 5. Start manager
     let config = JobsManagerConfig {
         worker_count: 1,
-        worker_config: WorkerConfig {
-            poll_interval: Duration::from_millis(100),
-            poll_interval_randomization: Duration::from_millis(10),
-            retrier_config: RetrierConfig::default(),
-            ..Default::default()
-        },
+        worker_config: super::common::build_worker_config(Duration::from_millis(100), Duration::from_millis(10)),
         ..Default::default()
     };
 
@@ -121,44 +118,44 @@ async fn test_job_iterations_honors_next_start_at() -> Result<(), Box<dyn std::e
     let iteration_count_clone = Arc::clone(&iteration_count);
     let first_at_clone = Arc::clone(&first_iteration_completed_at_ms);
     let second_at_clone = Arc::clone(&second_iteration_started_at_ms);
-    let executor: TaskExecutorFn = Arc::new(move |task, manager, _cancel_token| {
+    let executor = task_fn(move |ctx| {
         let count = Arc::clone(&iteration_count_clone);
         let first_at = Arc::clone(&first_at_clone);
         let second_at = Arc::clone(&second_at_clone);
-        let task_id = *task.id();
 
-        Box::pin(async move {
+        async move {
             let current = count.fetch_add(1, Ordering::SeqCst) + 1;
 
             if current == 1 {
                 first_at.store(Utc::now().timestamp_millis(), Ordering::SeqCst);
-                manager.set_next_start_at(Utc::now() + ChronoDuration::milliseconds(delay_ms))?;
+                ctx.job()
+                    .set_next_start_at(Utc::now() + ChronoDuration::milliseconds(delay_ms))?;
             }
             if current == 2 {
                 second_at.store(Utc::now().timestamp_millis(), Ordering::SeqCst);
             }
 
-            manager.complete_task(&task_id, b"done".to_vec())
-        })
+            Ok(TaskOutcome::Completed(b"done".to_vec()))
+        }
     });
 
-    let task_def = TaskDefinition::new(TaskCode::new("iteration_task"), Vec::new(), ChronoDuration::seconds(5))?;
-    let mut executors = HashMap::new();
-    executors.insert(TaskCode::new("iteration_task"), executor);
+    let task_def = TaskDefinition::new(TaskCode::new("iteration_task"), Duration::from_secs(5));
 
-    let job_def = JobDefinition::new(JobCode::new("test_next_start_at_job"), vec![task_def], executors)?
-        .with_max_iterations(expected_iterations)?;
+    let job_def = JobDefinition::new(
+        JobDefinitionId::new(),
+        JobCode::new("test_next_start_at_job"),
+        vec![(task_def, executor)],
+        Vec::new(),
+        Vec::new(),
+        TaskLimits::default(),
+    )?
+    .with_max_iterations(expected_iterations)?;
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
 
     let storage = Arc::new(InMemoryStorage::new());
     let config = JobsManagerConfig {
         worker_count: 1,
-        worker_config: WorkerConfig {
-            poll_interval: Duration::from_millis(20),
-            poll_interval_randomization: Duration::from_millis(0),
-            retrier_config: RetrierConfig::default(),
-            ..Default::default()
-        },
+        worker_config: super::common::build_worker_config(Duration::from_millis(20), Duration::ZERO),
         ..Default::default()
     };
     let mut manager_env = ManagerEnv::new(

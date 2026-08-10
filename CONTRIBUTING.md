@@ -27,13 +27,8 @@ If your Docker socket is not in the default location — OrbStack, Colima, rootl
 DOCKER_HOST=unix://$HOME/.orbstack/run/docker.sock make test
 ```
 
-To run the examples you need the same kind of store, but long-lived:
-
-```bash
-make examples-infra-up
-cargo run --example simple_job
-make examples-infra-down
-```
+To run the examples you need the same kind of store, but long-lived; the commands for it are in
+[examples/README.md](examples/README.md).
 
 ## Before committing
 

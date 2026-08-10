@@ -6,7 +6,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
-use crate::{Job, JobCode, JobMeta, Metrics, Storage, StorageError, StorageResult};
+use crate::{Job, JobCode, JobMeta, MetricsSink, Storage, StorageError, StorageResult};
 
 // Internal structure to hold the job state
 #[derive(Clone)]
@@ -19,7 +19,7 @@ struct CachedJob {
 pub struct CachedStorage {
     inner: Arc<dyn Storage>,
     cache: DashMap<JobCode, Arc<Mutex<CachedJob>>>,
-    metrics: Metrics,
+    metrics: Arc<dyn MetricsSink>,
 }
 
 impl CachedStorage {
@@ -27,7 +27,7 @@ impl CachedStorage {
     ///
     /// The cache is checked out against `inner`'s metadata on every read, so a stale entry never
     /// serves a job the backend has since moved on from.
-    pub fn new(inner: Arc<dyn Storage>, metrics: Metrics) -> Self {
+    pub fn new(inner: Arc<dyn Storage>, metrics: Arc<dyn MetricsSink>) -> Self {
         Self {
             inner,
             cache: DashMap::new(),

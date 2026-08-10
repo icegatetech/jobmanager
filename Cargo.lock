@@ -1962,7 +1962,6 @@ dependencies = [
  "futures-util",
  "http 1.4.2",
  "opentelemetry",
- "opentelemetry_sdk",
  "parking_lot",
  "rand 0.9.5",
  "serde",
@@ -2220,24 +2219,6 @@ dependencies = [
  "pin-project-lite",
  "thiserror",
  "tracing",
-]
-
-[[package]]
-name = "opentelemetry_sdk"
-version = "0.32.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b59f80e1ac4d5ff7a2db8fb6c80badb7f0f3f858211fba08dd9aaec750894f9"
-dependencies = [
- "futures-channel",
- "futures-executor",
- "futures-util",
- "opentelemetry",
- "percent-encoding",
- "portable-atomic",
- "rand 0.9.5",
- "thiserror",
- "tokio",
- "tokio-stream",
 ]
 
 [[package]]

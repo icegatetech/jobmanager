@@ -1,4 +1,4 @@
-name: icegate.jobmanager
+name: jobmanager
 
 services:
   jobmanager.rustfs:

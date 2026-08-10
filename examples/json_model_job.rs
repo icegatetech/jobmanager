@@ -1,137 +1,85 @@
+// A typed model crossing the opaque bytes the library stores.
+//
+// A task's input and output are `Vec<u8>` - the crate never looks inside them. Serde is what turns a
+// model into those bytes and back: `to_vec` when a definition is built or a task completes,
+// `from_slice` when a task reads what it was given.
+//
+// Nothing here reads the stored output. Handing a payload from one task to the next is a separate
+// mechanism, shown by `simple_sequence_job` (a task creating its successor) and `fan_out_join` (a
+// join task reading its dependencies' outputs).
+
 #![allow(missing_docs)]
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+mod harness;
 
-use chrono::Duration as ChronoDuration;
-use jobmanager::{
-    CachedStorage, Error, ImmutableTask, JobDefinition, JobManager, JobRegistry, JobStateCodecKind, JobsManager,
-    JobsManagerConfig, Metrics, S3Storage, S3StorageConfig, TaskDefinition, TaskExecutorFn,
-};
+use jobmanager::prelude::*;
 use serde::{Deserialize, Serialize};
-use tracing::{Level, info};
-use uuid::Uuid;
 
+const TASK_CODE: &str = "record";
+
+/// What the task is given, serialized into its input before the job is built.
 #[derive(Serialize, Deserialize, Debug)]
-struct TaskData {
-    message: String,
+struct TaskInput {
+    source: String,
     value: i32,
-    timestamp: u64,
+}
+
+/// What the task reports, serialized into its output when it completes.
+#[derive(Serialize, Deserialize, Debug)]
+struct TaskOutput {
+    source: String,
+    value: i32,
+    recorded_at: u64,
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logging
-    tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+async fn main() -> Result<()> {
+    harness::init_tracing();
 
-    info!("Starting JSON model job example");
+    tracing::info!("Starting JSON model job example");
 
-    // 1. Setup Storage
-    let s3_config = S3StorageConfig::new(
-        "http://localhost:9000",
-        "rustfsadmin",
-        "rustfsadmin",
-        "jobs",
-        "us-east-1",
-    )
-    .with_job_state_codec(JobStateCodecKind::Json);
+    // Built outside the job closure: the closure cannot return the serialization error.
+    let payload = serde_json::to_vec(&TaskInput {
+        source: "sensor-a".to_string(),
+        value: 42,
+    })?;
 
-    // Storage needs job definitions for reading job settings (enrich_job).
-    // We'll build JobRegistry first and share it with storage + manager.
+    let job_code = JobCode::new("JSON model job");
+    let manager = JobsManager::builder()
+        .s3(harness::build_run_scoped_s3_config("json-model"))
+        .job(job_code.clone(), |j| {
+            // One iteration is enough to show the shape, and it lets the example exit by itself.
+            j.max_iterations(1);
+            j.add_task(
+                TaskDefinition::new(TASK_CODE, Duration::from_secs(5)).with_input(payload),
+                task_fn(record_reading),
+            );
+        })
+        .build()
+        .await?;
 
-    // Define tasks
-    let task1_def = TaskDefinition::new("step1".into(), Vec::new(), ChronoDuration::seconds(5))?;
-    let task2_def = TaskDefinition::new("step2".into(), Vec::new(), ChronoDuration::seconds(5))?;
+    let handle = manager.start()?;
+    tracing::info!("Manager started. Waiting for the job to run out its iterations...");
+    handle.wait_for_job_completion(&job_code).await?;
+    handle.shutdown().await?;
 
-    // Register executors
-    let mut executors = HashMap::new();
+    tracing::info!("Example finished.");
+    Ok(())
+}
 
-    // Step 1: Generate Data
-    let step1_executor: TaskExecutorFn = Arc::new(
-        |task: Arc<dyn ImmutableTask>, manager: &dyn JobManager, _cancel_token| {
-            let fut = async move {
-                info!("Step 1 executing...");
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|e| Error::Other(format!("system time error: {e}")))?;
-                let data = TaskData {
-                    message: "Hello from Step 1".to_string(),
-                    value: 42,
-                    timestamp: timestamp.as_secs(),
-                };
+/// Decodes the model it was given and completes with a model of its own.
+async fn record_reading(ctx: TaskContext) -> TaskResult {
+    let reading: TaskInput = serde_json::from_slice(ctx.input())?;
+    tracing::info!(?reading, "decoded the model out of the task input");
 
-                let output_json = serde_json::to_vec(&data)?;
-                info!("Step 1 completing with data: {:?}", data);
-
-                // Use the manager API to persist the output.
-                manager.complete_task(task.id(), output_json)
-            };
-            Box::pin(fut)
-        },
-    );
-
-    // Step 2: Process Data
-    let step2_executor: TaskExecutorFn = Arc::new(
-        |task: Arc<dyn ImmutableTask>, manager: &dyn JobManager, _cancel_token| {
-            let fut = async move {
-                info!("Step 2 executing...");
-
-                // Let's assume for this example the input is what we care about.
-                let input = task.get_input();
-                if input.is_empty() {
-                    info!("Step 2 received empty input");
-                } else {
-                    let data: TaskData = serde_json::from_slice(input)?;
-                    info!("Step 2 received data: {:?}", data);
-                }
-
-                manager.complete_task(task.id(), Vec::new())
-            };
-            Box::pin(fut)
-        },
-    );
-
-    executors.insert("step1".into(), step1_executor);
-    executors.insert("step2".into(), step2_executor);
-
-    let job_def = JobDefinition::new(
-        format!("JSON model job-{}", Uuid::new_v4()).into(),
-        vec![task1_def, task2_def],
-        executors,
-    )?
-    .with_max_iterations(3)?;
-
-    let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
-    // retrier was unused.
-    let s3_storage = Arc::new(S3Storage::new(s3_config, job_registry.clone(), Metrics::new_disabled()).await?);
-
-    let cached_storage = Arc::new(CachedStorage::new(s3_storage, Metrics::new_disabled()));
-
-    // job_code was unused.
-
-    // 2. Start Manager
-    let manager_config = JobsManagerConfig {
-        worker_count: 2,
-        ..Default::default()
+    let recorded_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+    let report = TaskOutput {
+        source: reading.source,
+        value: reading.value,
+        recorded_at,
     };
 
-    // ManagerEnv is for tests. We should use JobsManager directly.
-    let manager = JobsManager::new(
-        cached_storage.clone(),
-        manager_config,
-        Arc::clone(&job_registry),
-        Metrics::new_disabled(),
-    )?;
-
-    let manager_handle = manager.start()?;
-
-    info!("Manager started. Waiting for job execution...");
-
-    // Wait for some time
-    tokio::time::sleep(Duration::from_secs(10)).await;
-
-    manager_handle.shutdown().await?;
-
-    info!("Example finished.");
-
-    Ok(())
+    tracing::info!(?report, "completing with the model as the task output");
+    // Returning the payload is what closes the task: the worker stores it.
+    Ok(TaskOutcome::Completed(serde_json::to_vec(&report)?))
 }

@@ -1,28 +1,12 @@
-use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
-use tokio_util::sync::CancellationToken;
-
-use crate::{Error, ImmutableTask, JobCode, JobDefinition, JobDefinitionRegistry, JobManager, TaskCode};
-
-/// Task executor function signature.
-///
-/// `JobManager` is borrowed so executors can't move it into background tasks.
-/// `CancellationToken` allows executor to stop early on shutdown.
-pub type TaskExecutorFn = Arc<
-    dyn for<'a> Fn(
-            Arc<dyn ImmutableTask>,
-            &'a dyn JobManager,
-            CancellationToken,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>
-        + Send
-        + Sync,
->;
+use crate::{Error, JobCode, JobDefinition, JobDefinitionRegistry, TaskCode, TaskExecutor};
 
 /// Immutable collection of job definitions and task executors.
 #[derive(Clone)]
 pub struct JobRegistry {
     jobs_by_code: HashMap<JobCode, JobDefinition>,
-    task_executors_by_key: HashMap<String, TaskExecutorFn>,
+    task_executors_by_key: HashMap<String, Arc<dyn TaskExecutor>>,
 }
 
 impl JobRegistry {
@@ -38,7 +22,7 @@ impl JobRegistry {
     ///
     /// Returns [`Error::Other`] if `jobs` is empty, if any job code is empty, or if two
     /// definitions share a code.
-    pub fn new(jobs: Vec<JobDefinition>) -> Result<Self, Error> {
+    pub(crate) fn new(jobs: Vec<JobDefinition>) -> Result<Self, Error> {
         if jobs.is_empty() {
             return Err(Error::Other("jobs cannot be empty".into()));
         }
@@ -76,11 +60,15 @@ impl JobRegistry {
             .ok_or_else(|| Error::Other(format!("job definition {code} not found")))
     }
 
-    pub(crate) fn get_task_executor(&self, job_code: &JobCode, task_code: &TaskCode) -> Result<TaskExecutorFn, Error> {
+    pub(crate) fn get_task_executor(
+        &self,
+        job_code: &JobCode,
+        task_code: &TaskCode,
+    ) -> Result<Arc<dyn TaskExecutor>, Error> {
         let key = Self::task_executor_key(job_code, task_code);
         self.task_executors_by_key
             .get(&key)
-            .cloned()
+            .map(Arc::clone)
             .ok_or_else(|| Error::Other(format!("executor for task {task_code} and job {job_code} not exist")))
     }
 
