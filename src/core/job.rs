@@ -987,7 +987,7 @@ impl Job {
         Ok(())
     }
 
-    // Merging. Call this method after worker handled a task.
+    // Merging with saved state. Call this method after worker handled a task to merge saved state with worker state.
     pub(crate) fn merge_with_processed_task(
         &mut self,
         worker_job: &Self,
@@ -1009,16 +1009,23 @@ impl Job {
             JobError::Other(format!("merge job '{}' status failed: {}", self.code, e))
         })?;
 
-        // Merge tasks created or processed by this worker
-        // IMPORTANT. Since tasks can be created in the executor, we need to merge of all tasks that the
-        // current worker has created or updated.
-        for (exist_task_id, task_arc) in &worker_job.tasks_by_id {
-            // A task can be created by an executor or a worker can update a task.
-            // A task is processed by one worker, but created tasks must be merged too.
-            if (task_arc.created_by_worker() == *worker_id && task_arc.processing_by_worker().is_none())
-                || task_arc.processing_by_worker() == Some(*worker_id)
-            {
-                self.tasks_by_id.insert(*exist_task_id, Arc::clone(task_arc));
+        // The worker's copy is a snapshot from the moment it read the job, so it may only overwrite
+        // what this worker changed since. Task by task:
+        //
+        // - created by the executor during this execution: absent from the stored state, so nothing
+        //   there can be newer - merge it, or the work the executor planned is lost.
+        // - processed by this worker: the very result being saved - merge it.
+        // - created by this worker during an *earlier* execution: `created_by_worker` still names
+        //   this worker, but the stored task has moved on and may already be completed by someone
+        //   else - keep the stored one, or it comes back as "to do" and is executed a second time.
+        // - anything else: another worker's to write - keep the stored one.
+        for (worker_task_id, worker_task) in &worker_job.tasks_by_id {
+            let is_created_now = worker_task.created_by_worker() == *worker_id
+                && worker_task.processing_by_worker().is_none()
+                && !self.tasks_by_id.contains_key(worker_task_id);
+            let is_processed_now = worker_task.processing_by_worker() == Some(*worker_id);
+            if is_created_now || is_processed_now {
+                self.tasks_by_id.insert(*worker_task_id, Arc::clone(worker_task));
             }
         }
 
@@ -2647,6 +2654,53 @@ mod tests {
         assert!(matches!(err, JobError::TaskWorkerMismatch));
     }
 
+    /// The rival that picked the same task finished it, closed the iteration and opened the next
+    /// one, so the state this worker re-read after its conflict is an iteration whose tasks carry
+    /// other identifiers. The refusal keeps a task of the previous iteration out of the new one.
+    #[test]
+    fn test_merge_with_picked_task_refuses_a_task_the_stored_iteration_does_not_hold() {
+        let task_id = Uuid::from_u128(1091);
+        let worker_id = Uuid::from_u128(1092);
+        let task = make_task(task_id, "shift", TaskStatus::Todo, Vec::new());
+        let mut worker_job = restore_job(
+            Uuid::from_u128(1093),
+            JobStatus::Started,
+            vec![task],
+            1,
+            None,
+            None,
+            Uuid::from_u128(1094),
+            None,
+            None,
+            None,
+            HashMap::new(),
+        );
+        let picked = worker_job.pick_task_to_execute(&worker_id).unwrap();
+        assert_eq!(picked, TaskPickup::Ready(task_id));
+        worker_job.start_task(&task_id, worker_id).unwrap();
+
+        let next_iteration_task_id = Uuid::from_u128(1095);
+        let mut saved_job = restore_job(
+            *worker_job.id(),
+            JobStatus::Started,
+            vec![make_task(next_iteration_task_id, "shift", TaskStatus::Todo, Vec::new())],
+            2,
+            None,
+            None,
+            Uuid::from_u128(1096),
+            None,
+            None,
+            None,
+            HashMap::new(),
+        );
+
+        let err = saved_job.merge_with_picked_task(&worker_job, &worker_id, &task_id).unwrap_err();
+
+        assert!(matches!(err, JobError::TaskNotFound));
+        assert!(!saved_job.tasks_by_id.contains_key(&task_id));
+        assert_eq!(saved_job.tasks_by_id.len(), 1);
+    }
+
     #[test]
     fn test_merge_with_picked_task_idempotent() {
         let task_id = Uuid::from_u128(1070);
@@ -2762,6 +2816,57 @@ mod tests {
         assert!(matches!(err, JobError::Other(_)));
     }
 
+    /// A start cannot reopen an iteration that already ended. No worker sequence reaches this
+    /// state: an iteration ends as `Failed` only when nothing is pickable, and a task pickable in
+    /// this worker's copy is pickable for the rival too, while a task the rival owns is refused
+    /// earlier by `check_task_stolen`. The stored state is therefore restored directly, and the
+    /// test guards the contract of the method, as `test_start_task_worker_mismatch` does for
+    /// `Task::start`.
+    #[test]
+    fn test_merge_with_picked_task_refuses_a_status_the_stored_iteration_cannot_leave() {
+        let task_id = Uuid::from_u128(1097);
+        let worker_id = Uuid::from_u128(1098);
+        let task = make_task(task_id, "shift", TaskStatus::Todo, Vec::new());
+        let mut worker_job = restore_job(
+            Uuid::from_u128(1099),
+            JobStatus::Started,
+            vec![task.clone()],
+            1,
+            None,
+            None,
+            Uuid::from_u128(1100),
+            None,
+            None,
+            None,
+            HashMap::new(),
+        );
+        let picked = worker_job.pick_task_to_execute(&worker_id).unwrap();
+        assert_eq!(picked, TaskPickup::Ready(task_id));
+        worker_job.start_task(&task_id, worker_id).unwrap();
+
+        let mut saved_job = restore_job(
+            *worker_job.id(),
+            JobStatus::Failed,
+            vec![task],
+            1,
+            None,
+            None,
+            Uuid::from_u128(1101),
+            Some(Utc::now()),
+            Some(Utc::now()),
+            None,
+            HashMap::new(),
+        );
+
+        let err = saved_job.merge_with_picked_task(&worker_job, &worker_id, &task_id).unwrap_err();
+
+        assert!(matches!(err, JobError::Other(_)));
+        assert!(matches!(saved_job.status(), JobStatus::Failed));
+        let stored_task = saved_job.get_task_arc(&task_id).unwrap();
+        assert_eq!(*stored_task.status(), TaskStatus::Todo);
+        assert_eq!(stored_task.processing_by_worker(), None);
+    }
+
     #[test]
     fn test_merge_with_processed_task_different_id() {
         let task = make_task(Uuid::from_u128(110), "todo", TaskStatus::Todo, Vec::new());
@@ -2837,6 +2942,91 @@ mod tests {
             .merge_with_processed_task(&worker_job, &Uuid::from_u128(1203), &task_id)
             .unwrap_err();
         assert!(matches!(err, JobError::TaskWorkerMismatch));
+    }
+
+    /// While this worker ran its task a rival took it over on expiry, finished the iteration and
+    /// opened the next one, so the state re-read after the conflict holds no task with this
+    /// identifier. The absence guard alone would not stop the merge - every task of the previous
+    /// iteration is absent from the new one and would look newly created - so the refusal has to
+    /// come from the check that runs before the merge loop.
+    #[test]
+    fn test_merge_with_processed_task_refuses_a_task_the_stored_iteration_does_not_hold() {
+        let worker_id = Uuid::from_u128(1380);
+        let processed_task_id = Uuid::from_u128(1381);
+        let created_task_id = Uuid::from_u128(1382);
+        let next_iteration_task_id = Uuid::from_u128(1383);
+
+        let mut saved_job = restore_job(
+            Uuid::from_u128(1384),
+            JobStatus::Started,
+            vec![make_task(next_iteration_task_id, "plan", TaskStatus::Todo, Vec::new())],
+            2,
+            None,
+            None,
+            Uuid::from_u128(1385),
+            None,
+            None,
+            None,
+            HashMap::new(),
+        );
+
+        let processed_task = Task::restore(
+            processed_task_id,
+            TaskCode::new("shift"),
+            TaskStatus::Completed,
+            Some(worker_id),
+            worker_id,
+            Duration::seconds(60),
+            Some(Utc::now()),
+            Some(Utc::now()),
+            Some(Utc::now() + Duration::seconds(60)),
+            1,
+            DEFAULT_MAX_ATTEMPTS,
+            Vec::new(),
+            b"shifted".to_vec(),
+            String::new(),
+            Vec::new(),
+        );
+        // Created by this worker and owned by nobody: the merge loop would carry it over, which is
+        // what makes the refusal observable on the task count below.
+        let created_task = Task::restore(
+            created_task_id,
+            TaskCode::new("shift"),
+            TaskStatus::Todo,
+            None,
+            worker_id,
+            Duration::seconds(60),
+            None,
+            None,
+            None,
+            0,
+            DEFAULT_MAX_ATTEMPTS,
+            Vec::new(),
+            Vec::new(),
+            String::new(),
+            Vec::new(),
+        );
+        let worker_job = restore_job(
+            *saved_job.id(),
+            JobStatus::Running,
+            vec![processed_task, created_task],
+            1,
+            None,
+            None,
+            worker_id,
+            Some(Utc::now()),
+            None,
+            None,
+            HashMap::new(),
+        );
+
+        let err = saved_job
+            .merge_with_processed_task(&worker_job, &worker_id, &processed_task_id)
+            .unwrap_err();
+
+        assert!(matches!(err, JobError::TaskNotFound));
+        assert_eq!(saved_job.tasks_by_id.len(), 1);
+        assert!(saved_job.tasks_by_id.contains_key(&next_iteration_task_id));
     }
 
     #[test]
@@ -2937,6 +3127,109 @@ mod tests {
         assert!(job.tasks_by_id.contains_key(&created_task_id));
         assert!(job.tasks_by_id.contains_key(&processed_task_id));
         assert!(!job.tasks_by_id.contains_key(&other_task_id));
+    }
+
+    /// A task this worker created in an earlier execution has moved on in the stored state, and the
+    /// worker's copy still holds it as it was read. Merging that copy back would resurrect a task
+    /// another worker already completed, and the next poll would execute it a second time.
+    #[test]
+    fn test_merge_with_processed_task_keeps_a_sibling_completed_by_another_worker() {
+        let worker_id = Uuid::from_u128(1360);
+        let other_worker_id = Uuid::from_u128(1361);
+        let processed_task_id = Uuid::from_u128(1362);
+        let sibling_task_id = Uuid::from_u128(1363);
+
+        let sibling_in_storage = Task::restore(
+            sibling_task_id,
+            TaskCode::new("shift"),
+            TaskStatus::Completed,
+            Some(other_worker_id),
+            worker_id,
+            Duration::seconds(60),
+            Some(Utc::now()),
+            Some(Utc::now()),
+            Some(Utc::now() + Duration::seconds(60)),
+            1,
+            DEFAULT_MAX_ATTEMPTS,
+            Vec::new(),
+            b"shifted".to_vec(),
+            String::new(),
+            Vec::new(),
+        );
+        let mut job = restore_job(
+            Uuid::from_u128(1364),
+            JobStatus::Running,
+            vec![
+                make_task(processed_task_id, "shift", TaskStatus::Started, Vec::new()),
+                sibling_in_storage,
+            ],
+            1,
+            None,
+            None,
+            other_worker_id,
+            Some(Utc::now()),
+            None,
+            None,
+            HashMap::new(),
+        );
+
+        // The copy this worker read before the other one took the sibling: created by this worker
+        // while it ran the planning task, and untouched since.
+        let sibling_in_worker_copy = Task::restore(
+            sibling_task_id,
+            TaskCode::new("shift"),
+            TaskStatus::Todo,
+            None,
+            worker_id,
+            Duration::seconds(60),
+            None,
+            None,
+            None,
+            0,
+            DEFAULT_MAX_ATTEMPTS,
+            Vec::new(),
+            Vec::new(),
+            String::new(),
+            Vec::new(),
+        );
+        let processed_task = Task::restore(
+            processed_task_id,
+            TaskCode::new("shift"),
+            TaskStatus::Completed,
+            Some(worker_id),
+            worker_id,
+            Duration::seconds(60),
+            Some(Utc::now()),
+            Some(Utc::now()),
+            Some(Utc::now() + Duration::seconds(60)),
+            1,
+            DEFAULT_MAX_ATTEMPTS,
+            Vec::new(),
+            b"shifted".to_vec(),
+            String::new(),
+            Vec::new(),
+        );
+        let worker_job = restore_job(
+            *job.id(),
+            JobStatus::Running,
+            vec![processed_task, sibling_in_worker_copy],
+            1,
+            None,
+            None,
+            worker_id,
+            Some(Utc::now()),
+            None,
+            None,
+            HashMap::new(),
+        );
+
+        job.merge_with_processed_task(&worker_job, &worker_id, &processed_task_id)
+            .unwrap();
+
+        let sibling = job.get_task_arc(&sibling_task_id).unwrap();
+        assert_eq!(*sibling.status(), TaskStatus::Completed);
+        assert_eq!(sibling.processing_by_worker(), Some(other_worker_id));
+        assert!(job.all_tasks_completed(), "the merge must leave every task completed");
     }
 
     #[test]

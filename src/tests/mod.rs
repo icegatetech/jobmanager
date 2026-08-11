@@ -21,5 +21,6 @@ mod task_attempt_limit_test;
 mod task_dependencies_test;
 mod task_failure_test;
 mod task_outcome_test;
+mod task_single_execution_test;
 mod two_jobs_test;
 mod wait_for_iteration_completion_test;
