@@ -370,7 +370,8 @@ impl Worker {
             job_code = %job.code(),
             job_id = %job.id(),
             job_start_at = %job.started_at(),
-            iter = job.iter_num()
+            iter = job.iter_num(),
+            otel.name = %format!("try_process_job-{}", job.code())
         )
     )]
     async fn try_process_job(&self, mut job: Job, cancel_token: &CancellationToken) -> bool {
