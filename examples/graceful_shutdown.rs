@@ -3,20 +3,26 @@
 // A task that ignores its cancellation token delays the whole pool's shutdown by however long its
 // work takes. Selecting on the token instead lets the worker drain immediately, and returning
 // `TaskOutcome::Cancelled` persists nothing: the task stays open and is picked up again on a later
-// run. The attempt it already spent is not returned, which is why the token is checked between units
-// of work rather than only at the start.
+// run. Nothing about the task is written back, so the token is checked between units of work rather
+// than only at the start.
 //
 // That is also why this example wears out, and why two runs in a row do not both show the same
 // thing. Its state lives under a fixed prefix - a prefix unique per run would hide the very thing
 // the example shows, an unfinished task outliving the process - and the cancelled task is left
 // started, holding the deadline it was given. So:
 //
-// - a run started before `IMPORT_TIMEOUT` has passed finds the task still held and prints no step
-//   and no cancellation;
-// - a run after it takes the expired task over, which spends one of `RUNS_BEFORE_BUDGET_SPENT`
-//   attempts;
-// - once those are spent the expired task is failed, the iteration ends failed, and every further
-//   run is silent for good.
+// - a run started before `TASK_TIMEOUT` has passed finds the task still held and prints no step and
+//   no cancellation;
+// - a run after it takes the expired task over, which spends no attempt - nothing refused the task;
+// - once the task's maximum lifetime has passed the expired task is failed, the iteration ends
+//   failed, and - the job being capped at one iteration - every further run is silent for good.
+//   Without that cap the next iteration would be planned from scratch and the example would start
+//   over instead.
+//
+// That lifetime runs by the wall clock from the task's first start, so it is spent by time rather
+// than by runs: `TASK_LIFETIME_IN_DEADLINES` is an upper bound on the runs that still show a
+// cancellation, reached only by starting each run right after the previous deadline passed. Run the
+// example rarely enough and the task is already failed on the second run.
 //
 // Clearing the store starts the count over:
 //
@@ -37,9 +43,12 @@ const STEP_DURATION: Duration = Duration::from_millis(500);
 const RUN_BEFORE_SHUTDOWN: Duration = Duration::from_secs(3);
 /// Deadline the import task is started with, and so how long a cancelled one stays untouchable.
 const TASK_TIMEOUT: Duration = Duration::from_mins(2);
-/// Attempts the import task is given, and so the number of runs that still show a cancellation:
-/// each pickup spends one attempt, and a cancelled task does not get it back.
-const RUNS_BEFORE_BUDGET_SPENT: u32 = 5;
+/// Maximum lifetime of the import task, stated in whole deadlines: how many takeovers fit into it
+/// at most, since a takeover becomes possible once a deadline has passed.
+const TASK_LIFETIME_IN_DEADLINES: u32 = 5;
+/// Longest the import task may occupy its iteration, counted by the wall clock from its first
+/// start: past it the task is failed and the iteration ends failed.
+const TASK_MAX_LIFETIME: Duration = TASK_TIMEOUT.saturating_mul(TASK_LIFETIME_IN_DEADLINES);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -48,8 +57,9 @@ async fn main() -> Result<()> {
     let manager = JobsManager::builder()
         .s3(harness::build_s3_config("graceful-shutdown"))
         .job("graceful shutdown", |j| {
+            j.max_iterations(1);
             j.add_task(
-                TaskDefinition::new(TASK_CODE, TASK_TIMEOUT).with_max_attempts(RUNS_BEFORE_BUDGET_SPENT),
+                TaskDefinition::new(TASK_CODE, TASK_TIMEOUT).with_max_lifetime(TASK_MAX_LIFETIME),
                 task_fn(import_rows_in_steps),
             );
         })

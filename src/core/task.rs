@@ -61,9 +61,10 @@ pub enum TaskStatus {
     /// Task is currently being executed by a worker.
     ///
     /// Ownership is bounded by the task deadline: once it passes, another worker may take the
-    /// task over as long as the task still has attempts left, so a slow executor can end up
-    /// running concurrently with its replacement. Once the budget is spent, an expired task is
-    /// failed instead of taken over - but the executor already running keeps running either way.
+    /// task over as long as the task has not outlived its maximum lifetime, so a slow executor
+    /// can end up running concurrently with its replacement. A takeover spends no attempt; once
+    /// the lifetime is spent, the task is failed instead of taken over - but the executor
+    /// already running keeps running either way, and the result it returns afterwards is refused.
     Started,
     /// Task finished successfully.
     ///
@@ -72,8 +73,9 @@ pub enum TaskStatus {
     Completed,
     /// Task execution failed, task will be processed again.
     ///
-    /// Retried until the task's attempt budget is spent; after that it is terminal - it is never
-    /// picked up again and its job iteration ends as `JobStatus::Failed`.
+    /// Retried until the task's attempt budget is spent or its maximum lifetime has passed; after
+    /// that it is terminal - it is never picked up again and its job iteration ends as
+    /// `JobStatus::Failed`.
     Failed,
 }
 
@@ -91,10 +93,20 @@ impl std::fmt::Display for TaskStatus {
 
 /// Number of execution attempts a task gets before it is terminally failed.
 ///
-/// Sized for transient failures (a flaky object-store call, a lost worker): five
-/// attempts absorb those, while a task failing deterministically stops retrying
-/// instead of blocking its dependents and the job's next iteration forever.
+/// An attempt is spent by the first start of the task and by every start following a refusal of
+/// the executor, never by a takeover of an expired task, so this budget bounds how often the task's
+/// own work may fail. Sized for transient failures (a
+/// flaky object-store call): five attempts absorb those, while a task failing deterministically
+/// stops retrying instead of blocking its dependents and the job's next iteration forever.
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 5;
+
+/// How many times the default maximum lifetime of a task exceeds its deadline.
+///
+/// Takeovers are bounded by the lifetime rather than by the attempt budget, and five deadlines
+/// repeat the ceiling a budget of five starts used to give them. For a task that keeps failing the
+/// lifetime is a second, independent limit: it runs from the first start, so retries that are slow
+/// or start late can run out of it while attempts are still left.
+pub const DEFAULT_LIFETIME_MULTIPLIER: u32 = 5;
 
 /// How a task names another task it waits for.
 ///
@@ -148,15 +160,18 @@ pub struct TaskDefinition {
     code: TaskCode,
     input: Vec<u8>,
     timeout: std::time::Duration,
+    max_lifetime: std::time::Duration,
     depends_on: Vec<TaskRef>,
     max_attempts: u32,
 }
 
 impl TaskDefinition {
-    /// Builds a definition with no input, no dependencies and the default attempt budget.
+    /// Builds a definition with no input, no dependencies, the default attempt budget and a
+    /// maximum lifetime of [`DEFAULT_LIFETIME_MULTIPLIER`] times `timeout`.
     ///
     /// `timeout` is not a cancellation budget: it sets the deadline after which another worker is
-    /// allowed to take the task over, while the original executor keeps running.
+    /// allowed to take the task over. The deadline does cancel the executor's token, but an
+    /// executor that does not select on it keeps running.
     ///
     /// Nothing is rejected here. A definition is checked where a task is actually created from it -
     /// by [`JobsManagerBuilder::build`](crate::JobsManagerBuilder::build) for an initial task and by
@@ -167,6 +182,11 @@ impl TaskDefinition {
             code: code.into(),
             input: Vec::new(),
             timeout,
+            // A product that does not fit is left for `validate` to reject, which it does through
+            // the same range check the timeout goes through.
+            max_lifetime: timeout
+                .checked_mul(DEFAULT_LIFETIME_MULTIPLIER)
+                .unwrap_or(std::time::Duration::MAX),
             depends_on: Vec::new(),
             max_attempts: DEFAULT_MAX_ATTEMPTS,
         }
@@ -195,6 +215,14 @@ impl TaskDefinition {
         self.timeout
     }
 
+    /// Longest the task may occupy its iteration, counted from its first start.
+    ///
+    /// Unless [`Self::with_max_lifetime`] replaces it, this is [`DEFAULT_LIFETIME_MULTIPLIER`]
+    /// times [`Self::timeout`].
+    pub const fn max_lifetime(&self) -> std::time::Duration {
+        self.max_lifetime
+    }
+
     /// Makes the task wait for every reference in `depends_on`, replacing whatever it waited for
     /// before.
     ///
@@ -213,15 +241,35 @@ impl TaskDefinition {
         self
     }
 
-    /// Caps how many times the task may be started before it is terminally
+    /// Caps how many times the executor may refuse the task before it is terminally
     /// failed and never picked up again. Defaults to [`DEFAULT_MAX_ATTEMPTS`].
     ///
-    /// The budget covers every start of the task, not only failures: a takeover
-    /// of an expired task spends an attempt too. A zero budget is rejected where the task is
-    /// created, in the same place as the rest of the definition.
+    /// An attempt is spent by the first start of the task and by every start following a refusal -
+    /// an error or a panic. A takeover of an expired task spends nothing here and is bounded by
+    /// [`Self::with_max_lifetime`] instead. A zero budget is rejected where the task is created,
+    /// in the same place as the rest of the definition.
     #[must_use]
     pub const fn with_max_attempts(mut self, max_attempts: u32) -> Self {
         self.max_attempts = max_attempts;
+        self
+    }
+
+    /// Caps how long the task may occupy its iteration, counted from its first start. Defaults to
+    /// [`DEFAULT_LIFETIME_MULTIPLIER`] times the timeout.
+    ///
+    /// This is what bounds takeovers of an expired task, which spend no attempt: once the lifetime
+    /// has passed the task is failed and its iteration ends as failed, whatever is left of the
+    /// attempt budget.
+    ///
+    /// The bound is absolute rather than approached one deadline at a time: every deadline the task
+    /// is started with is capped by it, so the executor holding the task is signalled no later than
+    /// the lifetime passes, the task is failed on the first pick afterwards whatever its deadline
+    /// says, and a result returned past the lifetime is refused instead of stored. A lifetime that
+    /// is zero, below the timeout, or beyond the millisecond range the stored state uses is rejected
+    /// where the task is created.
+    #[must_use]
+    pub const fn with_max_lifetime(mut self, max_lifetime: std::time::Duration) -> Self {
+        self.max_lifetime = max_lifetime;
         self
     }
 
@@ -243,14 +291,26 @@ impl TaskDefinition {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::Other`] if the timeout is zero or beyond the millisecond range the
-    /// stored state uses, if the attempt budget is zero, or if the input exceeds `limits`.
+    /// Returns [`JobError::Other`] if the timeout or the maximum lifetime is zero or beyond the
+    /// millisecond range the stored state uses, if the lifetime is below the timeout, if the
+    /// attempt budget is zero, or if the input exceeds `limits`.
     pub(crate) fn validate(&self, limits: TaskLimits) -> Result<(), JobError> {
         if self.timeout.is_zero() {
             return Err(JobError::Other("task timeout must be positive".into()));
         }
         if Duration::from_std(self.timeout).is_err() {
             return Err(JobError::Other("task timeout is too large".into()));
+        }
+        if self.max_lifetime.is_zero() {
+            return Err(JobError::Other("task max lifetime must be positive".into()));
+        }
+        if Duration::from_std(self.max_lifetime).is_err() {
+            return Err(JobError::Other("task max lifetime is too large".into()));
+        }
+        if self.max_lifetime < self.timeout {
+            return Err(JobError::Other(
+                "task max lifetime must not be below the task timeout".into(),
+            ));
         }
         if self.max_attempts == 0 {
             return Err(JobError::Other("task max attempts must be positive".into()));
@@ -305,8 +365,9 @@ pub trait ImmutableTask: Send + Sync {
 
     /// Whether the task's execution deadline has passed.
     ///
-    /// True only while a deadline is set, i.e. after the task has been started at least once.
-    /// An expired task may already have been taken over by another worker.
+    /// True only while a deadline is set, i.e. after the task has been started at least once. An
+    /// expired task may already have been taken over by another worker, and its executor's
+    /// cancellation token is cancelled - which the executor is free to ignore.
     fn is_expired(&self) -> bool;
 
     /// Whether the task finished successfully. Terminal - it will not be executed again.
@@ -315,18 +376,43 @@ pub trait ImmutableTask: Send + Sync {
     /// Whether the last attempt failed.
     ///
     /// Not terminal on its own: the task is retried while [`Self::attempts`] is below
-    /// [`Self::max_attempts`], and becomes terminal only once that budget is spent.
+    /// [`Self::max_attempts`] and its maximum lifetime has not passed, and becomes terminal once
+    /// either of the two runs out.
     fn is_failed(&self) -> bool;
 
-    /// Number of times the task has been started, including the attempt in progress.
+    /// Number of attempts the task has spent, including the one in progress.
     ///
-    /// Counts takeovers of expired tasks as well, so it can exceed the number of failures. It is
-    /// compared against [`Self::max_attempts`] to decide whether the task may run again.
+    /// An attempt is spent by the first start of the task and by every start after a refusal of
+    /// the executor; a takeover of an expired task spends none, so this never exceeds the number
+    /// of refusals by more than one. It is compared against [`Self::max_attempts`] to decide
+    /// whether the task may run again.
     fn attempts(&self) -> u32;
 
-    /// Attempt budget the task was defined with: once [`Self::attempts`] reaches it,
-    /// the task is never picked up again and its job iteration ends as failed.
+    /// Attempt budget the task was defined with, bounding refusals of the executor alone: once
+    /// [`Self::attempts`] reaches it, a failed task is terminal and its job iteration ends as
+    /// failed.
+    ///
+    /// It does not bound takeovers. A task left `Started` past its deadline is taken over whatever
+    /// this budget says, so a spent budget is no guarantee against a second run of the same work;
+    /// what stops the takeovers is the task's maximum lifetime, set with
+    /// [`TaskDefinition::with_max_lifetime`].
     fn max_attempts(&self) -> u32;
+}
+
+/// What a worker may do with a task right now, as the task itself sees it.
+///
+/// One answer rather than two predicates: whether a task may be started and whether it must be
+/// failed are outcomes of a single rule, so a caller cannot act on a combination that rule never
+/// produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskAvailability {
+    /// The task may be started. For one already `Started` past its deadline that start is a
+    /// takeover, which spends no attempt.
+    Pickable,
+    /// The task has outlived its maximum lifetime, so it is to be failed rather than taken over.
+    ExpiredPastLifetime,
+    /// Nothing to do with it: running within its deadline, blocked, completed, or terminally failed.
+    Unavailable,
 }
 
 // Task - internal task representation
@@ -337,10 +423,21 @@ pub(crate) struct Task {
     status: TaskStatus,
     processing_by_worker: Option<Uuid>,
     created_by_worker: Uuid,
+    /// Task whose execution created this one, and only while that execution is still running.
+    ///
+    /// The value belongs to that execution rather than to the task: [`Self::restore`] puts `None`
+    /// here, because a task restored into a fresh copy of its job is claimed by no execution, and a
+    /// later failure of the task that once created it leaves it alone.
+    // Named for its pair `created_by_worker` rather than for the lint: the two answer the same
+    // question about a task's origin, and only one of them repeating the type name would hide that.
+    #[allow(clippy::struct_field_names)]
+    created_by_task: Option<Uuid>,
     timeout: Duration,
+    max_lifetime: Duration,
     started_at: Option<DateTime<Utc>>,
     completed_at: Option<DateTime<Utc>>,
-    deadline_at: Option<DateTime<Utc>>,
+    deadline_at: Option<DateTime<Utc>>, // TODO(low): seems like we can calculate deadline from started_at, timeout, lifetime_deadline_at
+    lifetime_deadline_at: Option<DateTime<Utc>>,
     attempt: u32,
     max_attempts: u32,
     input: Vec<u8>,
@@ -354,7 +451,16 @@ impl Task {
     ///
     /// The identifier is passed in rather than minted here, because the dependencies of an initial
     /// task are positions and can only be resolved once every task of the iteration has one.
-    pub(crate) fn new(id: Uuid, created_by_worker: Uuid, task_def: &TaskDefinition, depends_on: Vec<Uuid>) -> Self {
+    ///
+    /// `created_by_task` names the task whose execution is creating this one, and is `None` for an
+    /// initial task of an iteration - see the field's own comment for how long it lives.
+    pub(crate) fn new(
+        id: Uuid,
+        created_by_worker: Uuid,
+        created_by_task: Option<Uuid>,
+        task_def: &TaskDefinition,
+        depends_on: Vec<Uuid>,
+    ) -> Self {
         let status = if depends_on.is_empty() {
             TaskStatus::Todo
         } else {
@@ -367,12 +473,15 @@ impl Task {
             status,
             processing_by_worker: None,
             created_by_worker,
+            created_by_task,
             // The definition passed `TaskDefinition::validate` before reaching here, so the
-            // conversion cannot fail; the fallback only stands in for the lint-forbidden `unwrap`.
+            // conversions cannot fail; the fallbacks only stand in for the lint-forbidden `unwrap`.
             timeout: Duration::from_std(task_def.timeout()).unwrap_or_else(|_| Duration::zero()),
+            max_lifetime: Duration::from_std(task_def.max_lifetime()).unwrap_or_else(|_| Duration::zero()),
             started_at: None,
             completed_at: None,
             deadline_at: None,
+            lifetime_deadline_at: None,
             attempt: 0,
             max_attempts: task_def.max_attempts(),
             input: task_def.input().to_vec(),
@@ -382,6 +491,8 @@ impl Task {
         }
     }
 
+    // TODO(med): carry the fields in a parameter struct; the list has outgrown what a positional
+    // call site can be read at.
     #[allow(clippy::too_many_arguments)]
     pub(crate) const fn restore(
         id: Uuid,
@@ -390,9 +501,11 @@ impl Task {
         processing_by_worker: Option<Uuid>,
         created_by_worker: Uuid,
         timeout: Duration,
+        max_lifetime: Duration,
         started_at: Option<DateTime<Utc>>,
         completed_at: Option<DateTime<Utc>>,
         deadline_at: Option<DateTime<Utc>>,
+        lifetime_deadline_at: Option<DateTime<Utc>>,
         attempt: u32,
         max_attempts: u32,
         input: Vec<u8>,
@@ -406,10 +519,15 @@ impl Task {
             status,
             processing_by_worker,
             created_by_worker,
+            // A restored task has no parent to be rolled back by: whatever created it is long past
+            // its own execution, and the task is in storage rather than in a worker's copy alone.
+            created_by_task: None,
             timeout,
+            max_lifetime,
             started_at,
             completed_at,
             deadline_at,
+            lifetime_deadline_at,
             attempt,
             max_attempts,
             input,
@@ -440,8 +558,16 @@ impl Task {
         self.created_by_worker
     }
 
+    pub(crate) const fn created_by_task(&self) -> Option<Uuid> {
+        self.created_by_task
+    }
+
     pub(crate) const fn timeout(&self) -> Duration {
         self.timeout
+    }
+
+    pub(crate) const fn max_lifetime(&self) -> Duration {
+        self.max_lifetime
     }
 
     pub(crate) const fn attempt(&self) -> u32 {
@@ -464,6 +590,10 @@ impl Task {
         self.deadline_at
     }
 
+    pub(crate) const fn lifetime_deadline_at(&self) -> Option<DateTime<Utc>> {
+        self.lifetime_deadline_at
+    }
+
     pub(crate) fn input(&self) -> &[u8] {
         &self.input
     }
@@ -480,9 +610,17 @@ impl Task {
         &self.depends_on
     }
 
-    // State checks
-    pub(crate) fn is_expired(&self) -> bool {
-        self.deadline_at.is_some_and(|deadline| Utc::now() > deadline)
+    // State checks. The two deadline predicates take the moment to judge by, so the verdict built
+    // from them is one moment's worth and a test can place the boundary exactly; the callers below
+    // read the clock once and pass it on.
+    fn is_expired_at(&self, now: DateTime<Utc>) -> bool {
+        self.deadline_at.is_some_and(|deadline| now > deadline)
+    }
+
+    /// Whether the task has outlived the time it may occupy its iteration. False while the task
+    /// has never been started, since the lifetime runs from the first start.
+    fn is_lifetime_expired_at(&self, now: DateTime<Utc>) -> bool {
+        self.lifetime_deadline_at.is_some_and(|deadline| now > deadline)
     }
 
     pub(crate) const fn is_completed(&self) -> bool {
@@ -497,19 +635,52 @@ impl Task {
         matches!(self.status, TaskStatus::Started)
     }
 
-    /// Whether the task failed and spent its whole attempt budget, so it will
-    /// never run again. Tasks blocked behind it can never be unblocked either,
-    /// which is what ends the job iteration (see `Job::pick_task_to_execute`).
-    pub(crate) const fn is_terminally_failed(&self) -> bool {
-        self.is_failed() && self.attempt >= self.max_attempts
+    pub(crate) const fn is_resolved(&self) -> bool {
+        self.is_completed() || self.is_failed()
     }
 
-    pub(crate) fn can_be_picked_up(&self) -> bool {
+    /// Whether the task failed and ran out of either limit - its attempt budget or its maximum
+    /// lifetime - so it will never run again. Tasks blocked behind it can never be unblocked
+    /// either, which is what ends the job iteration (see `Job::pick_task_to_execute`).
+    ///
+    /// The lifetime is the second reason because a task failed *for* outliving it keeps attempts
+    /// to spare: without it that task would be pickable again and the iteration would never end.
+    pub(crate) fn is_terminally_failed(&self) -> bool {
+        self.is_failed() && (self.attempt >= self.max_attempts || self.is_lifetime_expired_at(Utc::now()))
+    }
+
+    /// What a worker may do with this task right now.
+    ///
+    /// The maximum lifetime is answered first and on its own: it is the absolute bound, so a task
+    /// past it is [`TaskAvailability::ExpiredPastLifetime`] whatever its deadline says. A `Started`
+    /// task within its lifetime is [`TaskAvailability::Pickable`] once its deadline has passed -
+    /// that start is a takeover.
+    ///
+    /// The two limits can only disagree on state written before the deadline was capped by the
+    /// lifetime, since [`Self::start`] leaves the deadline at or below it.
+    pub(crate) fn check_availability(&self) -> TaskAvailability {
         match self.status {
-            TaskStatus::Todo => true,
-            TaskStatus::Failed => !self.is_terminally_failed(),
-            TaskStatus::Blocked | TaskStatus::Completed => false,
-            TaskStatus::Started => self.is_expired() && self.attempt < self.max_attempts,
+            TaskStatus::Todo => TaskAvailability::Pickable,
+            TaskStatus::Blocked | TaskStatus::Completed => TaskAvailability::Unavailable,
+            TaskStatus::Failed => {
+                if self.is_terminally_failed() {
+                    TaskAvailability::Unavailable
+                } else {
+                    TaskAvailability::Pickable
+                }
+            }
+            TaskStatus::Started => {
+                // Both deadlines are judged by one reading: taken apart, a task could be found
+                // takeable by the first predicate and past its lifetime by the second.
+                let now = Utc::now();
+                if self.is_lifetime_expired_at(now) {
+                    TaskAvailability::ExpiredPastLifetime
+                } else if self.is_expired_at(now) {
+                    TaskAvailability::Pickable
+                } else {
+                    TaskAvailability::Unavailable
+                }
+            }
         }
     }
 
@@ -519,6 +690,19 @@ impl Task {
         }
     }
 
+    pub(crate) fn can_be_picked_up(&self) -> bool {
+        matches!(self.check_availability(), TaskAvailability::Pickable)
+    }
+
+    /// Hands the task to `worker_id`, placing the deadline of that ownership and, on the first
+    /// start, the moment the task's lifetime expires.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::TaskWorkerMismatch`] if another worker holds the task, or
+    /// [`JobError::Other`] if the task cannot be started right now or if either moment falls outside
+    /// the range of dates. The task is left as it was in every error case: both moments are computed
+    /// before anything is assigned.
     pub(crate) fn start(&mut self, worker_id: Uuid) -> Result<(), JobError> {
         if !self.can_be_picked_up() {
             if self.processing_by_worker != Some(worker_id) {
@@ -530,30 +714,71 @@ impl Task {
             )));
         }
 
+        // The lifetime runs from the first start rather than from creation, so waiting in `Blocked`
+        // behind a dependency does not eat into it. Both additions are checked: a definition placing
+        // a moment outside the range of dates passes validation - a duration is counted in a wider
+        // range than a date is - and the plain `+` panics on it.
+        let now = Utc::now();
+        let (Some(lifetime_deadline_at), Some(timeout_deadline_at)) = (
+            self.lifetime_deadline_at.or_else(|| now.checked_add_signed(self.max_lifetime)),
+            now.checked_add_signed(self.timeout),
+        ) else {
+            return Err(JobError::Other(format!(
+                "cannot start task (id: {}; code: {}): its timeout of {} ms or its maximum lifetime of {} ms \
+                 falls outside the range of dates",
+                self.id,
+                self.code,
+                self.timeout.num_milliseconds(),
+                self.max_lifetime.num_milliseconds()
+            )));
+        };
+        // Capped by the absolute bound, which is what keeps a takeover from handing the task a
+        // deadline reaching past the lifetime - and the executor an unsignalled window there.
+        let deadline_at = timeout_deadline_at.min(lifetime_deadline_at);
+
+        // A task already `Started` can only be reached here by a takeover, which spends no
+        // attempt: the budget answers for refusals of the executor, not for lost workers.
+        let is_takeover = self.is_started();
+
         self.status = TaskStatus::Started;
         self.processing_by_worker = Some(worker_id);
-        let now = Utc::now();
         self.started_at = Some(now);
-        self.deadline_at = Some(now + self.timeout);
-        // TODO(high): the attempt budget is spent by takeovers as well as by failures.
-        // A task whose worker dies repeatedly is terminally failed without ever having
-        // failed on its own. Split the counters, or exclude takeovers from the budget.
-        self.attempt += 1;
+        self.deadline_at = Some(deadline_at);
+        self.lifetime_deadline_at = Some(lifetime_deadline_at);
+        if !is_takeover {
+            self.attempt += 1;
+        }
 
         Ok(())
     }
 
+    /// Stores `output` as the task's result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::Other`] if the task is not running, or if it has outlived its maximum
+    /// lifetime - the bound is absolute, so work finished past it is refused rather than stored,
+    /// and the task is failed by whoever picks it up next.
     pub(crate) fn complete(&mut self, output: Vec<u8>) -> Result<(), JobError> {
+        let now = Utc::now();
         if !matches!(self.status, TaskStatus::Started) {
             return Err(JobError::Other(format!(
                 "cannot complete task (id: {}; code: {}) with status {:?}",
                 self.id, self.code, self.status
             )));
         }
+        if self.is_lifetime_expired_at(now) {
+            return Err(JobError::Other(format!(
+                "cannot complete task (id: {}; code: {}): it outlived its maximum lifetime of {} ms",
+                self.id,
+                self.code,
+                self.max_lifetime.num_milliseconds()
+            )));
+        }
 
         self.output = output;
         self.status = TaskStatus::Completed;
-        self.completed_at = Some(Utc::now());
+        self.completed_at = Some(now);
 
         Ok(())
     }
@@ -601,7 +826,7 @@ impl ImmutableTask for Task {
     }
 
     fn is_expired(&self) -> bool {
-        self.is_expired()
+        self.is_expired_at(Utc::now())
     }
 
     fn is_completed(&self) -> bool {
@@ -664,6 +889,53 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_zero_max_lifetime() {
+        let def =
+            TaskDefinition::new("t", std::time::Duration::from_secs(1)).with_max_lifetime(std::time::Duration::ZERO);
+        let error = def.validate(TaskLimits::default()).unwrap_err();
+        assert!(
+            error.to_string().contains("max lifetime must be positive"),
+            "got: {error}"
+        );
+    }
+
+    /// The lifetime rides the same millisecond `i64` in the stored state as the timeout does.
+    #[test]
+    fn validate_rejects_max_lifetime_beyond_millisecond_range() {
+        let def =
+            TaskDefinition::new("t", std::time::Duration::from_secs(1)).with_max_lifetime(std::time::Duration::MAX);
+        let error = def.validate(TaskLimits::default()).unwrap_err();
+        assert!(error.to_string().contains("max lifetime is too large"), "got: {error}");
+    }
+
+    /// A lifetime shorter than the deadline would kill the task before its very first deadline
+    /// passed, so no takeover could ever happen.
+    #[test]
+    fn validate_rejects_max_lifetime_below_the_timeout() {
+        let def = TaskDefinition::new("t", std::time::Duration::from_secs(10))
+            .with_max_lifetime(std::time::Duration::from_secs(9));
+        let error = def.validate(TaskLimits::default()).unwrap_err();
+        assert!(error.to_string().contains("must not be below"), "got: {error}");
+    }
+
+    /// The boundary itself is legal: exactly one deadline's worth of lifetime means the task is
+    /// failed at the moment it could first be taken over.
+    #[test]
+    fn validate_accepts_max_lifetime_equal_to_the_timeout() {
+        let def = TaskDefinition::new("t", std::time::Duration::from_secs(10))
+            .with_max_lifetime(std::time::Duration::from_secs(10));
+        assert!(def.validate(TaskLimits::default()).is_ok());
+    }
+
+    /// The default is stated literally rather than derived from the multiplier, so a changed
+    /// multiplier shows up here instead of in production behavior alone.
+    #[test]
+    fn new_sets_the_max_lifetime_to_five_timeouts() {
+        let def = TaskDefinition::new("t", std::time::Duration::from_millis(300));
+        assert_eq!(def.max_lifetime(), std::time::Duration::from_millis(1500));
+    }
+
+    #[test]
     fn validate_rejects_zero_max_attempts() {
         let def = TaskDefinition::new("t", std::time::Duration::from_secs(1)).with_max_attempts(0);
         let error = def.validate(TaskLimits::default()).unwrap_err();
@@ -698,7 +970,7 @@ mod tests {
     #[test]
     fn task_carries_the_definition_timeout() {
         let def = TaskDefinition::new("t", std::time::Duration::from_millis(1500));
-        let task = Task::new(Uuid::from_u128(2), Uuid::from_u128(1), &def, Vec::new());
+        let task = Task::new(Uuid::from_u128(2), Uuid::from_u128(1), None, &def, Vec::new());
         assert_eq!(task.timeout(), Duration::milliseconds(1500));
     }
 
@@ -708,10 +980,282 @@ mod tests {
     fn new_blocks_a_task_that_declares_dependencies() {
         let def = TaskDefinition::new("t", std::time::Duration::from_secs(1));
 
-        let blocked = Task::new(Uuid::from_u128(2), Uuid::from_u128(1), &def, vec![Uuid::from_u128(3)]);
-        let free = Task::new(Uuid::from_u128(4), Uuid::from_u128(1), &def, Vec::new());
+        let blocked = Task::new(
+            Uuid::from_u128(2),
+            Uuid::from_u128(1),
+            None,
+            &def,
+            vec![Uuid::from_u128(3)],
+        );
+        let free = Task::new(Uuid::from_u128(4), Uuid::from_u128(1), None, &def, Vec::new());
 
         assert_eq!(*blocked.status(), TaskStatus::Blocked);
         assert_eq!(*free.status(), TaskStatus::Todo);
+    }
+
+    /// A task in the state a lost worker leaves behind: started, past its deadline, with the
+    /// lifetime deadline `lifetime_left` away.
+    fn expired_started_task(attempt: u32, lifetime_left: Duration) -> Task {
+        let now = Utc::now();
+        Task::restore(
+            Uuid::from_u128(2),
+            TaskCode::new("t"),
+            TaskStatus::Started,
+            Some(Uuid::from_u128(1)),
+            Uuid::from_u128(1),
+            Duration::seconds(5),
+            Duration::seconds(25),
+            Some(now - Duration::seconds(10)),
+            None,
+            Some(now - Duration::seconds(1)),
+            Some(now + lifetime_left),
+            attempt,
+            DEFAULT_MAX_ATTEMPTS,
+            Vec::new(),
+            Vec::new(),
+            String::new(),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn start_from_todo_spends_an_attempt_and_sets_the_lifetime_deadline() {
+        let def = TaskDefinition::new("t", std::time::Duration::from_secs(2));
+        let mut task = Task::new(Uuid::from_u128(2), Uuid::from_u128(1), None, &def, Vec::new());
+
+        let before = Utc::now();
+        task.start(Uuid::from_u128(3)).unwrap();
+
+        assert_eq!(task.attempt(), 1);
+        let lifetime_deadline = task.lifetime_deadline_at().expect("the first start sets the lifetime");
+        assert!(
+            (before + Duration::seconds(10)..=Utc::now() + Duration::seconds(10)).contains(&lifetime_deadline),
+            "the lifetime deadline must be five timeouts past the start, got {lifetime_deadline}"
+        );
+    }
+
+    /// The regression the attempt accounting exists for: a worker that dies leaves the task
+    /// started, and whoever takes it over must not be charged for that.
+    #[test]
+    fn takeover_of_an_expired_task_spends_no_attempt_and_keeps_the_lifetime_deadline() {
+        let mut task = expired_started_task(1, Duration::seconds(20));
+        let lifetime_deadline = task.lifetime_deadline_at();
+
+        task.start(Uuid::from_u128(4)).unwrap();
+
+        assert_eq!(task.attempt(), 1);
+        assert_eq!(task.lifetime_deadline_at(), lifetime_deadline);
+    }
+
+    /// The lifetime runs from the *first* start, so a retry after a refusal spends an attempt but
+    /// leaves the deadline that bounds the task's occupancy of its iteration where it was - the same
+    /// rule a takeover follows, on the path that does spend an attempt.
+    #[test]
+    fn start_after_a_failure_spends_an_attempt_and_keeps_the_lifetime_deadline() {
+        let mut task = Task::restore(
+            Uuid::from_u128(2),
+            TaskCode::new("t"),
+            TaskStatus::Failed,
+            Some(Uuid::from_u128(1)),
+            Uuid::from_u128(1),
+            Duration::seconds(5),
+            Duration::seconds(25),
+            Some(Utc::now() - Duration::seconds(10)),
+            Some(Utc::now() - Duration::seconds(9)),
+            Some(Utc::now() - Duration::seconds(5)),
+            Some(Utc::now() + Duration::seconds(15)),
+            1,
+            DEFAULT_MAX_ATTEMPTS,
+            Vec::new(),
+            Vec::new(),
+            String::new(),
+            Vec::new(),
+        );
+        let lifetime_deadline = task.lifetime_deadline_at();
+
+        task.start(Uuid::from_u128(4)).unwrap();
+
+        assert_eq!(task.attempt(), 2);
+        assert_eq!(task.lifetime_deadline_at(), lifetime_deadline);
+    }
+
+    /// The parent lives no longer than the execution that created the task, so restoring one takes
+    /// no parent at all: a task read back from storage belongs to no open execution, and a later
+    /// failure of whatever created it must leave it alone.
+    ///
+    /// What this pins down is the *absence of an input*, so it can only fail on the day `restore`
+    /// grows one - the same rule under a real backend is asserted in
+    /// `task_lifetime_persistence_test`, where a parent added to the stored representation would
+    /// come back through the shared mapping in `storage::state`.
+    #[test]
+    fn a_restored_task_belongs_to_no_open_execution() {
+        let task = Task::restore(
+            Uuid::from_u128(2),
+            TaskCode::new("t"),
+            TaskStatus::Todo,
+            None,
+            Uuid::from_u128(1),
+            Duration::seconds(5),
+            Duration::seconds(25),
+            None,
+            None,
+            None,
+            None,
+            0,
+            DEFAULT_MAX_ATTEMPTS,
+            Vec::new(),
+            Vec::new(),
+            String::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(task.created_by_task(), None);
+    }
+
+    /// The lifetime is what bounds takeovers now that they spend no attempt, and the two sides of
+    /// that boundary are two different verdicts rather than one predicate turning false.
+    #[test]
+    fn an_expired_task_is_failed_instead_of_taken_over_once_its_lifetime_has_passed() {
+        assert_eq!(
+            expired_started_task(1, Duration::seconds(20)).check_availability(),
+            TaskAvailability::Pickable
+        );
+        assert_eq!(
+            expired_started_task(1, -Duration::seconds(1)).check_availability(),
+            TaskAvailability::ExpiredPastLifetime
+        );
+    }
+
+    /// Which side of the lifetime deadline the instant itself falls on, which the verdict above
+    /// cannot pin down: it reads the clock itself, and by the time it does, a deadline placed at
+    /// "now" is already in the past. The predicate takes the moment, so all three cases are exact -
+    /// and the boundary is the same one the ownership deadline uses.
+    #[test]
+    fn the_lifetime_deadline_belongs_to_the_task_until_the_moment_after_it() {
+        let now = Utc::now();
+        let task = expired_started_task(1, Duration::zero());
+        let lifetime_deadline = task.lifetime_deadline_at().expect("the fixture places the lifetime deadline");
+
+        assert!(!task.is_lifetime_expired_at(lifetime_deadline - Duration::milliseconds(1)));
+        assert!(!task.is_lifetime_expired_at(lifetime_deadline));
+        assert!(task.is_lifetime_expired_at(lifetime_deadline + Duration::milliseconds(1)));
+        assert!(
+            !task.is_lifetime_expired_at(now),
+            "the fixture must place the deadline no earlier than the moment the test started"
+        );
+    }
+
+    /// The bound is absolute: state written before the deadline was capped by the lifetime can hold
+    /// a task whose deadline outlasts it, and such a task is failed rather than left to the executor
+    /// holding it.
+    #[test]
+    fn a_task_past_its_lifetime_is_failed_even_while_its_deadline_holds() {
+        let now = Utc::now();
+        let task = Task::restore(
+            Uuid::from_u128(2),
+            TaskCode::new("t"),
+            TaskStatus::Started,
+            Some(Uuid::from_u128(1)),
+            Uuid::from_u128(1),
+            Duration::seconds(5),
+            Duration::seconds(25),
+            Some(now - Duration::seconds(30)),
+            None,
+            Some(now + Duration::seconds(5)),
+            Some(now - Duration::seconds(1)),
+            1,
+            DEFAULT_MAX_ATTEMPTS,
+            Vec::new(),
+            Vec::new(),
+            String::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(task.check_availability(), TaskAvailability::ExpiredPastLifetime);
+    }
+
+    /// A takeover close to the lifetime deadline must not hand the task a deadline reaching past it:
+    /// the window between the two would be one nobody signalled the executor in, and the lifetime
+    /// would be exceeded by almost a whole deadline. The task's own timeout is five seconds, so a
+    /// lifetime two seconds away is what the deadline has to fall back to.
+    #[test]
+    fn a_start_caps_the_deadline_at_the_lifetime_deadline() {
+        let mut task = expired_started_task(1, Duration::seconds(2));
+        let lifetime_deadline = task.lifetime_deadline_at();
+
+        task.start(Uuid::from_u128(4)).unwrap();
+
+        assert_eq!(task.deadline_at(), lifetime_deadline);
+    }
+
+    /// The ordinary start, where the deadline is the one the definition asked for: capping must not
+    /// shorten a deadline the lifetime leaves room for.
+    #[test]
+    fn a_start_keeps_the_deadline_the_timeout_asks_for_while_the_lifetime_allows_it() {
+        let before = Utc::now();
+        let mut task = expired_started_task(1, Duration::seconds(20));
+
+        task.start(Uuid::from_u128(4)).unwrap();
+
+        let deadline = task.deadline_at().expect("a start places the deadline");
+        assert!(
+            (before + Duration::seconds(5)..=Utc::now() + Duration::seconds(5)).contains(&deadline),
+            "the deadline must be one timeout past the start, got {deadline}"
+        );
+    }
+
+    /// A definition wide enough to place a boundary outside the range of dates passes validation -
+    /// durations are counted in a wider range than dates are - so the start has to answer with an
+    /// error rather than with the panic the plain addition would raise.
+    #[test]
+    fn a_start_whose_lifetime_falls_outside_the_range_of_dates_is_refused() {
+        let mut task = Task::restore(
+            Uuid::from_u128(2),
+            TaskCode::new("t"),
+            TaskStatus::Todo,
+            None,
+            Uuid::from_u128(1),
+            Duration::seconds(5),
+            Duration::MAX,
+            None,
+            None,
+            None,
+            None,
+            0,
+            DEFAULT_MAX_ATTEMPTS,
+            Vec::new(),
+            Vec::new(),
+            String::new(),
+            Vec::new(),
+        );
+
+        let error = task.start(Uuid::from_u128(4)).unwrap_err();
+
+        assert!(error.to_string().contains("outside the range of dates"), "got: {error}");
+        assert_eq!(*task.status(), TaskStatus::Todo, "a refused start must change nothing");
+        assert_eq!(task.attempt(), 0);
+        assert_eq!(task.deadline_at(), None);
+    }
+
+    /// The other half of the absolute bound: work finished past the lifetime is refused, so an
+    /// executor that ignored its cancellation cannot store a result the limit already ruled out.
+    ///
+    /// Both sides of the boundary. Which side the instant itself belongs to is decided by the same
+    /// predicate this reads, asserted exactly in
+    /// `the_lifetime_deadline_belongs_to_the_task_until_the_moment_after_it`.
+    #[test]
+    fn a_task_cannot_be_completed_past_its_lifetime_deadline() {
+        for (lifetime_left, is_accepted) in [(Duration::seconds(10), true), (-Duration::seconds(1), false)] {
+            let mut task = expired_started_task(1, lifetime_left);
+
+            let outcome = task.complete(b"done".to_vec());
+
+            assert_eq!(
+                outcome.is_ok(),
+                is_accepted,
+                "a lifetime deadline {lifetime_left} away: {outcome:?}"
+            );
+            assert_eq!(task.is_completed(), is_accepted);
+        }
     }
 }

@@ -1,10 +1,11 @@
 // An attempt budget running out.
 //
-// Every start spends an attempt - a failure and a takeover of an expired task alike. Once the budget
-// is gone the task is terminal: it is never picked up again, tasks blocked behind it never run, and
-// the iteration ends as failed. The job itself is not over - the next iteration starts on its normal
-// schedule and is planned from scratch, which is what keeps one broken task from blocking its
-// dependents forever.
+// The first start and each start after an executor refusal spend an attempt; a takeover of an
+// expired task spends none. Takeovers are bounded by the task's maximum lifetime instead. Once
+// the budget is gone the task is terminal:
+// it is never picked up again, tasks blocked behind it never run, and the iteration ends as failed.
+// The job itself is not over - the next iteration starts on its normal schedule and is planned from
+// scratch, which is what keeps one broken task from blocking its dependents forever.
 //
 // The default budget is five (`DEFAULT_MAX_ATTEMPTS`); two is used here so the example is quick.
 

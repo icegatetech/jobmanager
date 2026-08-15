@@ -12,8 +12,8 @@ use tokio_util::sync::CancellationToken;
 use super::common::manager_env::ManagerEnv;
 use crate::storage::in_memory::InMemoryStorage;
 use crate::{
-    Job, JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStatus, JobsManagerConfig, Storage, TaskCode,
-    TaskDefinition, TaskExecutor, TaskLimits, TaskOutcome, task_fn,
+    Error, Job, JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStatus, JobsManagerConfig, Storage, TaskCode,
+    TaskDefinition, TaskExecutor, TaskLimits, TaskOutcome, TaskStatus, task_fn,
 };
 
 /// How long a test waits for the single iteration to finish.
@@ -178,23 +178,34 @@ async fn deferred_outcome_without_resolution_fails_the_task() -> Result<(), Box<
     Ok(())
 }
 
-/// `Cancelled` persists nothing: the task stays open and is picked up again later, and the job does
-/// not reach a terminal state.
+/// Deadline of the task below, and so how long its executor waits for its token.
+const CANCELLED_TASK_TIMEOUT: Duration = Duration::from_millis(100);
+/// Maximum lifetime of that task, wide enough that the takeovers following the cancellation never
+/// reach it: what is under test is what a cancelled execution writes, not the lifetime bound.
+const CANCELLED_TASK_MAX_LIFETIME: Duration = Duration::from_secs(30);
+
+/// `Cancelled` reported after the deadline cancelled the execution persists nothing: the task is
+/// left exactly as the next worker has to find it - started, on the attempt its first start spent,
+/// with no failure recorded.
 ///
 /// The iteration never finishes, so the pool is stopped on the executor's own report instead of
-/// being waited out - a wait that has to time out costs the suite that timeout on every run.
+/// being waited out - a wait that has to time out costs the suite that timeout on every run. The
+/// report is sent only after the token fired and nothing stops the pool before it, so the
+/// cancellation under test can only be the deadline; `Cancelled` on a token nobody cancelled fails
+/// the task instead, which `worker::tests` covers.
 #[tokio::test]
-async fn cancelled_outcome_leaves_the_task_open() -> Result<(), Box<dyn std::error::Error>> {
+async fn cancelled_outcome_after_the_deadline_persists_nothing() -> Result<(), Box<dyn std::error::Error>> {
     super::common::init_tracing();
 
-    let (executor_reports, mut executor_ran) = mpsc::channel::<()>(1);
+    let (executor_reports, mut executor_was_cancelled) = mpsc::channel::<()>(1);
 
     let mut manager_env = start_one_task_job(
         "outcome_cancelled",
-        task_definition(),
-        task_fn(move |_ctx| {
+        TaskDefinition::new(TASK_CODE, CANCELLED_TASK_TIMEOUT).with_max_lifetime(CANCELLED_TASK_MAX_LIFETIME),
+        task_fn(move |ctx| {
             let reports = executor_reports.clone();
             async move {
+                ctx.cancel_token().cancelled().await;
                 // The report is what the test waits for; a full channel means it already arrived.
                 let _ = reports.try_send(());
                 Ok(TaskOutcome::Cancelled)
@@ -202,9 +213,9 @@ async fn cancelled_outcome_leaves_the_task_open() -> Result<(), Box<dyn std::err
         }),
     )?;
 
-    tokio::time::timeout(ITERATION_TIMEOUT, executor_ran.recv())
+    tokio::time::timeout(ITERATION_TIMEOUT, executor_was_cancelled.recv())
         .await?
-        .ok_or("the executor must report that it ran")?;
+        .ok_or("the deadline must cancel the token of the executor holding the task")?;
     manager_env.stop().await;
 
     let job = manager_env
@@ -212,8 +223,14 @@ async fn cancelled_outcome_leaves_the_task_open() -> Result<(), Box<dyn std::err
         .get_job(&JobCode::new("outcome_cancelled"), &CancellationToken::new())
         .await?;
     assert_ne!(*job.status(), JobStatus::Completed);
-    let task = job.get_tasks_by_code(&TaskCode::new(TASK_CODE)).remove(0);
-    assert!(!task.is_completed());
+    let task = job.tasks_as_iter().next().ok_or("the iteration must still hold its task")?;
+    assert_eq!(*task.status(), TaskStatus::Started);
+    assert_eq!(
+        task.attempt(),
+        1,
+        "the first start spends the only attempt; a takeover after it spends none"
+    );
+    assert!(task.error_msg().is_empty(), "got: {}", task.error_msg());
     Ok(())
 }
 
@@ -299,5 +316,80 @@ async fn a_panic_with_an_unreadable_payload_is_recorded_as_unknown() -> Result<(
     let task = job.get_tasks_by_code(&TaskCode::new(TASK_CODE)).remove(0);
     assert!(!task.is_completed());
     assert!(task.get_error().contains("unknown panic"), "got: {}", task.get_error());
+    Ok(())
+}
+
+/// An execution can report the result of its work and still end in error - it completes its own task
+/// and only then fails on something after it. What the executor wrote stands, and it is what gets
+/// persisted: a worker that failed such a task a second time got the refusal the domain owes it and
+/// saved nothing at all, leaving the task started in storage for takeover after takeover to run
+/// work that was already done.
+///
+/// The task keeps its default attempt budget, so a run that persisted nothing would be taken over
+/// and executed again rather than ending the iteration.
+#[tokio::test]
+async fn an_error_after_the_executor_completed_its_task_keeps_the_completed_result()
+-> Result<(), Box<dyn std::error::Error>> {
+    super::common::init_tracing();
+
+    let runs = Arc::new(AtomicUsize::new(0));
+    let runs_in_executor = Arc::clone(&runs);
+
+    let job = run_one_iteration(
+        "outcome_error_after_complete",
+        task_definition(),
+        task_fn(move |ctx| {
+            let runs = Arc::clone(&runs_in_executor);
+            async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                ctx.job().complete_task(ctx.id(), b"by executor".to_vec())?;
+                Err(Error::Other("failed after reporting its result".to_string()).into())
+            }
+        }),
+    )
+    .await?;
+
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "a persisted result must not be executed a second time"
+    );
+    assert_eq!(*job.status(), JobStatus::Completed);
+    let task = job.get_tasks_by_code(&TaskCode::new(TASK_CODE)).remove(0);
+    assert!(task.is_completed());
+    assert_eq!(task.get_output(), b"by executor");
+    Ok(())
+}
+
+/// The same for the other resolution: an executor that failed its own task and then returned the
+/// error as well keeps the reason it gave, and its refusal is spent once rather than repeated after
+/// every deadline.
+#[tokio::test]
+async fn an_error_after_the_executor_failed_its_task_keeps_the_reason_it_gave() -> Result<(), Box<dyn std::error::Error>>
+{
+    super::common::init_tracing();
+
+    let runs = Arc::new(AtomicUsize::new(0));
+    let runs_in_executor = Arc::clone(&runs);
+
+    let job = run_one_iteration(
+        "outcome_error_after_fail",
+        task_definition().with_max_attempts(1),
+        task_fn(move |ctx| {
+            let runs = Arc::clone(&runs_in_executor);
+            async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                ctx.job().fail_task(ctx.id(), "rejected by executor")?;
+                Err(Error::Other("failed after refusing the task".to_string()).into())
+            }
+        }),
+    )
+    .await?;
+
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "one attempt, one execution");
+    assert_eq!(*job.status(), JobStatus::Failed);
+    let task = job.get_tasks_by_code(&TaskCode::new(TASK_CODE)).remove(0);
+    assert!(task.is_failed());
+    assert_eq!(task.get_error(), "rejected by executor");
     Ok(())
 }

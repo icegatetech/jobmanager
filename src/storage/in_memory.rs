@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
+use crate::storage::state::copy_persisted_state;
 use crate::{Job, JobCode, JobMeta, Storage, StorageError, StorageResult};
 
 /// In-memory `Storage` for tests and examples: holds the current iteration of every job it was
@@ -12,8 +13,10 @@ use crate::{Job, JobCode, JobMeta, Storage, StorageError, StorageResult};
 /// Writes are conditional exactly as the object-store backend's are - a save carrying a version
 /// other than the stored one, or creating an iteration that is not the next one, is refused with
 /// [`StorageError::ConcurrentModification`] - so a component test sees the same conflicts a worker
-/// meets in production. Not intended for production use: state is lost with the process. How many
-/// requests a wrapping backend actually issued is counted by `CountingStorage`, not here.
+/// meets in production. What a save keeps is the same as well: the job is put through the stored
+/// representation on its way in, so a test is not a more forgiving oracle than the object store.
+/// Not intended for production use: state is lost with the process. How many requests a wrapping
+/// backend actually issued is counted by `CountingStorage`, not here.
 pub struct InMemoryStorage {
     jobs_by_code: RwLock<HashMap<JobCode, Job>>,
     version_counter: AtomicU64,
@@ -111,7 +114,7 @@ impl Storage for InMemoryStorage {
 
         let next_version = self.version_counter.fetch_add(1, Ordering::SeqCst) + 1;
         job.update_version(format!("{next_version}"));
-        jobs.insert(job.code().clone(), job.clone());
+        jobs.insert(job.code().clone(), copy_persisted_state(job));
         Ok(())
     }
 

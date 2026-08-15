@@ -86,6 +86,64 @@ async fn test_cache_invalidation() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// A cache hit answers with the state the worker saved, down to the execution a task was created
+/// by: the cache holds this pool's own write, and which fields a backend keeps of it is that
+/// backend's business, not something the cache reproduces.
+///
+/// The difference is observable and harmless: the creating execution is read only by
+/// [`Job::fail_task`], which needs the task it rolls back to be `Started`, and a started task is
+/// never saved together with the tasks its execution created - the save carrying them records it as
+/// completed or failed.
+#[tokio::test]
+async fn a_cache_hit_returns_the_job_the_worker_saved() -> Result<(), Box<dyn std::error::Error>> {
+    super::common::init_tracing();
+
+    let storage = Arc::new(CountingStorage::new(
+        Arc::new(InMemoryStorage::new()) as Arc<dyn Storage>
+    ));
+    let cached_storage = CachedStorage::new(Arc::clone(&storage) as Arc<dyn Storage>, Arc::new(NoopMetrics));
+    let cancel_token = CancellationToken::new();
+    let worker_id = Uuid::from_u128(1);
+    let job_code = JobCode::new("cached_parented_job");
+
+    let job_def = JobDefinition::new(
+        JobDefinitionId::new(),
+        job_code.clone(),
+        vec![(
+            TaskDefinition::new(TaskCode::from("plan"), Duration::from_secs(5)),
+            task_fn(|_ctx| async { Ok(TaskOutcome::empty()) }),
+        )],
+        Vec::new(),
+        Vec::new(),
+        TaskLimits::default(),
+    )?
+    .with_max_iterations(1)?;
+    let mut job = Job::new(&job_def, HashMap::new(), worker_id)?;
+    let parent_id = *job
+        .get_tasks_by_code(&TaskCode::from("plan"))
+        .first()
+        .ok_or("the description declares one task")?
+        .id();
+    job.work(&worker_id)?;
+    job.start_task(&parent_id, worker_id)?;
+    let child_id = job.add_task(
+        &TaskDefinition::new(TaskCode::from("planned"), Duration::from_secs(5)),
+        worker_id,
+        Some(parent_id),
+    )?;
+    cached_storage.save_job(&mut job, &cancel_token).await?;
+
+    let job_from_cache = cached_storage.get_job(&job_code, &cancel_token).await?;
+
+    assert_eq!(
+        storage.get_by_meta_calls(),
+        0,
+        "the read under test must have been served by the cache"
+    );
+    assert_eq!(job_from_cache.find_task(&child_id)?.created_by_task(), Some(parent_id));
+    Ok(())
+}
+
 /// Which backend a pool ends up reading through, asserted on the only thing that tells the two
 /// apart from outside: the read cache is the sole source of these two measurements, so a pool
 /// running without it must produce neither.

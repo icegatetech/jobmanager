@@ -1,5 +1,6 @@
-use std::{any::Any, collections::HashMap, panic::AssertUnwindSafe, sync::Arc};
+use std::{any::Any, collections::HashMap, future::Future, panic::AssertUnwindSafe, sync::Arc};
 
+use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
 use parking_lot::{Mutex, RwLock};
 use rand::Rng;
@@ -13,7 +14,7 @@ use crate::execution::job_cleaner::JobIterationStarted;
 use crate::execution::job_handle::{JobHandleImpl, JobHandleState};
 use crate::{
     Error, InternalError, Job, JobCode, JobError, JobHandle, JobRegistry, JobStatus, MetricsSink, Retrier,
-    RetrierConfig, RetryStep, Storage, StorageError, TaskCode, TaskContext, TaskOutcome, TaskPickup,
+    RetrierConfig, RetryStep, Storage, StorageError, TaskCode, TaskContext, TaskOutcome, TaskPickup, TaskResult,
 };
 // TODO(low): implement subscription mechanism for job updates between workers - if worker received/saved job, other workers should update their state to reduce races.
 // Can be done via storage wrapper.
@@ -196,8 +197,6 @@ pub(crate) struct Worker {
     job_cache: RwLock<HashMap<JobCode, JobCacheEntry>>,
     // TODO(med): combine metrics, iteration_notifier, finished_iterations so that the worker simply publishes the event, and subscribers process the event themselves.
 }
-
-// TODO(med): cancel task if timeout
 
 impl Worker {
     pub fn new(
@@ -606,17 +605,29 @@ impl Worker {
 
         let executor = self.job_registry.get_task_executor(job.code(), &task.code().clone())?;
 
+        // The deadline is what the executor's cancellation is scheduled by, so it is read from the
+        // domain state rather than from the view the executor itself is given. It already accounts
+        // for the task's maximum lifetime - the domain caps it there - so there is no second
+        // boundary for a worker to work out.
+        let deadline_at = job.find_task(&task_id)?.deadline_at();
+
         // The handle the executor is given owns the job, so it can be moved into an async closure.
         // Ownership comes back below, once the handle is closed and dropped.
         let shared_state = Arc::new(RwLock::new(JobHandleState::new(job)));
-        let job_handle = Arc::new(JobHandleImpl::new(Arc::clone(&shared_state), self.id));
+        let job_handle = Arc::new(JobHandleImpl::new(Arc::clone(&shared_state), self.id, task_id));
+        // Two tokens rather than one, because the deadline is a verdict about the execution and the
+        // executor holds what it is given: cancelling the executor's own token does not reach the
+        // deadline token, so a self-cancelled executor cannot report its refusal as a deadline. The
+        // deadline token carries the pool's shutdown, and the task's deadline on top of it.
+        let deadline_cancel_token = cancel_token.child_token();
+        let executor_cancel_token = deadline_cancel_token.child_token();
         let outcome = {
             let ctx = TaskContext::new(
                 task,
                 Arc::clone(&job_handle) as Arc<dyn JobHandle>,
-                cancel_token.clone(),
+                executor_cancel_token,
             );
-            AssertUnwindSafe(executor.execute(ctx)).catch_unwind().await
+            Self::run_executor_until_deadline(executor.execute(ctx), deadline_at, &deadline_cancel_token).await
         };
         job_handle.close();
         // Dropping the worker's own reference is what makes the reclaim below succeed; without it
@@ -647,7 +658,23 @@ impl Worker {
             Ok(Ok(TaskOutcome::Completed(output))) => job.complete_task(&task_id, output).map_err(InternalError::from),
             // The executor resolved the task through its handle; touching it again would fail.
             Ok(Ok(TaskOutcome::Deferred)) => Self::check_task_resolution(&job, &task_id),
-            Ok(Ok(TaskOutcome::Cancelled)) => return Err(InternalError::Cancelled),
+            // A shutdown was ruled out above, so the executor was released by its own deadline. The
+            // task stays as it is for another worker to take over, and the pass counts as work done:
+            // backing the poll interval off before a takeover that is already due would only delay
+            // it.
+            Ok(Ok(TaskOutcome::Cancelled)) if deadline_cancel_token.is_cancelled() => {
+                info!("Task '{}' execution cancelled by its deadline", task_id);
+                return Ok(());
+            }
+            // Neither the deadline nor a shutdown released this execution, so the outcome is a
+            // broken contract rather than a cancellation - including when the executor cancelled
+            // its own token. Honouring it would leave the task held until its deadline runs out, on
+            // an attempt already spent, and report a cancellation that never happened.
+            Ok(Ok(TaskOutcome::Cancelled)) => Err(InternalError::Other(
+                "executor returned Cancelled without a cancellation of its execution: return the outcome of \
+                 the work, or select on the token and return Cancelled once it fires"
+                    .to_string(),
+            )),
             Ok(Err(e)) => Err(InternalError::Other(e.to_string())),
             Err(panic) => Err(InternalError::Other(format!(
                 "executor panicked: {}",
@@ -660,86 +687,56 @@ impl Worker {
             info!("Task '{}' exceeded deadline", task_id);
         }
 
-        // Handle result
-        match result {
+        // The two outcomes are told apart by what they record on the task and by the reason the save
+        // is labelled with; what follows is the same for both, because an execution that failed
+        // after its executor resolved its own task leaves a resolved task behind, and that result
+        // completes the iteration exactly like a successful one.
+        let save_reason = match result {
             Err(e) => {
-                error!("Task '{}' execution failed: {}", task_id, e);
-                job.fail_task(&task_id, &e.to_string())?;
-
-                let worker_id = self.id;
-                let task_id_clone = task_id;
-                let metrics = self.metrics.clone();
-                let task_code_for_metrics = task_code.clone();
-                let job_code_for_metrics = job_code.clone();
-                _ = self
-                    .save_processed_task(job, &task_id, &cancel_token, move |ctx| {
-                        let JobMergeContext {
-                            current_job,
-                            mut saved_job,
-                        } = ctx;
-                        match saved_job.merge_with_processed_task(current_job, &worker_id, &task_id_clone) {
-                            Ok(()) => {
-                                metrics.record_save_conflict_retry(&job_code_for_metrics, "save_failed_task");
-                                debug!("Retry to save failed task");
-                                Ok(MergeDecision::Retry(saved_job))
-                            }
-                            Err(JobError::TaskWorkerMismatch) => {
-                                metrics.record_task_stolen(
-                                    &job_code_for_metrics,
-                                    &task_code_for_metrics,
-                                    "save_failed_task",
-                                );
-                                debug!("Task has stolen when try to save failed task - skip");
-                                Ok(MergeDecision::Done(saved_job, SaveOutcome::Stolen))
-                            }
-                            Err(e) => Err(InternalError::from(e)),
-                        }
-                    })
-                    .await?;
+                let rolled_back_tasks = job.record_task_execution_failure(&task_id, &e.to_string())?;
+                info!(rolled_back_tasks, "Task '{}' execution failed: {}", task_id, e);
+                "save_failed_task"
             }
             Ok(()) => {
                 info!("Task '{}' handled successfully", task_id);
-
-                let worker_id = self.id;
-                let task_id_clone = task_id;
-                let metrics = self.metrics.clone();
-                let task_code_for_metrics = task_code.clone();
-                let job_code_for_metrics = job_code.clone();
-
-                job.try_to_complete(&worker_id)?;
-
-                job = self
-                    .save_processed_task(job, &task_id, &cancel_token, move |ctx| {
-                        let JobMergeContext {
-                            current_job,
-                            mut saved_job,
-                        } = ctx;
-                        match saved_job.merge_with_processed_task(current_job, &worker_id, &task_id_clone) {
-                            Ok(()) => {
-                                metrics.record_save_conflict_retry(&job_code_for_metrics, "save_completed_task");
-                                // conditions for job completion might have been met (another worker completed task)
-                                saved_job.try_to_complete(&worker_id)?;
-                                debug!("Retry to save completed task");
-                                Ok(MergeDecision::Retry(saved_job))
-                            }
-                            Err(JobError::TaskWorkerMismatch) => {
-                                metrics.record_task_stolen(
-                                    &job_code_for_metrics,
-                                    &task_code_for_metrics,
-                                    "save_completed_task",
-                                );
-                                debug!("Task has stolen when try to save completed task - skip");
-                                Ok(MergeDecision::Done(saved_job, SaveOutcome::Stolen))
-                            }
-                            Err(e) => Err(InternalError::from(e)),
-                        }
-                    })
-                    .await?;
-
-                if job.is_processed() {
-                    self.job_completed(&job);
-                }
+                "save_completed_task"
             }
+        };
+
+        let worker_id = self.id;
+        let task_id_clone = task_id;
+        let metrics = self.metrics.clone();
+        let task_code_for_metrics = task_code.clone();
+        let job_code_for_metrics = job_code.clone();
+
+        job.try_to_complete(&worker_id)?;
+
+        let job = self
+            .save_processed_task(job, &task_id, &cancel_token, move |ctx| {
+                let JobMergeContext {
+                    current_job,
+                    mut saved_job,
+                } = ctx;
+                match saved_job.merge_with_processed_task(current_job, &worker_id, &task_id_clone) {
+                    Ok(()) => {
+                        metrics.record_save_conflict_retry(&job_code_for_metrics, save_reason);
+                        // conditions for job completion might have been met (another worker completed task)
+                        saved_job.try_to_complete(&worker_id)?;
+                        debug!("Retry to save processed task ({save_reason})");
+                        Ok(MergeDecision::Retry(saved_job))
+                    }
+                    Err(JobError::TaskWorkerMismatch) => {
+                        metrics.record_task_stolen(&job_code_for_metrics, &task_code_for_metrics, save_reason);
+                        debug!("Task has stolen when try to save processed task ({save_reason}) - skip");
+                        Ok(MergeDecision::Done(saved_job, SaveOutcome::Stolen))
+                    }
+                    Err(e) => Err(InternalError::from(e)),
+                }
+            })
+            .await?;
+
+        if job.is_processed() {
+            self.job_completed(&job);
         }
 
         Ok(())
@@ -845,9 +842,9 @@ impl Worker {
             job.version()
         );
 
-        if let Some(tsk) = job.tasks_as_iter().find(|task| task.id() == task_id) {
+        if let Ok(task) = job.find_task(task_id) {
             // Calculate duration if start/complete times are available
-            let duration = match (tsk.completed_at(), tsk.started_at()) {
+            let duration = match (task.completed_at(), task.started_at()) {
                 (Some(completed), Some(started)) => completed
                     .signed_duration_since(started)
                     .to_std()
@@ -856,14 +853,14 @@ impl Worker {
             };
 
             self.metrics
-                .record_task_processed(job.code(), tsk.code(), tsk.status(), duration);
+                .record_task_processed(job.code(), task.code(), task.status(), duration);
         }
 
         Ok(job)
     }
 
-    /// Persist an iteration that cannot progress because tasks spent their
-    /// attempt budget.
+    /// Persist an iteration that cannot progress because tasks ran out of either limit - their
+    /// attempt budget or their maximum lifetime.
     ///
     /// [`Job::pick_task_to_execute`] has already moved the job to `Failed`;
     /// saving that state is what lets the scheduler start the next iteration,
@@ -872,7 +869,7 @@ impl Worker {
     /// it on the next poll.
     async fn save_failed_iteration(&self, job: Job, cancel_token: &CancellationToken) -> Result<bool, InternalError> {
         error!(
-            "Job {} iteration {} failed - tasks exhausted their attempts ({})",
+            "Job {} iteration {} failed - tasks ran out of their attempt budget or maximum lifetime ({})",
             job.code(),
             job.iter_num(),
             job.tasks_as_string()
@@ -930,12 +927,40 @@ impl Worker {
         );
     }
 
+    /// Runs `execution` to completion, cancelling `deadline_cancel_token` once `deadline_at` has
+    /// passed - or right away if it already has.
+    ///
+    /// The future is never dropped, only signalled: dropping it would tear the executor down at
+    /// whatever await point it sits on, leaving it no chance to clean up. Cancellation is
+    /// therefore cooperative, and an executor that does not select on its token keeps running
+    /// past the deadline while another worker takes its task over.
+    async fn run_executor_until_deadline(
+        execution: impl Future<Output = TaskResult> + Send,
+        deadline_at: Option<DateTime<Utc>>,
+        deadline_cancel_token: &CancellationToken,
+    ) -> Result<TaskResult, Box<dyn Any + Send>> {
+        let execution = AssertUnwindSafe(execution).catch_unwind();
+        tokio::pin!(execution);
+
+        if let Some(deadline_at) = deadline_at {
+            let time_left = (deadline_at - Utc::now()).to_std().unwrap_or(Duration::ZERO);
+            tokio::select! {
+                outcome = &mut execution => return outcome,
+                () = sleep(time_left) => {
+                    debug!("Task deadline reached, cancelling the execution token");
+                    deadline_cancel_token.cancel();
+                }
+            }
+        }
+
+        execution.await
+    }
+
     /// Checks that the task an executor returned [`TaskOutcome::Deferred`] for is no longer open.
     /// Completing and failing are the only ways to resolve one, so anything else was left for
     /// nobody to close.
     fn check_task_resolution(job: &Job, task_id: &Uuid) -> Result<(), InternalError> {
-        let task = job.get_task(task_id)?;
-        if task.is_completed() || task.is_failed() {
+        if job.find_task(task_id)?.is_resolved() {
             return Ok(());
         }
 
@@ -949,6 +974,9 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        InMemoryStorage, JobDefinition, JobDefinitionId, NoopMetrics, TaskDefinition, TaskExecutor, TaskLimits, task_fn,
+    };
 
     /// How many draws a test takes when it asserts on the spread of the jitter rather than on a
     /// single value. A range of milliseconds has millions of nanoseconds in it, so this many equal
@@ -1127,5 +1155,128 @@ mod tests {
         let config = config_polled_every(Duration::from_millis(10));
 
         assert_eq!(config.max_poll_interval(), WorkerConfig::new().max_poll_interval());
+    }
+
+    /// Deadline of the task the pass below runs, and so how long its executor waits for the token.
+    const CANCELLED_TASK_TIMEOUT: Duration = Duration::from_millis(50);
+
+    /// Longest the pass below may take: two orders of magnitude above the task's deadline, so a
+    /// loaded machine does not fail the test, while a cancellation that never arrives does - with a
+    /// diagnostic rather than a hung run.
+    const PROGRESS_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Sink for a worker whose iterations nobody waits for.
+    struct IgnoredIterations;
+
+    impl FinishedIterationSink for IgnoredIterations {
+        fn record_finished_iteration(&self, _job_code: &JobCode, _iter_num: u64) {}
+    }
+
+    fn worker_running(job_def: JobDefinition, storage: Arc<dyn Storage>) -> Result<Worker, Error> {
+        Ok(Worker::new(
+            Arc::new(JobRegistry::new(vec![job_def])?),
+            storage,
+            config_polled_every(Duration::from_millis(10)),
+            Arc::new(NoopMetrics),
+            None,
+            Arc::new(IgnoredIterations),
+        ))
+    }
+
+    /// A description of one task running `executor`, for the two passes below.
+    fn job_running(job_code: &str, timeout: Duration, executor: Arc<dyn TaskExecutor>) -> JobDefinition {
+        JobDefinition::new(
+            JobDefinitionId::new(),
+            JobCode::new(job_code),
+            vec![(TaskDefinition::new(TaskCode::new("cancelled"), timeout), executor)],
+            Vec::new(),
+            Vec::new(),
+            TaskLimits::default(),
+        )
+        .expect("the test description must be legal")
+    }
+
+    /// A cancellation the executor reports after its own deadline passed is not the pool shutting
+    /// down - the shutdown is ruled out before the outcome is read. The pass picked, started and
+    /// persisted the task, and the task is due to be taken over, so it counts as work done: treated
+    /// as a shutdown it would instead double the wait before the next poll.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pass_whose_executor_was_cancelled_by_the_deadline_counts_as_work_done() {
+        let executor = task_fn(|ctx| async move {
+            ctx.cancel_token().cancelled().await;
+            Ok(TaskOutcome::Cancelled)
+        });
+        let job_def = job_running("deadline_cancelled_job", CANCELLED_TASK_TIMEOUT, executor);
+        let job_code = job_def.code().clone();
+        let worker =
+            worker_running(job_def, Arc::new(InMemoryStorage::new())).expect("the test worker must be constructible");
+
+        let work_done = tokio::time::timeout(
+            PROGRESS_TIMEOUT,
+            worker.process_job(&job_code, &CancellationToken::new()),
+        )
+        .await
+        .expect("the deadline must release the executor and let the pass finish");
+
+        assert!(
+            work_done,
+            "a pass released by the task's own deadline must not be counted as an idle one"
+        );
+    }
+
+    /// Deadline of the task below: long enough that nothing cancels the execution, so the outcome the
+    /// executor returns is the only thing under test.
+    const UNCANCELLED_TASK_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// `Cancelled` returned while nothing cancelled the execution is a broken contract, not a
+    /// deadline. Honouring it would leave the task open on an attempt already spent, idle until its
+    /// deadline ran out, so it is failed like any other refusal - and the recorded reason has to say
+    /// which of the two happened.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_outcome_without_a_cancellation_fails_the_task() {
+        let executor = task_fn(|_ctx| async { Ok(TaskOutcome::Cancelled) });
+
+        assert_task_failed_by("uncancelled_job", executor).await;
+    }
+
+    /// The same contract, closed against the one way an executor could argue itself out of it: the
+    /// token it is given is its own, so cancelling it must not be readable as the deadline. Taken
+    /// for one, the refusal would leave the task held until its real deadline ran out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_self_cancelled_executor_cannot_report_its_refusal_as_a_deadline() {
+        let executor = task_fn(|ctx| async move {
+            ctx.cancel_token().cancel();
+            Ok(TaskOutcome::Cancelled)
+        });
+
+        assert_task_failed_by("self_cancelled_job", executor).await;
+    }
+
+    /// Runs one pass of a worker over a job whose only task `executor` refuses, and asserts the
+    /// refusal was recorded as a failure rather than honoured as a cancellation.
+    async fn assert_task_failed_by(job_code: &str, executor: Arc<dyn TaskExecutor>) {
+        let job_def = job_running(job_code, UNCANCELLED_TASK_TIMEOUT, executor);
+        let job_code = job_def.code().clone();
+        let storage = Arc::new(InMemoryStorage::new());
+        let worker = worker_running(job_def, Arc::clone(&storage) as Arc<dyn Storage>)
+            .expect("the test worker must be constructible");
+        let cancel_token = CancellationToken::new();
+
+        let work_done = tokio::time::timeout(PROGRESS_TIMEOUT, worker.process_job(&job_code, &cancel_token))
+            .await
+            .expect("the pass must finish without waiting for the deadline");
+
+        assert!(work_done, "a pass that failed a task is not an idle one");
+        let job = storage
+            .get_job(&job_code, &cancel_token)
+            .await
+            .expect("the failed task must have been persisted");
+        let task = job.tasks_as_iter().next().expect("the iteration must still hold its task");
+        assert!(task.is_failed(), "got status {}", task.status());
+        assert!(
+            task.error_msg().contains("without a cancellation"),
+            "got: {}",
+            task.error_msg()
+        );
     }
 }

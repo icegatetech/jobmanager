@@ -184,6 +184,9 @@ impl Storage for CachedStorage {
 
         match self.inner.save_job(job, cancel_token).await {
             Ok(()) => {
+                // The copy the worker just wrote, cloned as it stands: the cache is this pool's
+                // record of its own write, and what a backend keeps of that state is the backend's
+                // own business. A clone shares the tasks, so caching a save stays cheap.
                 cached_job.job = Some(job.clone());
                 debug!(
                     "Job '{}' saved to storage and cache (id: {}, iter: {}, version: {}, tasks: {:?})",

@@ -125,6 +125,38 @@ async fn save_job_lets_one_creator_of_an_iteration_win() -> Result<(), Box<dyn s
     Ok(())
 }
 
+/// A field the stored representation leaves out has to be gone under every backend alike. Kept
+/// here, this backend would be a more forgiving oracle than the object store: a later failure of
+/// the parent would roll back a task the iteration already owns, and only against S3 would the
+/// same run leave it in place.
+#[tokio::test]
+async fn save_job_drops_the_execution_that_created_a_task() -> Result<(), Box<dyn std::error::Error>> {
+    let storage = InMemoryStorage::new();
+    let cancel_token = CancellationToken::new();
+    let job_code = JobCode::new("parented_job");
+    let worker_id = Uuid::from_u128(1);
+
+    let mut job = Job::new(&job_definition(&job_code), HashMap::new(), worker_id)?;
+    let parent_id = *job
+        .get_tasks_by_code(&TaskCode::new("task"))
+        .first()
+        .ok_or("the description declares one task")?
+        .id();
+    job.work(&worker_id)?;
+    job.start_task(&parent_id, worker_id)?;
+    let child_id = job.add_task(
+        &TaskDefinition::new(TaskCode::new("child"), Duration::from_secs(5)),
+        worker_id,
+        Some(parent_id),
+    )?;
+    storage.save_job(&mut job, &cancel_token).await?;
+
+    let stored = storage.get_job(&job_code, &cancel_token).await?;
+
+    assert_eq!(stored.find_task(&child_id)?.created_by_task(), None);
+    Ok(())
+}
+
 /// The backend stands in for a store that holds every job; saving one must not make another
 /// disappear, or its workers would keep recreating it from scratch.
 #[tokio::test]

@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::{ImmutableTask, JobHandle, TaskCode};
 
 /// Everything one task execution is given: the task itself, the job it runs in, and the
-/// cancellation signal of the worker pool.
+/// cancellation signal of this execution.
 ///
 /// Owned rather than borrowed, so an executor can be a plain async closure. The job handle inside
 /// stops working the moment the executor returns; see [`JobHandle`].
@@ -44,12 +44,23 @@ impl TaskContext {
         self.task.get_input()
     }
 
-    /// Cancellation signal of the worker pool; select on it in long-running work.
+    /// Cancellation signal of this execution; select on it in long-running work.
+    ///
+    /// Three events cancel it: a shutdown of the worker pool, the task's own deadline passing, and
+    /// the executor cancelling the token itself. The first two are cooperative - an executor that
+    /// ignores the token keeps running, which is why a deadline lets another worker take the task
+    /// over rather than stopping the work.
+    ///
+    /// The token is this execution's own, so cancelling it stops the work waiting on it and nothing
+    /// beyond: it neither cancels the pool nor makes the worker treat the outcome as a deadline. An
+    /// executor that cancels itself and then returns
+    /// [`TaskOutcome::Cancelled`](crate::TaskOutcome::Cancelled) has refused the task, and it is
+    /// failed as such.
     pub const fn cancel_token(&self) -> &CancellationToken {
         &self.cancel_token
     }
 
-    /// Whether a shutdown has been requested.
+    /// Whether this execution has been cancelled; see [`Self::cancel_token`] for what cancels it.
     pub fn is_cancelled(&self) -> bool {
         self.cancel_token.is_cancelled()
     }
