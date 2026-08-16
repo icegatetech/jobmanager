@@ -51,6 +51,15 @@ mod execution;
 mod infra;
 mod storage;
 
+// Types of other crates that the public API hands out or takes in. They are re-exported so a
+// consumer has one right path to each of them; the version of any of these is part of this crate's
+// contract, so raising one is a breaking change of this crate.
+pub use chrono::{DateTime, Utc};
+#[cfg(feature = "metrics-otel")]
+pub use opentelemetry::metrics::Meter;
+pub use tokio_util::sync::CancellationToken;
+pub use uuid::Uuid;
+
 // `pub` re-exports form the crate's public API; `pub(crate)` ones are short paths used
 // across the crate. rustfmt sorts them into one alphabetical list, so the two kinds are
 // interleaved on purpose — read the visibility, not the position.
@@ -65,7 +74,9 @@ pub use crate::core::job::{DEFAULT_ITERATION_RETENTION, JobCode, JobStatus, Task
 pub(crate) use crate::core::job::{Job, JobDefinition, JobDefinitionId, TaskPickup};
 pub(crate) use crate::core::registry::JobRegistry;
 pub(crate) use crate::core::task::Task;
-pub use crate::core::task::{DEFAULT_MAX_ATTEMPTS, ImmutableTask, TaskCode, TaskDefinition, TaskRef, TaskStatus};
+pub use crate::core::task::{
+    DEFAULT_LIFETIME_MULTIPLIER, DEFAULT_MAX_ATTEMPTS, ImmutableTask, TaskCode, TaskDefinition, TaskRef, TaskStatus,
+};
 pub use crate::execution::builder::{JobBuilder, JobsManagerBuilder};
 pub use crate::execution::executor::{TaskExecutor, TaskOutcome, TaskResult, task_fn};
 pub(crate) use crate::execution::job_cleaner::JobCleaner;

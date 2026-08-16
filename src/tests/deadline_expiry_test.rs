@@ -22,34 +22,38 @@ use crate::{
 async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
     super::common::init_tracing();
 
-    let expected_attempts: u32 = 4;
+    let expected_executions: u32 = 4;
 
     // 1. Start object storage
     let store = S3TestContainer::start().await?;
 
-    // 2. Track task execution attempts
-    let attempt_count = Arc::new(AtomicU32::new(0));
+    // 2. Track task executions, which the takeovers no longer show up in the attempt counter as
+    let execution_count = Arc::new(AtomicU32::new(0));
 
-    let attempt_count_clone = Arc::clone(&attempt_count);
+    let execution_count_clone = Arc::clone(&execution_count);
 
     let executor = task_fn(move |_ctx| {
-        let count = Arc::clone(&attempt_count_clone);
+        let count = Arc::clone(&execution_count_clone);
 
         async move {
-            let attempt = count.fetch_add(1, Ordering::SeqCst) + 1;
-            tracing::info!("Task attempt {} started", attempt);
+            let execution = count.fetch_add(1, Ordering::SeqCst) + 1;
+            tracing::info!("Task execution {} started", execution);
 
-            if attempt <= 3 {
-                // First attempt: exceed deadline so another worker can re-pick.
+            if execution <= 3 {
+                // Exceed the deadline so another worker can re-pick; the token this executor is
+                // given is cancelled meanwhile, and ignoring it is what keeps the takeover legal.
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
 
-            // Complete successfully (first attempt might be stolen).
+            // Complete successfully (an earlier execution might be stolen).
             Ok(TaskOutcome::Completed(b"success".to_vec()))
         }
     });
 
-    let task_def = TaskDefinition::new(TaskCode::new("hanging_task"), Duration::from_millis(100));
+    // Four executions of half a second each need a lifetime the default - five deadlines, half a
+    // second in total - does not give.
+    let task_def = TaskDefinition::new(TaskCode::new("hanging_task"), Duration::from_millis(100))
+        .with_max_lifetime(Duration::from_secs(30));
 
     let job_def = JobDefinition::new(
         JobDefinitionId::new(),
@@ -99,11 +103,11 @@ async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
     manager_env.wait_for_all_jobs_completion(Duration::from_secs(15)).await?;
     manager_env.stop().await;
 
-    // 7. Verify task was attempted multiple times
+    // 7. Verify task was executed multiple times
     assert_eq!(
-        attempt_count.load(Ordering::SeqCst),
-        expected_attempts,
-        "task should be attempted {expected_attempts} due to deadline expiry"
+        execution_count.load(Ordering::SeqCst),
+        expected_executions,
+        "task should be executed {expected_executions} times due to deadline expiry"
     );
 
     // Verify final job state
@@ -116,8 +120,8 @@ async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
     let attempts = tasks.first().map_or(0, |t| t.attempts());
     assert_eq!(*job.status(), JobStatus::Completed);
     assert_eq!(
-        attempts, expected_attempts,
-        "expected task to be restarted after deadline"
+        attempts, 1,
+        "a takeover after the deadline must not spend an attempt: nothing refused the task"
     );
 
     Ok(())

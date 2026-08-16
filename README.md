@@ -26,10 +26,17 @@ Tasks can declare dependencies on each other, carry an input and an output paylo
 deadline. A job can repeat: it runs iterations on a schedule, and an executor can move the next
 iteration earlier or later.
 
-Every task has an attempt budget, set per task with `TaskDefinition::with_max_attempts`. Once it is
-spent the task is terminal and its iteration ends as failed — which is not the end of the job: the
-next iteration is planned from scratch, so a permanently failing task delays work instead of
-blocking it forever.
+Two limits bound a task, and either one ends it. The **attempt budget**, set with
+`TaskDefinition::with_max_attempts` and five by default, is spent by refusals of the executor — an
+error or a panic. The **maximum lifetime**, set with `TaskDefinition::with_max_lifetime` and five
+deadlines by default, runs from the task's first start and is what bounds takeovers: a worker that
+takes an expired task over spends no attempt, so a task whose workers keep dying is retried until
+its lifetime runs out rather than after a handful of deaths. That bound is absolute: every deadline
+the task is given is capped by it, so the executor holding the task is signalled no later than the
+lifetime passes, the task is failed on the first pick afterwards, and a result returned past the
+lifetime is refused rather than stored. Once either limit is spent the task is
+terminal and its iteration ends as failed — which is not the end of the job: the next iteration is
+planned from scratch, so a permanently failing task delays work instead of blocking it forever.
 
 Old iterations do not pile up: each job keeps its most recent ones, set per job with
 `JobBuilder::keep_iterations`, and the rest are deleted in the background. Turn it off with

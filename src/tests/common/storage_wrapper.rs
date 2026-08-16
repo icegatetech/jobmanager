@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    Job, JobCode, TaskCode, TaskPickup,
+    Job, JobCode, TaskCode, TaskPickup, TaskStatus,
     storage::{JobMeta, Storage, StorageError, StorageResult},
 };
 
@@ -154,6 +154,15 @@ impl Storage for CountingStorage {
     }
 }
 
+/// Which save of an existing iteration [`ContendingStorage`] gets its own write in ahead of.
+pub enum ContendedSave {
+    /// The first save of an existing iteration, whatever it carries.
+    First,
+    /// The first save carrying a task of this code in this status - the save an execution's own
+    /// result rides on.
+    OfTask { code: TaskCode, status: TaskStatus },
+}
+
 /// Storage double that makes exactly one save of an existing iteration lose a race: another
 /// worker's write lands first, so the save that follows finds the version it read already moved.
 ///
@@ -161,6 +170,7 @@ impl Storage for CountingStorage {
 /// The conflict therefore resolves as a merge and a retry, never as a steal.
 pub struct ContendingStorage {
     inner: Arc<dyn Storage>,
+    contended_save: ContendedSave,
     is_interference_pending: AtomicBool,
     interferences: AtomicU64,
 }
@@ -169,15 +179,37 @@ impl ContendingStorage {
     pub fn new(inner: Arc<dyn Storage>) -> Self {
         Self {
             inner,
+            contended_save: ContendedSave::First,
             is_interference_pending: AtomicBool::new(true),
             interferences: AtomicU64::new(0),
         }
+    }
+
+    /// Holds the interference back until the save `contended_save` names, instead of contending
+    /// with the first save of any kind.
+    pub fn with_contended_save(mut self, contended_save: ContendedSave) -> Self {
+        self.contended_save = contended_save;
+        self
     }
 
     /// How many times the double really got a write in ahead of its caller, so a test can prove its
     /// fixture reached the conflict it asserts on.
     pub fn interferences(&self) -> u64 {
         self.interferences.load(Ordering::SeqCst)
+    }
+
+    /// Whether this is the save the double was told to contend with.
+    fn is_contended_save(&self, job: &Job) -> bool {
+        // A save carrying no version creates an iteration and has no version to invalidate.
+        if job.version().is_empty() {
+            return false;
+        }
+        match &self.contended_save {
+            ContendedSave::First => true,
+            ContendedSave::OfTask { code, status } => {
+                job.tasks_as_iter().any(|task| task.code() == code && task.status() == status)
+            }
+        }
     }
 }
 
@@ -196,8 +228,7 @@ impl Storage for ContendingStorage {
     }
 
     async fn save_job(&self, job: &mut Job, cancel_token: &CancellationToken) -> StorageResult<()> {
-        // A save carrying no version creates an iteration and has no version to invalidate.
-        if !job.version().is_empty() && self.is_interference_pending.swap(false, Ordering::SeqCst) {
+        if self.is_contended_save(job) && self.is_interference_pending.swap(false, Ordering::SeqCst) {
             let mut stored = self.inner.get_job(job.code(), cancel_token).await?;
             self.inner.save_job(&mut stored, cancel_token).await?;
             self.interferences.fetch_add(1, Ordering::SeqCst);

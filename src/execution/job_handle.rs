@@ -25,12 +25,30 @@ pub trait JobHandle: Send + Sync {
     /// Use this to fan out follow-up work from within an executor (e.g. chaining a task onto
     /// the completion of another). The returned reference is what
     /// [`TaskDefinition::with_dependencies`] takes, so a further task can be made to wait for this
-    /// one. The task is only picked up by a worker once the job holding it is persisted.
+    /// one - including one registered by a later call of this method. The task is only picked up by
+    /// a worker once the job holding it is persisted.
+    ///
+    /// What this execution creates is dropped if its task ends up failed - by an error from the
+    /// executor, by a panic, by a [`TaskOutcome::Deferred`](crate::TaskOutcome::Deferred) that leaves
+    /// the task open, or by [`Self::fail_task`]. Tasks registered by several calls are therefore
+    /// dropped together: a failure takes back the whole plan of that execution, never a part of it.
+    ///
+    /// So work that has to survive is registered by a task that *completes*: an executor with
+    /// something to hand on reports the outcome of its own work, rather than failing itself and
+    /// expecting what it created to stay. Either order does, and the two differ in what a failure
+    /// halfway through leaves behind: registering the work first and completing the task through
+    /// [`Self::complete_task`] last is all or nothing, while planning after the task is closed is
+    /// not - there is nothing left to roll back, so what was registered up to the failure stays
+    /// and the iteration finishes on a plan that was never completed. An executor that needs the
+    /// plan whole registers it before it closes its own task. What is refused is registering work
+    /// once this execution has *failed* its own task, since the rollback that failure ran is
+    /// already over and the late registration would be the one part of the execution outliving it.
     ///
     /// # Errors
     ///
     /// Returns an error if `task_def` does not pass the job's limits, if one of its declared
-    /// dependencies does not exist in the job, or if the handle is no longer valid.
+    /// dependencies does not exist in the job, if this execution already failed its own task, or
+    /// if the handle is no longer valid.
     fn add_task(&self, task_def: TaskDefinition) -> Result<TaskRef, Error>;
 
     /// Marks the task as completed and stores `output` as its result.
@@ -43,6 +61,17 @@ pub trait JobHandle: Send + Sync {
     fn complete_task(&self, task_id: &Uuid, output: Vec<u8>) -> Result<(), Error>;
 
     /// Marks the task as failed, recording `error_msg` as the failure reason.
+    ///
+    /// A failure decided here is a failure like any other: the task is picked up again while its
+    /// attempt budget and its maximum lifetime last, so an executor failing its own task will run
+    /// again unless the task was defined with an attempt budget of one - and what this execution
+    /// registered through [`Self::add_task`] is dropped, so that retry starts from the tasks the
+    /// iteration held without it. There is no way to fail a task and leave the tasks it created
+    /// behind - failing its own task ends this execution, and [`Self::add_task`] registers nothing
+    /// afterwards; hand work on from a task that completes.
+    ///
+    /// Failing a task this execution does not own is legal and rolls nothing back - a created task
+    /// belongs to the execution that registered it, and this one registered none for that task.
     ///
     /// # Errors
     ///
@@ -113,11 +142,18 @@ impl JobHandleState {
 pub(crate) struct JobHandleImpl {
     state: Arc<RwLock<JobHandleState>>,
     worker_id: Uuid,
+    /// Task this handle was opened for, which is what a task it creates is attributed to so a failed
+    /// execution can be rolled back.
+    task_id: Uuid,
 }
 
 impl JobHandleImpl {
-    pub(crate) const fn new(state: Arc<RwLock<JobHandleState>>, worker_id: Uuid) -> Self {
-        Self { state, worker_id }
+    pub(crate) const fn new(state: Arc<RwLock<JobHandleState>>, worker_id: Uuid, task_id: Uuid) -> Self {
+        Self {
+            state,
+            worker_id,
+            task_id,
+        }
     }
 
     /// Invalidates the handle. Called by the worker once the executor returned, so a handle that
@@ -157,7 +193,10 @@ impl JobHandleImpl {
 
 impl JobHandle for JobHandleImpl {
     fn add_task(&self, task_def: TaskDefinition) -> Result<TaskRef, Error> {
-        self.write_job(|job| job.add_task(&task_def, self.worker_id).map(TaskRef::created))
+        self.write_job(|job| {
+            job.add_task(&task_def, self.worker_id, Some(self.task_id))
+                .map(TaskRef::created)
+        })
     }
 
     fn complete_task(&self, task_id: &Uuid, output: Vec<u8>) -> Result<(), Error> {
@@ -165,7 +204,12 @@ impl JobHandle for JobHandleImpl {
     }
 
     fn fail_task(&self, task_id: &Uuid, error_msg: &str) -> Result<(), Error> {
-        self.write_job(|job| job.fail_task(task_id, error_msg))
+        // The count of rolled-back tasks is for a log the worker writes about an execution it
+        // refused; an executor failing a task through its own handle has nothing to report it to.
+        self.write_job(|job| {
+            job.fail_task(task_id, error_msg)?;
+            Ok(())
+        })
     }
 
     fn set_next_start_at(&self, next_start_at: DateTime<Utc>) -> Result<(), Error> {
@@ -237,7 +281,7 @@ mod tests {
     #[test]
     fn set_next_start_at_updates_job_under_lock() {
         let state = test_state();
-        let handle = JobHandleImpl::new(Arc::clone(&state), Uuid::from_u128(2));
+        let handle = JobHandleImpl::new(Arc::clone(&state), Uuid::from_u128(2), only_task_id(&state));
 
         let next_start_at = Utc::now() + Duration::seconds(30);
         handle.set_next_start_at(next_start_at).unwrap();
@@ -250,7 +294,7 @@ mod tests {
     #[test]
     fn open_handle_mutates_the_job() {
         let state = test_state();
-        let handle = JobHandleImpl::new(Arc::clone(&state), Uuid::from_u128(2));
+        let handle = JobHandleImpl::new(Arc::clone(&state), Uuid::from_u128(2), only_task_id(&state));
         let task_id = only_task_id(&state);
 
         state.write().job.start_task(&task_id, Uuid::from_u128(2)).unwrap();
@@ -264,7 +308,7 @@ mod tests {
     #[test]
     fn closed_handle_rejects_every_call() {
         let state = test_state();
-        let handle = JobHandleImpl::new(Arc::clone(&state), Uuid::from_u128(2));
+        let handle = JobHandleImpl::new(Arc::clone(&state), Uuid::from_u128(2), only_task_id(&state));
         let task_id = only_task_id(&state);
         state.write().job.start_task(&task_id, Uuid::from_u128(2)).unwrap();
 
@@ -306,7 +350,11 @@ mod tests {
     #[test]
     fn close_waits_for_a_call_already_touching_the_job() {
         let state = test_state();
-        let handle = Arc::new(JobHandleImpl::new(Arc::clone(&state), Uuid::from_u128(2)));
+        let handle = Arc::new(JobHandleImpl::new(
+            Arc::clone(&state),
+            Uuid::from_u128(2),
+            only_task_id(&state),
+        ));
         let finish_order = Arc::new(Mutex::new(Vec::new()));
         let (entered_sender, entered_receiver) = mpsc::channel();
         let (release_sender, release_receiver) = mpsc::channel();
@@ -353,7 +401,11 @@ mod tests {
     #[test]
     fn a_call_waiting_for_the_lock_is_refused_once_close_wins_it() {
         let state = test_state();
-        let handle = Arc::new(JobHandleImpl::new(Arc::clone(&state), Uuid::from_u128(2)));
+        let handle = Arc::new(JobHandleImpl::new(
+            Arc::clone(&state),
+            Uuid::from_u128(2),
+            only_task_id(&state),
+        ));
         let task_id = only_task_id(&state);
         state.write().job.start_task(&task_id, Uuid::from_u128(2)).unwrap();
 

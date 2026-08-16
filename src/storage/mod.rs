@@ -2,6 +2,7 @@ pub(crate) mod cached;
 pub(crate) mod in_memory;
 pub(crate) mod s3;
 pub(crate) mod s3_error;
+pub(crate) mod state;
 
 use async_trait::async_trait;
 use thiserror::Error as ThisError;
@@ -78,6 +79,9 @@ pub(crate) struct JobMeta {
 }
 
 /// Storage backend trait for persisting job state.
+///
+/// What a save keeps and how a load rebuilds it belongs to [`state`] and is the same for every
+/// implementation; a backend owns its codec and its object keys, not the set of persisted fields.
 #[async_trait]
 #[allow(private_interfaces)] // TODO(low): think about how to open Job to public
 pub trait Storage: Send + Sync {

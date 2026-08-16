@@ -12,9 +12,18 @@ use crate::{TaskContext, TaskError};
 pub enum TaskOutcome {
     /// The task finished; the worker stores this payload as its output.
     Completed(Vec<u8>),
-    /// Neither finished nor failed: the worker persists nothing and stops. Use it when a shutdown
-    /// was observed mid-work; the task stays open and is picked up again later, which means the
-    /// attempt it already spent is not returned.
+    /// Neither finished nor failed: the worker persists nothing and stops. Return it when the
+    /// cancellation came from outside this execution - see
+    /// [`TaskContext::cancel_token`](crate::TaskContext::cancel_token) for what cancels one.
+    ///
+    /// Returned without such a cancellation, this fails the task like any other refusal, because a
+    /// task left open on an attempt already spent would otherwise sit idle until its deadline ran
+    /// out.
+    ///
+    /// Nothing this execution did reaches storage, the tasks it created through
+    /// [`JobHandle`](crate::JobHandle) included: the task stays open on the deadline it already
+    /// holds, and whoever picks it up once that deadline passes is taking it over, which spends no
+    /// attempt and is bounded by the task's maximum lifetime instead.
     Cancelled,
     /// The executor already resolved the task through [`JobHandle`](crate::JobHandle) and the
     /// worker must not touch it. Needed by executors that fan out work and decide themselves when
@@ -126,6 +135,7 @@ mod tests {
         let job_handle = Arc::new(JobHandleImpl::new(
             Arc::new(RwLock::new(JobHandleState::new(job))),
             Uuid::from_u128(2),
+            *task.id(),
         ));
 
         TaskContext::new(task, job_handle as Arc<dyn JobHandle>, CancellationToken::new())

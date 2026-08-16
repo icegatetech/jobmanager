@@ -42,7 +42,7 @@ second run would find the iteration budget already spent and wait forever.
 
 | Example | What it shows |
 |---|---|
-| [`idempotent_task`](idempotent_task.rs) | A deadline cancels nothing: the takeover, and the guard the side effect needs. |
+| [`idempotent_task`](idempotent_task.rs) | A deadline stops nobody: the takeover, and the guard the side effect needs. |
 | [`graceful_shutdown`](graceful_shutdown.rs) | Selecting on the cancellation token, and `TaskOutcome::Cancelled`. |
 | [`attempt_budget`](attempt_budget.rs) | An attempt budget running out, and the replan that follows. |
 | [`adaptive_schedule`](adaptive_schedule.rs) | `set_next_start_at` pulling the next iteration in or pushing it out. |

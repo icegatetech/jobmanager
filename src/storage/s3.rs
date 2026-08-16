@@ -9,16 +9,14 @@ use aws_sdk_s3::{
     primitives::ByteStream,
     types::{Delete, ObjectIdentifier},
 };
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
-use uuid::Uuid;
 
 use crate::{
-    Error, Job, JobCode, JobDefinitionRegistry, JobMeta, JobStatus, MetricsSink, Retrier, RetrierConfig, RetryStep,
-    Storage, StorageError, StorageResult, Task, TaskCode, TaskStatus,
+    Error, Job, JobCode, JobDefinitionRegistry, JobMeta, MetricsSink, Retrier, RetrierConfig, RetryStep, Storage,
+    StorageError, StorageResult,
     storage::s3_error::{classify_delete_failures, map_s3_error},
+    storage::state::StoredJob,
 };
 
 // TODO(high): add test s3 storage with Toxiproxy for testing network problems (chaos test))
@@ -45,8 +43,8 @@ const DEFAULT_DELETE_BATCH_SIZE: usize = 1000;
 trait JobStateCodec: Send + Sync {
     fn file_extension(&self) -> &'static str;
     fn content_type(&self) -> &'static str;
-    fn serialize(&self, job: &JobJson) -> StorageResult<Vec<u8>>;
-    fn deserialize(&self, data: &[u8]) -> StorageResult<JobJson>;
+    fn serialize(&self, job: &StoredJob) -> StorageResult<Vec<u8>>;
+    fn deserialize(&self, data: &[u8]) -> StorageResult<StoredJob>;
 }
 
 /// Serialization format used to persist job state as an S3 object.
@@ -80,11 +78,11 @@ impl JobStateCodec for JsonJobStateCodec {
         "application/json"
     }
 
-    fn serialize(&self, job: &JobJson) -> StorageResult<Vec<u8>> {
+    fn serialize(&self, job: &StoredJob) -> StorageResult<Vec<u8>> {
         serde_json::to_vec_pretty(job).map_err(|e| StorageError::Serialization(e.to_string()))
     }
 
-    fn deserialize(&self, data: &[u8]) -> StorageResult<JobJson> {
+    fn deserialize(&self, data: &[u8]) -> StorageResult<StoredJob> {
         serde_json::from_slice(data).map_err(|e| StorageError::Serialization(e.to_string()))
     }
 }
@@ -100,62 +98,15 @@ impl JobStateCodec for CborJobStateCodec {
         "application/cbor"
     }
 
-    fn serialize(&self, job: &JobJson) -> StorageResult<Vec<u8>> {
+    fn serialize(&self, job: &StoredJob) -> StorageResult<Vec<u8>> {
         let mut buffer = Vec::new();
         ciborium::ser::into_writer(job, &mut buffer).map_err(|e| StorageError::Serialization(e.to_string()))?;
         Ok(buffer)
     }
 
-    fn deserialize(&self, data: &[u8]) -> StorageResult<JobJson> {
+    fn deserialize(&self, data: &[u8]) -> StorageResult<StoredJob> {
         ciborium::de::from_reader(data).map_err(|e| StorageError::Serialization(e.to_string()))
     }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct TaskJson {
-    id: Uuid,
-    code: String,
-    status: TaskStatus,
-    created_by_worker: Uuid,
-    #[serde(default)]
-    timeout_ms: i64,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    processing_by: Option<Uuid>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    started_at: Option<DateTime<Utc>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    completed_at: Option<DateTime<Utc>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    deadline_at: Option<DateTime<Utc>>,
-    attempt: u32,
-    max_attempts: u32,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    input: Vec<u8>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    output: Vec<u8>,
-    #[serde(skip_serializing_if = "String::is_empty", default)]
-    error: String,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    depends_on: Vec<Uuid>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct JobJson {
-    id: Uuid,
-    code: String,
-    iter_num: u64,
-    status: JobStatus,
-    tasks: Vec<TaskJson>,
-    updated_by: Uuid,
-    started_at: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    running_at: Option<DateTime<Utc>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    completed_at: Option<DateTime<Utc>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    next_start_at: Option<DateTime<Utc>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
 /// Connection details of the S3-compatible bucket a pool keeps job state in, passed to
@@ -467,113 +418,21 @@ impl S3Storage {
     }
 
     fn serialize_job(&self, job: &Job) -> StorageResult<Vec<u8>> {
-        let job_json = Self::job_to_json(job);
-        self.codec.serialize(&job_json)
+        self.codec.serialize(&StoredJob::from_job(job))
     }
 
     fn deserialize_job(&self, data: &[u8], version: &str) -> StorageResult<Job> {
-        let job_json = self.codec.deserialize(data)?;
+        let stored_job = self.codec.deserialize(data)?;
         let job_def = self
             .registry
-            .get_job(&JobCode::new(job_json.code.as_str()))
+            .get_job(&JobCode::new(stored_job.code()))
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
-        Ok(Self::job_from_json(
-            job_json,
+        Ok(stored_job.into_job(
             job_def.max_iterations(),
             job_def.iteration_interval(),
             job_def.task_limits(),
             version,
         ))
-    }
-
-    fn task_to_json(task: &Task) -> TaskJson {
-        TaskJson {
-            id: *task.id(),
-            code: task.code().to_string(),
-            status: task.status().clone(),
-            timeout_ms: task.timeout().num_milliseconds(),
-            created_by_worker: task.created_by_worker(),
-            processing_by: task.processing_by_worker(),
-            started_at: task.started_at(),
-            completed_at: task.completed_at(),
-            deadline_at: task.deadline_at(),
-            attempt: task.attempt(),
-            max_attempts: task.max_attempts(),
-            input: task.input().to_vec(),
-            output: task.output().to_vec(),
-            error: task.error_msg().to_string(),
-            depends_on: task.depends_on().to_vec(),
-        }
-    }
-
-    fn job_to_json(job: &Job) -> JobJson {
-        let tasks: Vec<TaskJson> = job.tasks_as_iter().map(Self::task_to_json).collect();
-
-        JobJson {
-            id: *job.id(),
-            code: job.code().to_string(),
-            iter_num: job.iter_num(),
-            status: job.status().clone(),
-            tasks,
-            updated_by: job.updated_by_worker_id(),
-            started_at: job.started_at(),
-            running_at: job.running_at(),
-            completed_at: job.completed_at(),
-            next_start_at: job.next_start_at(),
-            metadata: if job.metadata().is_empty() {
-                None
-            } else {
-                Some(job.metadata().clone())
-            },
-        }
-    }
-
-    fn task_from_json(json: TaskJson) -> Task {
-        Task::restore(
-            json.id,
-            TaskCode::new(json.code),
-            json.status,
-            json.processing_by,
-            json.created_by_worker,
-            chrono::Duration::milliseconds(json.timeout_ms),
-            json.started_at,
-            json.completed_at,
-            json.deadline_at,
-            json.attempt,
-            json.max_attempts,
-            json.input,
-            json.output,
-            json.error,
-            json.depends_on,
-        )
-    }
-
-    fn job_from_json(
-        json: JobJson,
-        max_iterations: Option<u64>,
-        iteration_interval: Option<Duration>,
-        task_limits: crate::TaskLimits,
-        version: &str,
-    ) -> Job {
-        let tasks: Vec<Task> = json.tasks.into_iter().map(Self::task_from_json).collect();
-
-        Job::restore(
-            json.id,
-            JobCode::new(json.code),
-            version.to_string(),
-            json.iter_num,
-            json.status,
-            tasks,
-            json.updated_by,
-            json.started_at,
-            json.running_at,
-            json.completed_at,
-            json.next_start_at,
-            json.metadata.unwrap_or_default(),
-            max_iterations,
-            iteration_interval,
-            task_limits,
-        )
     }
 
     async fn put_next_iteration(&self, key: &str, job_serialized: Vec<u8>) -> StorageResult<Option<String>> {
