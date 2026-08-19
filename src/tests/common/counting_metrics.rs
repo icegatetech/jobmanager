@@ -18,6 +18,7 @@ pub struct CountingMetrics {
     cache_misses: AtomicU64,
     save_conflict_retries: AtomicU64,
     stolen_tasks: AtomicU64,
+    storage_operations: parking_lot::Mutex<std::collections::HashMap<(String, String), u64>>,
 }
 
 impl CountingMetrics {
@@ -60,6 +61,39 @@ impl CountingMetrics {
     pub fn stolen_tasks(&self) -> u64 {
         self.stolen_tasks.load(Ordering::SeqCst)
     }
+
+    /// How many storage operations were recorded in total, under whatever operation and status.
+    ///
+    /// A request is billed by the store whatever it answered, so a test asserting on the number of
+    /// them counts every pair rather than the ones it thought to name: a status nobody listed - a
+    /// `500`, a `429` - would otherwise disappear from the oracle.
+    pub fn storage_operations_total(&self) -> u64 {
+        self.storage_operations.lock().values().sum()
+    }
+
+    /// How many storage operations were recorded under any pair other than `operation`/`status`.
+    ///
+    /// Both halves are read under one lock, so a request recorded between two separate reads cannot
+    /// show up in the total a test compares and not in the pair it excludes.
+    pub fn storage_operations_besides(&self, operation: &str, status: &str) -> u64 {
+        let storage_operations = self.storage_operations.lock();
+        let excluded = storage_operations
+            .get(&(operation.to_string(), status.to_string()))
+            .copied()
+            .unwrap_or(0);
+
+        storage_operations.values().sum::<u64>() - excluded
+    }
+
+    /// How many times `operation` was recorded under `status` - the pair the storage metric is
+    /// labelled with.
+    pub fn storage_operations(&self, operation: &str, status: &str) -> u64 {
+        self.storage_operations
+            .lock()
+            .get(&(operation.to_string(), status.to_string()))
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 impl MetricsSink for CountingMetrics {
@@ -85,6 +119,14 @@ impl MetricsSink for CountingMetrics {
             TaskStatus::Todo | TaskStatus::Blocked | TaskStatus::Started => return,
         };
         counter.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn record_storage_operation(&self, operation: &str, status: &str, _duration: Duration) {
+        *self
+            .storage_operations
+            .lock()
+            .entry((operation.to_string(), status.to_string()))
+            .or_insert(0) += 1;
     }
 
     fn record_cache_hit(&self, _method: &str) {

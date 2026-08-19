@@ -126,6 +126,21 @@ pub(crate) enum TaskPickup {
     Exhausted,
 }
 
+/// What a job's state allows to be done about its next iteration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IterationStep {
+    /// The current iteration is open: its tasks can be taken into work.
+    IterationInProgress,
+    /// The current iteration ended and the next one is allowed now.
+    NextIterationReady,
+    /// The current iteration ended; the next one is allowed no earlier than the given moment.
+    NextIterationDueAt(DateTime<Utc>),
+    /// The current iteration ended and the job spent its iteration budget.
+    IterationBudgetSpent,
+    /// The current iteration ended, but no moment for the next one can be derived.
+    NextIterationUnscheduled,
+}
+
 /// Payload size caps applied to every task of a job.
 ///
 /// Oversized payloads are rejected with an error, never truncated: an input above the cap fails
@@ -919,25 +934,56 @@ impl Job {
         matches!(self.status, JobStatus::Started | JobStatus::Running)
     }
 
-    pub(crate) fn is_ready_to_next_iteration(&self) -> bool {
-        if !matches!(self.status, JobStatus::Completed | JobStatus::Failed) {
-            return false;
+    /// Earliest moment the domain allows the next iteration to begin - the step of
+    /// [`Self::pick_iteration_step`] that derives a moment, and the only caller of this.
+    ///
+    /// `None` where no moment follows from the state: the two cases the step has already ruled out
+    /// by the time it asks, and an interval that is not expressible as a moment. The moment itself
+    /// may lie in the past, which is what the step reads as "allowed now".
+    fn next_iteration_start_at(&self) -> Option<DateTime<Utc>> {
+        if !self.is_processed() || self.is_iteration_limit_reached() {
+            return None;
         }
 
-        if self.is_iteration_limit_reached() {
-            return false;
+        if let Some(next_start_at) = self.next_start_at {
+            return Some(next_start_at);
         }
 
-        if let Some(next_start) = self.next_start_at {
-            return Utc::now() > next_start;
-        }
-
-        // A failed conversion holds the next iteration back rather than releasing it: the interval
-        // is validated in `JobDefinition::with_iteration_interval`, so this cannot happen, and
-        // starting early would be the more damaging way to be wrong.
-        self.iteration_interval.is_none_or(|interval| {
-            Duration::from_std(interval).is_ok_and(|interval| Utc::now() >= self.started_at + interval)
+        // An interval that names no moment holds the next iteration back rather than releasing it:
+        // starting early would be the more damaging way to be wrong. Both steps are checked because
+        // an interval that converts can still carry the moment past the range a moment has.
+        self.iteration_interval.map_or(Some(self.started_at), |interval| {
+            Duration::from_std(interval)
+                .ok()
+                .and_then(|interval| self.started_at.checked_add_signed(interval))
         })
+    }
+
+    /// What this state allows to be done about the next iteration.
+    ///
+    /// A spent iteration budget outranks a due moment: a job at its limit starts no further
+    /// iteration, however long ago the moment for one passed.
+    // TODO(low): the moment is compared against the reader's own clock, and clocks running apart are
+    // not compensated for - a lagging one delays the start of an iteration by the whole difference,
+    // a leading one loses the write it races. The cost is a delay and not a wrong state, because
+    // every write stays conditional.
+    pub(crate) fn pick_iteration_step(&self) -> IterationStep {
+        if !self.is_processed() {
+            return IterationStep::IterationInProgress;
+        }
+        if self.is_iteration_limit_reached() {
+            return IterationStep::IterationBudgetSpent;
+        }
+
+        match self.next_iteration_start_at() {
+            Some(due) if Utc::now() >= due => IterationStep::NextIterationReady,
+            Some(due) => IterationStep::NextIterationDueAt(due),
+            None => IterationStep::NextIterationUnscheduled,
+        }
+    }
+
+    fn is_ready_to_next_iteration(&self) -> bool {
+        matches!(self.pick_iteration_step(), IterationStep::NextIterationReady)
     }
 
     // State mutations
@@ -1095,7 +1141,7 @@ impl Job {
         Ok(())
     }
 
-    pub(crate) const fn is_iteration_limit_reached(&self) -> bool {
+    const fn is_iteration_limit_reached(&self) -> bool {
         // TODO(low): add a special status that we no longer run the job and remove this check at the
         // complete stage
         match self.max_iterations {
@@ -2083,30 +2129,6 @@ mod tests {
     }
 
     #[test]
-    fn test_next_iteration_interval_not_elapsed() {
-        let task = make_task(Uuid::from_u128(36), "done", TaskStatus::Completed, Vec::new());
-        let job = Job::restore(
-            Uuid::from_u128(37),
-            JobCode::new("job"),
-            String::new(),
-            1,
-            JobStatus::Completed,
-            vec![task],
-            Uuid::from_u128(306),
-            Utc::now(),
-            None,
-            Some(Utc::now()),
-            None,
-            HashMap::new(),
-            None,
-            Some(std::time::Duration::from_mins(1)),
-            TaskLimits::default(),
-        );
-
-        assert!(!job.is_ready_to_next_iteration());
-    }
-
-    #[test]
     fn test_is_ready_to_next_iteration_anchors_to_restored_started_at() {
         // Simulates a process restart: the job is reloaded from storage carrying the
         // started_at of the iteration that already completed. The next-iteration gate
@@ -2165,27 +2187,6 @@ mod tests {
     }
 
     #[test]
-    fn test_set_next_start_at_blocks_next_iteration_when_future() {
-        let task = make_task(Uuid::from_u128(360), "done", TaskStatus::Completed, Vec::new());
-        let mut job = restore_job(
-            Uuid::from_u128(361),
-            JobStatus::Completed,
-            vec![task],
-            1,
-            None,
-            None,
-            Uuid::from_u128(362),
-            None,
-            Some(Utc::now()),
-            None,
-            HashMap::new(),
-        );
-
-        job.set_next_start_at(Utc::now() + Duration::seconds(60));
-        assert!(!job.is_ready_to_next_iteration());
-    }
-
-    #[test]
     fn test_set_next_start_at_overrides_iteration_interval_floor() {
         let task = make_task(Uuid::from_u128(366), "done", TaskStatus::Completed, Vec::new());
         let mut job = Job::restore(
@@ -2209,6 +2210,312 @@ mod tests {
         assert!(!job.is_ready_to_next_iteration());
         job.set_next_start_at(Utc::now() - Duration::seconds(1));
         assert!(job.is_ready_to_next_iteration());
+    }
+
+    /// A running iteration has no next one to schedule: the state it would be scheduled from does
+    /// not exist yet.
+    #[test]
+    fn a_running_iteration_has_no_due_moment() {
+        let task = make_task(Uuid::from_u128(380), "todo", TaskStatus::Todo, Vec::new());
+        let job = restore_job(
+            Uuid::from_u128(381),
+            JobStatus::Running,
+            vec![task],
+            1,
+            None,
+            None,
+            Uuid::from_u128(382),
+            Some(Utc::now()),
+            None,
+            None,
+            HashMap::new(),
+        );
+
+        assert_eq!(job.next_iteration_start_at(), None);
+    }
+
+    /// A job that spent its iteration budget never becomes due again, so a caller must not be told
+    /// to wait for a moment that will not come.
+    #[test]
+    fn a_job_at_its_iteration_limit_has_no_due_moment() {
+        let task = make_task(Uuid::from_u128(383), "done", TaskStatus::Completed, Vec::new());
+        let job = restore_job(
+            Uuid::from_u128(384),
+            JobStatus::Completed,
+            vec![task],
+            2,
+            Some(2),
+            None,
+            Uuid::from_u128(385),
+            None,
+            Some(Utc::now()),
+            None,
+            HashMap::new(),
+        );
+
+        assert_eq!(job.next_iteration_start_at(), None);
+    }
+
+    /// An explicit next start is the moment itself, and it overrides the interval - both directions
+    /// of that override are already covered by the tests above this one.
+    #[test]
+    fn an_explicit_next_start_is_the_due_moment() {
+        let next_start_at = Utc::now() + Duration::seconds(60);
+        let task = make_task(Uuid::from_u128(386), "done", TaskStatus::Completed, Vec::new());
+        let mut job = restore_job(
+            Uuid::from_u128(387),
+            JobStatus::Completed,
+            vec![task],
+            1,
+            None,
+            Some(std::time::Duration::from_mins(1)),
+            Uuid::from_u128(388),
+            None,
+            Some(Utc::now()),
+            None,
+            HashMap::new(),
+        );
+        job.set_next_start_at(next_start_at);
+
+        assert_eq!(job.next_iteration_start_at(), Some(next_start_at));
+    }
+
+    /// The interval is counted from the start of the iteration, not from its end, so a long
+    /// iteration does not push the schedule.
+    #[test]
+    fn an_interval_is_due_one_interval_after_the_iteration_started() {
+        let started_at = Utc::now() - Duration::seconds(30);
+        let task = make_task(Uuid::from_u128(389), "done", TaskStatus::Completed, Vec::new());
+        let job = Job::restore(
+            Uuid::from_u128(390),
+            JobCode::new("job"),
+            String::new(),
+            1,
+            JobStatus::Completed,
+            vec![task],
+            Uuid::from_u128(391),
+            started_at,
+            None,
+            Some(started_at + Duration::seconds(2)),
+            None,
+            HashMap::new(),
+            None,
+            Some(std::time::Duration::from_mins(1)),
+            TaskLimits::default(),
+        );
+
+        assert_eq!(job.next_iteration_start_at(), Some(started_at + Duration::minutes(1)));
+    }
+
+    /// Without a schedule the next iteration is due at once. The start of the current iteration is
+    /// the moment used for that: it is always in the past and, unlike the completion time, always
+    /// present.
+    #[test]
+    fn a_job_without_a_schedule_is_due_at_the_start_of_its_current_iteration() {
+        let started_at = Utc::now() - Duration::seconds(5);
+        let task = make_task(Uuid::from_u128(392), "done", TaskStatus::Completed, Vec::new());
+        let job = Job::restore(
+            Uuid::from_u128(393),
+            JobCode::new("job"),
+            String::new(),
+            1,
+            JobStatus::Completed,
+            vec![task],
+            Uuid::from_u128(394),
+            started_at,
+            None,
+            Some(Utc::now()),
+            None,
+            HashMap::new(),
+            None,
+            None,
+            TaskLimits::default(),
+        );
+
+        assert_eq!(job.next_iteration_start_at(), Some(started_at));
+    }
+
+    /// The predicate must read the moment rather than re-derive the rule: a state whose moment has
+    /// passed is ready, one whose moment is ahead is not.
+    #[test]
+    fn readiness_follows_the_due_moment() {
+        let task = make_task(Uuid::from_u128(395), "done", TaskStatus::Completed, Vec::new());
+        let mut job = restore_job(
+            Uuid::from_u128(396),
+            JobStatus::Completed,
+            vec![task],
+            1,
+            None,
+            None,
+            Uuid::from_u128(397),
+            None,
+            Some(Utc::now()),
+            None,
+            HashMap::new(),
+        );
+
+        job.set_next_start_at(Utc::now() - Duration::seconds(1));
+        assert!(job.is_ready_to_next_iteration());
+        assert!(job.next_iteration_start_at().is_some_and(|due| Utc::now() >= due));
+
+        job.set_next_start_at(Utc::now() + Duration::seconds(60));
+        assert!(!job.is_ready_to_next_iteration());
+        assert!(job.next_iteration_start_at().is_some_and(|due| Utc::now() < due));
+    }
+
+    /// The same agreement for a job scheduled by an interval rather than by an explicit start: the
+    /// predicate answers for the moment the interval names, in both directions.
+    ///
+    /// The moment *itself* is not asserted anywhere: both sides of the comparison read the wall
+    /// clock, so a job is only ever exactly due for the nanosecond it takes to ask, and no test can
+    /// hold it there.
+    #[test]
+    fn readiness_follows_the_due_moment_of_an_interval() {
+        let interval = std::time::Duration::from_mins(1);
+        let task = make_task(Uuid::from_u128(398), "done", TaskStatus::Completed, Vec::new());
+        let elapsed = Job::restore(
+            Uuid::from_u128(399),
+            JobCode::new("job"),
+            String::new(),
+            1,
+            JobStatus::Completed,
+            vec![task.clone()],
+            Uuid::from_u128(400),
+            Utc::now() - Duration::seconds(61),
+            None,
+            Some(Utc::now()),
+            None,
+            HashMap::new(),
+            None,
+            Some(interval),
+            TaskLimits::default(),
+        );
+        let pending = Job::restore(
+            Uuid::from_u128(401),
+            JobCode::new("job"),
+            String::new(),
+            1,
+            JobStatus::Completed,
+            vec![task],
+            Uuid::from_u128(402),
+            Utc::now() - Duration::seconds(1),
+            None,
+            Some(Utc::now()),
+            None,
+            HashMap::new(),
+            None,
+            Some(interval),
+            TaskLimits::default(),
+        );
+
+        assert!(elapsed.is_ready_to_next_iteration());
+        assert!(elapsed.next_iteration_start_at().is_some_and(|due| Utc::now() >= due));
+        assert!(!pending.is_ready_to_next_iteration());
+        assert!(pending.next_iteration_start_at().is_some_and(|due| Utc::now() < due));
+    }
+
+    /// A completed iteration whose next one is scheduled by an explicit moment, which every step
+    /// test below moves around that moment.
+    fn scheduled_job(id: u128, status: JobStatus, iter_num: u64, max_iterations: Option<u64>) -> Job {
+        let task = make_task(Uuid::from_u128(id + 1), "done", TaskStatus::Completed, Vec::new());
+        restore_job(
+            Uuid::from_u128(id),
+            status,
+            vec![task],
+            iter_num,
+            max_iterations,
+            None,
+            Uuid::from_u128(id + 2),
+            None,
+            Some(Utc::now()),
+            None,
+            HashMap::new(),
+        )
+    }
+
+    /// An iteration nobody finished is the work at hand: its tasks are what a caller takes up, and
+    /// no next iteration is on offer while it is open.
+    #[test]
+    fn an_open_iteration_steps_to_the_iteration_in_progress() {
+        let job = scheduled_job(410, JobStatus::Running, 1, None);
+
+        assert_eq!(job.pick_iteration_step(), IterationStep::IterationInProgress);
+    }
+
+    /// The budget outranks the moment, and the case that proves it is the one where both apply: a
+    /// job at its limit whose moment has passed must not be handed a next iteration.
+    #[test]
+    fn a_spent_iteration_budget_outranks_a_moment_already_reached() {
+        let mut job = scheduled_job(420, JobStatus::Completed, 2, Some(2));
+        job.set_next_start_at(Utc::now() - Duration::seconds(1));
+
+        assert_eq!(job.pick_iteration_step(), IterationStep::IterationBudgetSpent);
+    }
+
+    /// The three cases around the moment itself: ahead of it the caller is told to wait for it,
+    /// at it and past it the next iteration is allowed.
+    #[test]
+    fn the_step_follows_the_due_moment_across_its_boundary() {
+        let mut job = scheduled_job(430, JobStatus::Completed, 1, None);
+
+        let ahead = Utc::now() + Duration::seconds(60);
+        job.set_next_start_at(ahead);
+        assert_eq!(job.pick_iteration_step(), IterationStep::NextIterationDueAt(ahead));
+
+        // Read back a nanosecond later at the earliest, which is what "at the moment" amounts to
+        // for a rule comparing against the wall clock.
+        job.set_next_start_at(Utc::now());
+        assert_eq!(job.pick_iteration_step(), IterationStep::NextIterationReady);
+
+        job.set_next_start_at(Utc::now() - Duration::seconds(1));
+        assert_eq!(job.pick_iteration_step(), IterationStep::NextIterationReady);
+    }
+
+    /// A completed iteration whose next one is scheduled by the given interval, which is the only
+    /// way to reach a job carrying an interval no legal call sequence accepts.
+    fn job_with_iteration_interval(id: u128, iteration_interval: std::time::Duration) -> Job {
+        let task = make_task(Uuid::from_u128(id + 1), "done", TaskStatus::Completed, Vec::new());
+        Job::restore(
+            Uuid::from_u128(id),
+            JobCode::new("job"),
+            String::new(),
+            1,
+            JobStatus::Completed,
+            vec![task],
+            Uuid::from_u128(id + 2),
+            Utc::now(),
+            None,
+            Some(Utc::now()),
+            None,
+            HashMap::new(),
+            None,
+            Some(iteration_interval),
+            TaskLimits::default(),
+        )
+    }
+
+    /// An interval too large to express as a moment leaves the next iteration unscheduled rather
+    /// than releasing it.
+    #[test]
+    fn an_interval_that_names_no_moment_steps_to_nothing_scheduled() {
+        let job = job_with_iteration_interval(440, std::time::Duration::MAX);
+
+        assert_eq!(job.pick_iteration_step(), IterationStep::NextIterationUnscheduled);
+    }
+
+    /// The interval an iteration is counted from is the second way a moment can be out of range: it
+    /// converts, and the moment it names still lies past the range a moment has.
+    #[test]
+    fn an_interval_that_carries_the_moment_out_of_range_steps_to_nothing_scheduled() {
+        let three_hundred_thousand_years = Duration::days(300_000 * 365).to_std().unwrap();
+        assert!(
+            Duration::from_std(three_hundred_thousand_years).is_ok(),
+            "the case is about an interval the conversion accepts"
+        );
+
+        let job = job_with_iteration_interval(450, three_hundred_thousand_years);
+
+        assert_eq!(job.pick_iteration_step(), IterationStep::NextIterationUnscheduled);
     }
 
     #[test]

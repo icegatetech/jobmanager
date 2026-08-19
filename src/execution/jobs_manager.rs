@@ -141,8 +141,9 @@ impl JobsManagerHandle {
     /// one does.
     ///
     /// An iteration this pool did not finish itself - one left in storage by an earlier pool, or
-    /// one another pool completed - ends the wait on the poll that picks it up, so it is observed
-    /// with a delay of up to one poll interval rather than the moment it ended.
+    /// one another pool completed - ends the wait on the poll that picks it up. A job whose next
+    /// iteration is not due yet is not polled at all until it is, so such an iteration is observed
+    /// when the job next becomes due rather than within a poll interval of ending.
     ///
     /// # Errors
     ///

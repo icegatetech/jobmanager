@@ -228,8 +228,14 @@ impl JobsManagerBuilder {
 
     /// Base delay between storage polls of a worker that found work last time.
     ///
-    /// Raising it past the backoff ceiling raises the ceiling with it, so a job that iterates once
-    /// in minutes needs this setting alone; see [`Self::max_poll_interval`].
+    /// Applies per job: a job with nothing to wait for is polled at this interval, while one whose
+    /// next iteration is not due yet is not polled until it is.
+    ///
+    /// An unnamed backoff ceiling is ten times this interval, so a job that iterates once in
+    /// minutes needs this setting alone; see [`Self::max_poll_interval`].
+    ///
+    /// [`Self::build`] rejects a zero interval, one longer than a year, and one above a ceiling
+    /// named through [`Self::max_poll_interval`].
     #[must_use]
     pub const fn poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = Some(interval);
@@ -238,6 +244,11 @@ impl JobsManagerBuilder {
 
     /// Upper bound of the random delay added to each poll, which keeps workers from polling in
     /// lockstep.
+    ///
+    /// Also spreads the moment jobs sharing a schedule are picked up: without it every worker of
+    /// every pool wakes at the same instant when an interval-scheduled job becomes due, and all but
+    /// one pay a rejected write. A fleet of many workers on interval-scheduled jobs wants this
+    /// raised.
     #[must_use]
     pub const fn poll_jitter(mut self, jitter: Duration) -> Self {
         self.poll_jitter = Some(jitter);
@@ -246,8 +257,10 @@ impl JobsManagerBuilder {
 
     /// Ceiling the poll interval backs off to while there is no work.
     ///
-    /// Left unset, the ceiling is the default one or [`Self::poll_interval`], whichever is larger.
-    /// Set here, it must not be below the poll interval - [`Self::build`] rejects that pair.
+    /// Left unset, the ceiling is ten times [`Self::poll_interval`] - so a pool polled every 200 ms
+    /// backs off to two seconds, and one polled every ten seconds backs off to a hundred.
+    ///
+    /// [`Self::build`] rejects a ceiling below the poll interval and one longer than a year.
     #[must_use]
     pub const fn max_poll_interval(mut self, interval: Duration) -> Self {
         self.max_poll_interval = Some(interval);
@@ -634,11 +647,10 @@ mod tests {
         );
     }
 
-    /// The default ceiling is two seconds, so a pool polled less often than that would otherwise be
-    /// refused over a setting its caller never named - and its backoff would shorten the wait
-    /// instead of lengthening it.
+    /// An unnamed ceiling is derived from the poll interval, so however rarely a pool is polled it
+    /// is never refused over a ceiling its caller never named.
     #[tokio::test]
-    async fn build_accepts_a_poll_interval_above_the_default_maximum() {
+    async fn build_accepts_a_long_poll_interval_without_a_named_ceiling() {
         JobsManagerBuilder::new()
             .in_memory()
             .poll_interval(Duration::from_secs(10))
@@ -647,7 +659,7 @@ mod tests {
             })
             .build()
             .await
-            .expect("a poll interval above the default ceiling must build");
+            .expect("a poll interval with no named ceiling must build");
     }
 
     #[tokio::test]

@@ -1,13 +1,5 @@
 [advisories]
-ignore = [
-    # `quinn-proto` via `testcontainers`, wait for new version
-    "RUSTSEC-2026-0185",
-    # rustls-webpki 0.101.7 flaws: CRL matching, reachable panic in CRL parsing,
-    # URI and wildcard name-constraint handling. All reached transitively through
-    # aws-smithy-http-client -> rustls 0.21; this crate never calls rustls directly.
-    # Remove once the AWS SDK drops legacy rustls.
-    "RUSTSEC-2026-0049",
-    "RUSTSEC-2026-0098",
-    "RUSTSEC-2026-0099",
-    "RUSTSEC-2026-0104",
-]
+# Empty on purpose: every advisory this crate pulls in is fixed by a version bump or by
+# dropping the feature that pulled the vulnerable crate in. An entry here is a last resort,
+# and carries the reason and the condition for its removal.
+ignore = []

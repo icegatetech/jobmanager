@@ -120,6 +120,20 @@ iteration. The mechanics are documented on the types themselves; what follows is
   `iter_num - iteration_retention` of the iteration a worker has already persisted. The boundary is
   strictly below the job's current iteration, so the newest state object is never deletable;
   deleting it would let `find_job_meta` miss the job and a worker recreate it from `iter_num = 1`.
+- **Never make workers wait for one another.** A storage call is issued outside every lock: a lock is
+  held only long enough to take a snapshot or to record a result. The hot path — a cache hit — is
+  what this is for: every worker of a pool reaches storage in parallel and holds the entry for
+  microseconds, and widening that hold turns one round trip into a queue the whole pool stands in, on
+  every poll. The counterpart is that concurrent access stays the assumption: state taken out from
+  under a lock may be stale by the time it is used, and the write that follows is conditional for
+  exactly that reason.
+- **Never add a request to a pass.** Storage bills per request and the poll loop never ends, so a
+  `LIST`, a `GET` or a `PUT` added to one pass is paid by every worker of every pool, for every job,
+  for as long as the job exists. A pass some quota already covers fails loudly; a scenario nobody
+  quoted is where this fails silently, so a new one is given its number before it ships. What each
+  scenario is allowed to cost, and the rules those numbers are held to, are in
+  [docs/tests.md](docs/tests.md); a number that has to go up is a change to be agreed, never a test
+  to be updated.
 - Job settings (`max_iterations`, `iteration_interval`, `TaskLimits`, `iteration_retention`) are
   re-read from the `JobDefinition` on every load, so they are changed in code, never by editing a
   stored object.
@@ -132,6 +146,8 @@ iteration. The mechanics are documented on the types themselves; what follows is
 - When the change touches a domain structure, say which of its fields the stored representation
   carries and which it leaves out, and why — that call is made in `storage`, not in the domain type.
   A field left out **MUST** behave the same under every `Storage` implementation.
+- Say how many storage requests the change adds to a pass, and name the quota that asserts that
+  number. "None" is an answer; it is not an assumption.
 - Cover the behavior with tests — read [docs/tests.md](docs/tests.md) first.
 - The crate is pre-1.0 and unpublished, so a breaking API change is allowed — but state it, do not
   slip it in.
@@ -140,6 +156,8 @@ iteration. The mechanics are documented on the types themselves; what follows is
 
 - Run targeted tests for the affected functionality, and report which test commands were run and
   which required tests were not.
+- Run `make quota` and report the numbers, which its test names carry, not that the tests passed. A
+  number that moved is reported as a number.
 - Re-read every comment the change added and delete the ones that fail the acid test and the budget
   in [RUST.md](docs/RUST.md). This pass is a separate step because a comment that restates the code
   is written far more easily than it is noticed afterwards.

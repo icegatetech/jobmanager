@@ -66,9 +66,12 @@ tracing = "0.1"
 tokio = { version = "1.48.0", features = ["rt", "sync", "time", "macros", "signal"] }
 tokio-util = "0.7"
 
-# AWS S3
-aws-sdk-s3 = "1.127"
-aws-config = "1.8"
+# AWS S3. Default features are off to keep the SDK's legacy `rustls` connector out: it is the
+# hyper 0.14 stack, unused here next to the hyper 1.x default client, and it drags along its own
+# h2 0.3 and rustls 0.21 - the pair that kept turning up in `cargo audit`. The features listed are
+# the rest of the SDK's own defaults.
+aws-sdk-s3 = { version = "1.127", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
+aws-config = { version = "1.8", default-features = false, features = ["credentials-process", "default-https-client", "rt-tokio", "sso"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

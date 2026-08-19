@@ -51,6 +51,14 @@ pub(crate) fn map_s3_error<E: std::fmt::Debug>(err: &SdkError<E>) -> StorageErro
     }
 }
 
+/// Whether a failed `GetObject` is the store answering "not modified" to a conditional read.
+///
+/// Kept apart from [`map_s3_error`] on purpose: `304` is not a failure to translate but the answer
+/// the conditional read asks for, so it is recognised before the mapping and never reaches it.
+pub(crate) fn is_not_modified<E: std::fmt::Debug>(err: &SdkError<E>) -> bool {
+    matches!(err, SdkError::ServiceError(service_err) if service_err.raw().status().as_u16() == 304)
+}
+
 /// Storage error the per-object failures of one multi-object delete amount to, or `None` when the
 /// response reported no failure at all.
 ///

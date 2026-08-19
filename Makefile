@@ -1,10 +1,15 @@
-.PHONY: test check fmt fmt-fix clippy clippy-fix audit install ci \
+.PHONY: test quota check fmt fmt-fix clippy clippy-fix audit install ci \
         examples-infra-up examples-infra-down clean
 
 # Integration tests start an S3-compatible container (RustFS) via testcontainers.
 # --test-threads=1 is mandatory: parallel containers collide on ports.
 test:
 	cargo test -- --test-threads=1
+
+# Exact per-scenario S3 request counts. A number that moved is agreed, not updated - see
+# docs/tests.md.
+quota:
+	cargo test --lib tests::request_quota_test -- --test-threads=1
 
 check:
 	cargo check --all-targets

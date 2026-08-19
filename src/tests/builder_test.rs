@@ -9,7 +9,8 @@ use std::{
 use parking_lot::Mutex;
 
 use super::common::counting_metrics::CountingMetrics;
-use crate::{JobCode, JobsManager, MetricsSink, TaskDefinition, TaskLimits, TaskOutcome, task_fn};
+use super::common::s3_container::S3TestContainer;
+use crate::{JobCode, JobsManager, MetricsSink, S3StorageConfig, TaskDefinition, TaskLimits, TaskOutcome, task_fn};
 
 /// Bound on the wait: a broken chain must fail the test rather than hang the suite.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -348,5 +349,69 @@ async fn a_runtime_task_of_an_unregistered_code_fails_its_iteration() -> Result<
 
     assert_eq!(sink.failed_iterations(), 1);
     assert_eq!(sink.completed_iterations(), 0);
+    Ok(())
+}
+
+/// `no_cache()` has to reach the backend the builder assembles, not only the flag it keeps: the read
+/// cache is what a conditional read is issued by, so a pool that kept it against the caller's word
+/// would go on reading through a component that caller took out.
+///
+/// The two numbers come from the sink the pool was given rather than from a probe of the store: the
+/// builder owns the job descriptions it built, so a probe would need a second registry holding a
+/// copy of one.
+///
+/// One worker and two tasks are what make the second number mean anything: a worker runs one task
+/// per job per pass, so the iteration cannot finish before a pass has read a job the store already
+/// holds - the read a cache would answer, and the only one it records a decision for.
+#[tokio::test]
+async fn a_pool_built_without_the_cache_holds_no_cached_state() -> Result<(), Box<dyn std::error::Error>> {
+    super::common::init_tracing();
+
+    let container = S3TestContainer::start().await?;
+    let sink = Arc::new(CountingMetrics::default());
+    let manager = JobsManager::builder()
+        .s3(S3StorageConfig::new(
+            container.endpoint(),
+            container.username(),
+            container.password(),
+            "builder-no-cache",
+            "us-east-1",
+        ))
+        .no_cache()
+        .metrics(Arc::clone(&sink) as Arc<dyn MetricsSink>)
+        .workers(1)
+        .poll_interval(Duration::from_millis(20))
+        .job("uncached_job", |j| {
+            j.max_iterations(1);
+            j.add_task(
+                TaskDefinition::new("first", Duration::from_secs(5)),
+                task_fn(|_ctx| async { Ok(TaskOutcome::empty()) }),
+            );
+            j.add_task(
+                TaskDefinition::new("second", Duration::from_secs(5)),
+                task_fn(|_ctx| async { Ok(TaskOutcome::empty()) }),
+            );
+        })
+        .build()
+        .await?;
+
+    let handle = manager.start()?;
+    tokio::time::timeout(
+        WAIT_TIMEOUT,
+        handle.wait_for_job_completion(&JobCode::new("uncached_job")),
+    )
+    .await??;
+    handle.shutdown().await?;
+
+    assert_eq!(
+        sink.completed_iterations(),
+        1,
+        "the pool must have run the job's only iteration to the end"
+    );
+    assert_eq!(
+        sink.cache_hits() + sink.cache_misses(),
+        0,
+        "a pool built without the cache never decides whether a read is served from one"
+    );
     Ok(())
 }

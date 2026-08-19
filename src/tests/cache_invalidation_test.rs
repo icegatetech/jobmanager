@@ -53,34 +53,43 @@ async fn test_cache_invalidation() -> Result<(), Box<dyn std::error::Error>> {
     storage.save_job(&mut job, &cancel_token).await?;
     assert_eq!(job.version(), "1");
 
-    // First read: nothing is cached yet, so both the metadata and the job itself are fetched.
+    // First read: nothing is cached yet, so the iteration has to be discovered and fetched.
     let job_from_cache = cached_storage.get_job(&job_code, &cancel_token).await?;
     assert_eq!(storage.find_meta_calls(), 1);
     assert_eq!(storage.get_by_meta_calls(), 1);
+    assert_eq!(storage.conditional_read_calls(), 0);
     assert_eq!(job_from_cache.version(), "1");
 
     // Saving through the cache refreshes it, so no read is needed to keep it current.
     cached_storage.save_job(&mut job, &cancel_token).await?;
     assert_eq!(storage.find_meta_calls(), 1);
-    assert_eq!(storage.get_by_meta_calls(), 1);
+    assert_eq!(storage.conditional_read_calls(), 0);
     assert_eq!(job.version(), "2");
 
-    // Cache hit: the metadata is re-read to check currency, the job itself is not.
+    // Cache hit on a running iteration: currency is checked by a conditional read, which costs a
+    // GET, and no LIST is issued at all.
     let job_from_cache = cached_storage.get_job(&job_code, &cancel_token).await?;
-    assert_eq!(storage.find_meta_calls(), 2);
+    assert_eq!(
+        storage.find_meta_calls(),
+        1,
+        "a cached running iteration must not be listed"
+    );
+    assert_eq!(storage.conditional_read_calls(), 1);
+    assert_eq!(storage.unchanged_reads(), 1);
     assert_eq!(storage.get_by_meta_calls(), 1);
     assert_eq!(job_from_cache.version(), "2");
 
     // Another bypassing write leaves the cache stale.
     storage.save_job(&mut job, &cancel_token).await?;
-    assert_eq!(storage.find_meta_calls(), 2);
-    assert_eq!(storage.get_by_meta_calls(), 1);
     assert_eq!(job.version(), "3");
 
-    // Cache miss: the version moved, so the job is fetched again.
+    // The conditional read now answers with the state itself, so the stale cache is replaced
+    // without a LIST and without a second GET.
     let job_from_cache = cached_storage.get_job(&job_code, &cancel_token).await?;
-    assert_eq!(storage.find_meta_calls(), 3);
-    assert_eq!(storage.get_by_meta_calls(), 2);
+    assert_eq!(storage.find_meta_calls(), 1);
+    assert_eq!(storage.conditional_read_calls(), 2);
+    assert_eq!(storage.unchanged_reads(), 1);
+    assert_eq!(storage.get_by_meta_calls(), 1);
     assert_eq!(job_from_cache.version(), "3");
 
     Ok(())
