@@ -53,7 +53,6 @@ impl InMemoryStorage {
 }
 
 #[async_trait::async_trait]
-#[allow(private_interfaces)]
 impl Storage for InMemoryStorage {
     async fn get_job(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<Job> {
         if cancel_token.is_cancelled() {
@@ -91,6 +90,28 @@ impl Storage for InMemoryStorage {
                 version: job.version().to_string(),
             })
             .ok_or_else(|| StorageError::NotFound("Job is absent in in-memory storage".to_string()))
+    }
+
+    /// Holds only the current iteration, so a meta naming any other one is answered as absent
+    /// rather than with the state of a different iteration - see
+    /// [`Storage::get_changed_job`].
+    async fn get_changed_job(
+        &self,
+        job_meta: &JobMeta,
+        cancel_token: &CancellationToken,
+    ) -> StorageResult<Option<Job>> {
+        if cancel_token.is_cancelled() {
+            return Err(StorageError::Cancelled);
+        }
+        let jobs = self.jobs_by_code.read().await;
+        match jobs.get(&job_meta.code) {
+            Some(job) if job.iter_num() != job_meta.iter_num => Err(StorageError::NotFound(
+                "Job iteration is absent in in-memory storage".to_string(),
+            )),
+            Some(job) if job.version() == job_meta.version => Ok(None),
+            Some(job) => Ok(Some(job.clone())),
+            None => Err(StorageError::NotFound("Job is absent in in-memory storage".to_string())),
+        }
     }
 
     /// Refuses a save that would overwrite state written since `job` was read; see
@@ -153,6 +174,106 @@ mod tests {
     use super::*;
     use crate::{JobStatus, TaskLimits};
 
+    /// Builds a storage holding one saved job, and returns the meta naming its current state.
+    async fn storage_with_saved_job() -> (InMemoryStorage, JobMeta, Job) {
+        let storage = InMemoryStorage::new();
+        let job_code = JobCode::new("conditional_job");
+        let mut job = Job::restore(
+            Uuid::from_u128(1),
+            job_code.clone(),
+            String::new(),
+            1,
+            JobStatus::Started,
+            Vec::new(),
+            Uuid::from_u128(2),
+            Utc::now(),
+            None,
+            None,
+            None,
+            HashMap::new(),
+            None,
+            None,
+            TaskLimits::default(),
+        );
+        storage
+            .save_job(&mut job, &CancellationToken::new())
+            .await
+            .expect("the first save of an iteration must be accepted");
+        let job_meta = JobMeta {
+            code: job_code,
+            iter_num: job.iter_num(),
+            version: job.version().to_string(),
+        };
+
+        (storage, job_meta, job)
+    }
+
+    /// The whole point of the operation: a state that did not move answers without carrying itself
+    /// back over the wire.
+    #[tokio::test]
+    async fn an_unmoved_iteration_reads_as_unchanged() {
+        let (storage, job_meta, _job) = storage_with_saved_job().await;
+
+        let read = storage
+            .get_changed_job(&job_meta, &CancellationToken::new())
+            .await
+            .expect("a stored iteration must be readable");
+
+        assert!(read.is_none(), "got: {:?}", read.as_ref().map(Job::version));
+    }
+
+    #[tokio::test]
+    async fn a_moved_iteration_reads_as_changed_with_its_current_version() {
+        let (storage, job_meta, mut job) = storage_with_saved_job().await;
+        storage
+            .save_job(&mut job, &CancellationToken::new())
+            .await
+            .expect("a save carrying the stored version must be accepted");
+
+        let read = storage
+            .get_changed_job(&job_meta, &CancellationToken::new())
+            .await
+            .expect("a stored iteration must be readable");
+
+        let Some(changed) = read else {
+            panic!("a moved iteration must read as changed")
+        };
+        assert_eq!(changed.version(), job.version());
+        assert_eq!(changed.iter_num(), job_meta.iter_num);
+    }
+
+    /// A changed read may only ever carry the iteration that was asked for. Answering with a later one
+    /// would let a caller skip the discovery it owes to `find_job_meta`, and would make this
+    /// backend a more forgiving oracle than the object store, which cannot do it at all - the
+    /// iteration number is part of the object key there.
+    #[tokio::test]
+    async fn an_iteration_that_is_no_longer_stored_reads_as_not_found() {
+        let (storage, mut job_meta, _job) = storage_with_saved_job().await;
+        job_meta.iter_num += 1;
+
+        let error = storage
+            .get_changed_job(&job_meta, &CancellationToken::new())
+            .await
+            .err()
+            .expect("an iteration this storage does not hold must not be answered with another");
+
+        assert!(matches!(error, StorageError::NotFound(_)), "got: {error}");
+    }
+
+    #[tokio::test]
+    async fn reading_an_unknown_job_is_not_found() {
+        let (storage, mut job_meta, _job) = storage_with_saved_job().await;
+        job_meta.code = JobCode::new("job_nobody_saved");
+
+        let error = storage
+            .get_changed_job(&job_meta, &CancellationToken::new())
+            .await
+            .err()
+            .expect("an unknown job must not be readable");
+
+        assert!(matches!(error, StorageError::NotFound(_)), "got: {error}");
+    }
+
     /// A shutdown reaches a worker in the middle of its storage call, and every method has to
     /// answer it the same way the object-store backend does - otherwise a component test would see
     /// a cancellation the production backend turns into an error.
@@ -192,6 +313,7 @@ mod tests {
             storage.get_job(&job_code, &cancel_token).await.err(),
             storage.get_job_by_meta(&job_meta, &cancel_token).await.err(),
             storage.find_job_meta(&job_code, &cancel_token).await.err(),
+            storage.get_changed_job(&job_meta, &cancel_token).await.err(),
             storage.save_job(&mut job, &cancel_token).await.err(),
             storage.list_job_outdated_iterations(&job_code, 1, &cancel_token).await.err(),
             storage.delete_job_iterations(&job_code, &[1], &cancel_token).await.err(),

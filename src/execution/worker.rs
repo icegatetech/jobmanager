@@ -13,8 +13,9 @@ use uuid::Uuid;
 use crate::execution::job_cleaner::JobIterationStarted;
 use crate::execution::job_handle::{JobHandleImpl, JobHandleState};
 use crate::{
-    Error, InternalError, Job, JobCode, JobError, JobHandle, JobRegistry, JobStatus, MetricsSink, Retrier,
-    RetrierConfig, RetryStep, Storage, StorageError, TaskCode, TaskContext, TaskOutcome, TaskPickup, TaskResult,
+    Error, InternalError, IterationStep, Job, JobCode, JobError, JobHandle, JobRegistry, JobStatus, MetricsSink,
+    Retrier, RetrierConfig, RetryStep, Storage, StorageError, TaskCode, TaskContext, TaskOutcome, TaskPickup,
+    TaskResult,
 };
 // TODO(low): implement subscription mechanism for job updates between workers - if worker received/saved job, other workers should update their state to reduce races.
 // Can be done via storage wrapper.
@@ -43,8 +44,14 @@ impl Default for WorkerConfig {
 }
 
 impl WorkerConfig {
-    const DEFAULT_MAX_POLL_INTERVAL: Duration = Duration::from_secs(2);
+    /// How many times above the base interval the backoff ceiling sits when no ceiling was named.
+    const DEFAULT_MAX_POLL_INTERVAL_FACTOR: u32 = 10;
     const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+    /// Longest interval a worker accepts, either as its base or as its backoff ceiling.
+    // The product spells the year out in the units the bound is stated in; the `from_hours(8760)`
+    // the lint asks for names the same value in a number nobody reads as a year.
+    #[allow(clippy::duration_suboptimal_units)]
+    const LONGEST_ACCEPTED_POLL_INTERVAL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
     const DEFAULT_POLL_JITTER: Duration = Duration::from_millis(50);
 
     /// Settings a worker polls by unless a `with_*` method replaces one of them.
@@ -63,11 +70,15 @@ impl WorkerConfig {
     /// # Errors
     ///
     /// Returns [`Error::Other`] if `interval` is zero - a worker would then poll storage in a loop
-    /// without ever pausing - or if it is above a ceiling already named through
-    /// [`Self::with_max_poll_interval`], which would turn the backoff into a speed-up.
+    /// without ever pausing - if it is above [`Self::LONGEST_ACCEPTED_POLL_INTERVAL`], or if it is
+    /// above a ceiling already named through [`Self::with_max_poll_interval`], which would turn the
+    /// backoff into a speed-up.
     pub fn with_poll_interval(mut self, interval: Duration) -> Result<Self, Error> {
         if interval.is_zero() {
             return Err(Error::Other("poll interval must be positive".to_string()));
+        }
+        if interval > Self::LONGEST_ACCEPTED_POLL_INTERVAL {
+            return Err(Error::Other("poll interval must not exceed a year".to_string()));
         }
         if self.max_poll_interval.is_some_and(|ceiling| ceiling < interval) {
             return Err(Error::Other(
@@ -92,12 +103,15 @@ impl WorkerConfig {
     /// # Errors
     ///
     /// Returns [`Error::Other`] if `ceiling` is below the poll interval, which would turn the
-    /// backoff into a speed-up.
+    /// backoff into a speed-up, or above [`Self::LONGEST_ACCEPTED_POLL_INTERVAL`].
     pub fn with_max_poll_interval(mut self, ceiling: Duration) -> Result<Self, Error> {
         if ceiling < self.poll_interval {
             return Err(Error::Other(
                 "max poll interval must not be below the poll interval".to_string(),
             ));
+        }
+        if ceiling > Self::LONGEST_ACCEPTED_POLL_INTERVAL {
+            return Err(Error::Other("max poll interval must not exceed a year".to_string()));
         }
 
         self.max_poll_interval = Some(ceiling);
@@ -112,22 +126,32 @@ impl WorkerConfig {
     }
 
     /// Base interval a worker polls storage at after a pass that found work.
+    ///
+    /// Applies per job: a job with nothing to wait for is polled at this interval, while one whose
+    /// next iteration is not due yet is not polled until it is.
     pub const fn poll_interval(&self) -> Duration {
         self.poll_interval
     }
 
     /// Upper bound of the random delay added to each poll.
+    ///
+    /// Also spreads the moment jobs sharing a schedule are picked up: without it every worker of
+    /// every pool wakes at the same instant when an interval-scheduled job becomes due, and all but
+    /// one pay a rejected write. A fleet of many workers on interval-scheduled jobs wants this
+    /// raised.
     pub const fn poll_jitter(&self) -> Duration {
         self.poll_jitter
     }
 
     /// Ceiling the poll interval backs off to while there is no work.
     ///
-    /// A ceiling nobody named follows the poll interval whenever that is the larger of the two, so
-    /// a job polled less often than the default ceiling backs off upwards rather than down to it.
+    /// A ceiling nobody named is [`Self::DEFAULT_MAX_POLL_INTERVAL_FACTOR`] times the poll
+    /// interval, so the backoff spans the same number of doublings whatever the base interval is;
+    /// a ceiling named through [`Self::with_max_poll_interval`] replaces it outright. A pool that
+    /// wants a rare poll while idle without a frequent one while busy names both.
     pub fn max_poll_interval(&self) -> Duration {
         self.max_poll_interval
-            .unwrap_or_else(|| Self::DEFAULT_MAX_POLL_INTERVAL.max(self.poll_interval))
+            .unwrap_or(self.poll_interval * Self::DEFAULT_MAX_POLL_INTERVAL_FACTOR)
     }
 
     /// Retry policy a worker applies to its storage operations.
@@ -138,7 +162,37 @@ impl WorkerConfig {
 
 struct JobCacheEntry {
     next_poll: std::time::Instant,
+    // Backoff step of this job alone: a busy job must not hold an idle neighbour at the base
+    // interval, nor an idle one drag a busy neighbour up to the ceiling.
+    poll_interval: Duration,
     exhausted: bool, // true if job reached maxIterations
+}
+
+/// How one pass over a job ended, which is what decides when polling it again can change anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JobPassOutcome {
+    /// The job spent its iteration budget: no later pass can change anything.
+    IterationBudgetSpent,
+    /// The iteration finished; the next one is not due before the given moment.
+    NextIterationDueAt(DateTime<Utc>),
+    /// The pass moved the job.
+    Processed,
+    /// The pass changed nothing, or failed.
+    Stalled,
+}
+
+/// Time left until `moment`, or zero if it has already passed, and never more than
+/// [`WorkerConfig::LONGEST_ACCEPTED_POLL_INTERVAL`].
+///
+/// The cap holds the scheduler's arithmetic inside the range configured intervals are checked
+/// against: a moment set through [`JobHandle::set_next_start_at`] passes no such check, and adding a
+/// far enough one to an `Instant` panics. A job polled a year before it is due pays one pass, which
+/// schedules it again.
+fn calculate_duration_until(moment: DateTime<Utc>) -> Duration {
+    std::cmp::min(
+        (moment - Utc::now()).to_std().unwrap_or(Duration::ZERO),
+        WorkerConfig::LONGEST_ACCEPTED_POLL_INTERVAL,
+    )
 }
 
 struct JobMergeContext<'a> {
@@ -198,6 +252,8 @@ pub(crate) struct Worker {
     // TODO(med): combine metrics, iteration_notifier, finished_iterations so that the worker simply publishes the event, and subscribers process the event themselves.
 }
 
+// TODO(low): separate the job polling logic into a separate module
+
 impl Worker {
     pub fn new(
         job_registry: Arc<JobRegistry>,
@@ -226,10 +282,8 @@ impl Worker {
     pub async fn start(&self, cancel_token: CancellationToken) -> Result<(), InternalError> {
         info!("Starting worker {}", self.id);
 
-        let mut poll_interval = self.config.poll_interval();
-        let mut wait_duration = poll_interval;
-
         loop {
+            let wait_duration = self.calculate_wait_duration();
             tokio::select! {
                 () = cancel_token.cancelled() => {
                     info!("Stopping worker {}", self.id);
@@ -238,28 +292,19 @@ impl Worker {
                 () = sleep(wait_duration) => {}
             }
 
-            let work_done = self.process_jobs(&cancel_token).await;
-
-            poll_interval = Self::calculate_poll_interval(&self.config, poll_interval, work_done);
-            wait_duration = Self::calculate_wait_duration(&self.config, poll_interval);
+            self.process_jobs(&cancel_token).await;
         }
     }
 
-    /// Poll interval for the pass after one that ended with `work_done`: the configured base when
-    /// there was work, and twice `last_poll_interval` - capped at the configured maximum - when
-    /// there was none.
-    fn calculate_poll_interval(config: &WorkerConfig, last_poll_interval: Duration, work_done: bool) -> Duration {
-        if work_done {
-            config.poll_interval()
-        } else {
-            std::cmp::min(last_poll_interval * 2, config.max_poll_interval())
-        }
+    /// Interval for the pass after an idle one: twice the last, capped at the configured maximum.
+    fn calculate_backed_off_poll_interval(config: &WorkerConfig, last_poll_interval: Duration) -> Duration {
+        std::cmp::min(last_poll_interval * 2, config.max_poll_interval())
     }
 
-    /// How long a worker waits before its next pass: `poll_interval` plus a random share of the
-    /// configured jitter, which is what keeps workers from polling in lockstep. A zero jitter adds
-    /// nothing, so the wait is the poll interval itself.
-    fn calculate_wait_duration(config: &WorkerConfig, poll_interval: Duration) -> Duration {
+    /// Spreads `poll_interval` over a random share of the configured jitter, which is what keeps
+    /// workers from polling in lockstep. A zero jitter draws nothing, so the wait is the interval
+    /// itself.
+    fn calculate_jittered_wait(config: &WorkerConfig, poll_interval: Duration) -> Duration {
         let max_jitter_nanos = u64::try_from(config.poll_jitter().as_nanos()).unwrap_or(u64::MAX);
         let jitter = if max_jitter_nanos == 0 {
             Duration::ZERO
@@ -270,52 +315,96 @@ impl Worker {
         poll_interval + jitter
     }
 
-    async fn process_jobs(&self, cancel_token: &CancellationToken) -> bool {
-        let job_codes = self.job_registry.list_jobs();
-        let mut work_done = false;
-
-        for job_code in job_codes {
-            if self.process_job(&job_code, cancel_token).await {
-                work_done = true;
-                debug!("Job processed: {}", job_code);
-                continue;
+    /// How long to wait before the next pass: until the nearest job is due for a poll, plus jitter.
+    ///
+    /// A job this worker has not polled yet has no scheduled moment, so the base interval stands in
+    /// for it. A worker whose jobs have all spent their iteration budget polls nothing at all and
+    /// waits the ceiling rather than waking on the base interval to do nothing.
+    fn calculate_wait_duration(&self) -> Duration {
+        let job_count = self.job_registry.jobs_count();
+        let poll_interval = {
+            let cache = self.job_cache.read();
+            let now = std::time::Instant::now();
+            if cache.len() < job_count {
+                self.config.poll_interval()
+            } else {
+                cache
+                    .values()
+                    .filter(|entry| !entry.exhausted)
+                    .map(|entry| entry.next_poll.saturating_duration_since(now))
+                    .min()
+                    .unwrap_or_else(|| self.config.max_poll_interval())
             }
-            debug!("Job processing skipped: {}", job_code);
-        }
+        };
 
-        work_done
+        Self::calculate_jittered_wait(&self.config, poll_interval)
     }
 
-    async fn process_job(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> bool {
-        if !self.should_poll_job(job_code) {
-            return false;
+    async fn process_jobs(&self, cancel_token: &CancellationToken) {
+        for job_code in self.job_registry.list_jobs() {
+            if !self.should_poll_job(&job_code) {
+                continue;
+            }
+            let pass_outcome = self.process_job(&job_code, cancel_token).await;
+            debug!("Job processed: {} ({:?})", job_code, pass_outcome);
+            self.schedule_next_poll(&job_code, pass_outcome);
         }
+    }
 
+    /// Records when polling `job_code` can change anything again, given how its last pass ended.
+    fn schedule_next_poll(&self, job_code: &JobCode, pass_outcome: JobPassOutcome) {
+        let base_interval = self.config.poll_interval();
+        let now = std::time::Instant::now();
+        let mut cache = self.job_cache.write();
+        let entry = cache.entry(job_code.clone()).or_insert_with(|| JobCacheEntry {
+            next_poll: now,
+            poll_interval: base_interval,
+            exhausted: false,
+        });
+
+        match pass_outcome {
+            JobPassOutcome::IterationBudgetSpent => entry.exhausted = true,
+            JobPassOutcome::Processed => {
+                entry.poll_interval = base_interval;
+                entry.next_poll = now + base_interval;
+            }
+            JobPassOutcome::Stalled => {
+                entry.poll_interval = Self::calculate_backed_off_poll_interval(&self.config, entry.poll_interval);
+                entry.next_poll = now + entry.poll_interval;
+            }
+            JobPassOutcome::NextIterationDueAt(due) => {
+                entry.poll_interval = base_interval;
+                entry.next_poll = now + calculate_duration_until(due);
+            }
+        }
+        drop(cache);
+    }
+
+    /// One pass over `job_code`.
+    async fn process_job(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> JobPassOutcome {
         let job = match self.storage.get_job(job_code, cancel_token).await {
             Ok(job) => job,
             Err(StorageError::NotFound(_)) => match self.create_new_job(job_code, cancel_token).await {
                 Ok(job) => job,
                 Err(InternalError::Cancelled) => {
                     debug!("Job creation cancelled");
-                    return false;
+                    return JobPassOutcome::Stalled;
                 }
                 Err(e) => {
                     error!("Failed to create new job {}: {}", job_code, e);
-                    return false;
+                    return JobPassOutcome::Stalled;
                 }
             },
             // go to process job
             Err(StorageError::Cancelled) => {
                 debug!("Job processing cancelled");
-                return false;
+                return JobPassOutcome::Stalled;
             }
             Err(e) => {
                 error!("Failed to get job {} for processing: {}", job_code, e);
-                return false;
+                return JobPassOutcome::Stalled;
             }
         };
-
-        self.update_cache(job_code.clone(), false);
 
         self.try_process_job(job, cancel_token).await
     }
@@ -373,7 +462,7 @@ impl Worker {
             otel.name = %format!("try_process_job-{}", job.code())
         )
     )]
-    async fn try_process_job(&self, mut job: Job, cancel_token: &CancellationToken) -> bool {
+    async fn try_process_job(&self, mut job: Job, cancel_token: &CancellationToken) -> JobPassOutcome {
         // An iteration this worker did not finish itself - one from a previous run of the pool, or
         // one another worker completed - is only observable here, on the pickup. Reporting it
         // before the branches below, because starting the next iteration overwrites the number and
@@ -385,54 +474,56 @@ impl Worker {
         // The next-iteration gate anchors on the persisted started_at of the current
         // iteration, which survives process restarts. Log the inputs so a restart that
         // appears to "shift" the schedule can be traced back to the actual anchor.
-        let ready_for_next = job.is_ready_to_next_iteration();
+        let iteration_step = job.pick_iteration_step();
         debug!(
             status = %job.status(),
             started_at = %job.started_at(),
             completed_at = ?job.completed_at(),
             next_start_at = ?job.next_start_at(),
-            ready_for_next,
+            ?iteration_step,
             "Evaluating job scheduling on pickup"
         );
 
-        if ready_for_next {
-            job = match self.start_new_job_iteration(job, cancel_token).await {
-                Ok(job) => job,
-                Err(InternalError::Cancelled) => {
-                    debug!("Job iteration start cancelled");
-                    return false;
-                }
-                Err(e) => {
-                    error!("Failed to start job iteration: {}", e);
-                    return true;
-                }
-            };
-        } else if job.is_processed() && job.is_iteration_limit_reached() {
-            self.update_cache(job.code().clone(), true);
-            return false;
-        } else if job.is_processed() {
-            debug!(
-                started_at = %job.started_at(),
-                next_start_at = ?job.next_start_at(),
-                "Job completed; next iteration not yet due, waiting for schedule"
-            );
+        match iteration_step {
+            IterationStep::IterationInProgress => {}
+            IterationStep::NextIterationReady => {
+                job = match self.start_new_job_iteration(job, cancel_token).await {
+                    Ok(job) => job,
+                    Err(InternalError::Cancelled) => {
+                        debug!("Job iteration start cancelled");
+                        return JobPassOutcome::Stalled;
+                    }
+                    Err(e) => {
+                        error!("Failed to start job iteration: {}", e);
+                        return JobPassOutcome::Stalled;
+                    }
+                };
+            }
+            IterationStep::NextIterationDueAt(due) => return JobPassOutcome::NextIterationDueAt(due),
+            IterationStep::IterationBudgetSpent => return JobPassOutcome::IterationBudgetSpent,
+            // Nothing to wait for and nothing terminal about the state, so the job falls back to
+            // the ordinary backoff rather than to a moment nobody can compute.
+            IterationStep::NextIterationUnscheduled => return JobPassOutcome::Stalled,
         }
 
-        if job.is_ready_for_processing() {
-            debug!(
-                started_at = %job.started_at(),
-                "Job ready for processing"
-            );
-            self.pick_and_execute_task(job, cancel_token).await.unwrap_or_else(|e| {
-                if matches!(e, InternalError::Cancelled) {
-                    debug!("Job processing cancelled");
-                    return false;
-                }
+        // The start above can come back with the state another worker saved, which may already be
+        // an iteration this worker has nothing left to do in.
+        if !job.is_ready_for_processing() {
+            return JobPassOutcome::Stalled;
+        }
+
+        debug!(started_at = %job.started_at(), "Job ready for processing");
+        match self.pick_and_execute_task(job, cancel_token).await {
+            Ok(true) => JobPassOutcome::Processed,
+            Ok(false) => JobPassOutcome::Stalled,
+            Err(InternalError::Cancelled) => {
+                debug!("Job processing cancelled");
+                JobPassOutcome::Stalled
+            }
+            Err(e) => {
                 error!("Failed to execute task: {}", e);
-                true
-            })
-        } else {
-            false
+                JobPassOutcome::Stalled
+            }
         }
     }
 
@@ -916,17 +1007,6 @@ impl Worker {
         self.metrics.record_job_iteration_complete(job.code(), status, duration);
     }
 
-    fn update_cache(&self, job_code: JobCode, exhausted: bool) {
-        let mut cache = self.job_cache.write();
-        cache.insert(
-            job_code,
-            JobCacheEntry {
-                next_poll: std::time::Instant::now() + self.config.poll_interval(),
-                exhausted,
-            },
-        );
-    }
-
     /// Runs `execution` to completion, cancelling `deadline_cancel_token` once `deadline_at` has
     /// passed - or right away if it already has.
     ///
@@ -974,6 +1054,7 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::common::storage_wrapper::SaveRefusingStorage;
     use crate::{
         InMemoryStorage, JobDefinition, JobDefinitionId, NoopMetrics, TaskDefinition, TaskExecutor, TaskLimits, task_fn,
     };
@@ -1000,7 +1081,7 @@ mod tests {
         let config = config_with_jitter(Duration::ZERO);
 
         assert_eq!(
-            Worker::calculate_wait_duration(&config, Duration::from_millis(100)),
+            Worker::calculate_jittered_wait(&config, Duration::from_millis(100)),
             Duration::from_millis(100)
         );
     }
@@ -1029,7 +1110,7 @@ mod tests {
         let config = config_with_jitter(bound);
 
         let waits: Vec<Duration> = (0..JITTER_DRAWS)
-            .map(|_| Worker::calculate_wait_duration(&config, poll_interval))
+            .map(|_| Worker::calculate_jittered_wait(&config, poll_interval))
             .collect();
 
         for wait in &waits {
@@ -1046,21 +1127,11 @@ mod tests {
     }
 
     #[test]
-    fn a_pass_that_found_work_polls_again_at_the_configured_interval() {
-        let config = config_with_jitter(Duration::ZERO);
-
-        assert_eq!(
-            Worker::calculate_poll_interval(&config, Duration::from_millis(800), true),
-            config.poll_interval()
-        );
-    }
-
-    #[test]
     fn a_pass_without_work_doubles_the_poll_interval() {
         let config = config_with_jitter(Duration::ZERO);
 
         assert_eq!(
-            Worker::calculate_poll_interval(&config, Duration::from_millis(100), false),
+            Worker::calculate_backed_off_poll_interval(&config, Duration::from_millis(100)),
             Duration::from_millis(200)
         );
     }
@@ -1074,7 +1145,7 @@ mod tests {
             .expect("a ceiling above the base interval is accepted");
 
         assert_eq!(
-            Worker::calculate_poll_interval(&config, Duration::from_millis(200), false),
+            Worker::calculate_backed_off_poll_interval(&config, Duration::from_millis(200)),
             Duration::from_millis(300)
         );
     }
@@ -1138,23 +1209,74 @@ mod tests {
         assert_eq!(config.max_poll_interval(), Duration::from_secs(10));
     }
 
-    /// The default ceiling is two seconds, so a pool polled less often than that would otherwise be
-    /// held to a setting its caller never named - and its backoff would shorten the wait instead of
-    /// lengthening it.
+    /// An unnamed ceiling is the poll interval multiplied, so a rarely polled pool still has room
+    /// to back off; a fixed ceiling would sit at or below such an interval and cancel the backoff.
     #[test]
-    fn an_unnamed_maximum_poll_interval_follows_a_poll_interval_above_the_default() {
-        let config = config_polled_every(Duration::from_secs(10));
+    fn an_unnamed_maximum_poll_interval_scales_with_a_long_poll_interval() {
+        let config = config_polled_every(Duration::from_secs(5));
 
-        assert_eq!(config.max_poll_interval(), Duration::from_secs(10));
+        assert_eq!(config.max_poll_interval(), Duration::from_secs(50));
     }
 
-    /// Below the default the ceiling stays where it is: the backoff is what lets a worker polled
-    /// often fall back to a rare poll while there is no work.
+    /// The same rule at the other end of the range: a frequently polled pool gets a ceiling as
+    /// close as its interval is, rather than one named for a pool polled at another rate.
     #[test]
-    fn an_unnamed_maximum_poll_interval_keeps_the_default_above_the_poll_interval() {
+    fn an_unnamed_maximum_poll_interval_scales_with_a_short_poll_interval() {
         let config = config_polled_every(Duration::from_millis(10));
 
-        assert_eq!(config.max_poll_interval(), WorkerConfig::new().max_poll_interval());
+        assert_eq!(config.max_poll_interval(), Duration::from_millis(100));
+    }
+
+    /// The scheduler multiplies, doubles and adds intervals to an `Instant`, and every one of those
+    /// panics on overflow - so an interval it cannot compute with is refused at the boundary rather
+    /// than taken down the pass that crashes the worker.
+    #[test]
+    fn a_poll_interval_above_the_longest_accepted_one_is_rejected() {
+        let Err(error) = WorkerConfig::new().with_poll_interval(Duration::MAX) else {
+            panic!("a poll interval past the accepted range must be rejected")
+        };
+
+        assert!(
+            error.to_string().contains("poll interval must not exceed"),
+            "got: {error}"
+        );
+    }
+
+    /// The ceiling is an interval the scheduler computes with just as the base one is, so it is
+    /// held to the same range - naming it is not a way around the bound.
+    #[test]
+    fn a_maximum_poll_interval_above_the_longest_accepted_one_is_rejected() {
+        let Err(error) = WorkerConfig::new().with_max_poll_interval(Duration::MAX) else {
+            panic!("a ceiling past the accepted range must be rejected")
+        };
+
+        assert!(
+            error.to_string().contains("max poll interval must not exceed"),
+            "got: {error}"
+        );
+    }
+
+    /// The accepted range and the default factor are two halves of one rule: the ceiling derived
+    /// from the longest accepted interval is doubled again by the backoff, and neither step may
+    /// leave `Duration` behind. Raising either constant without the other panics here.
+    #[test]
+    fn the_longest_accepted_poll_interval_survives_the_backoff_arithmetic() {
+        let config = config_polled_every(WorkerConfig::LONGEST_ACCEPTED_POLL_INTERVAL);
+        let ceiling = config.max_poll_interval();
+
+        assert_eq!(Worker::calculate_backed_off_poll_interval(&config, ceiling), ceiling);
+    }
+
+    /// Regression: with a fixed default ceiling, a pool polled less often than that ceiling had
+    /// `min(interval * 2, ceiling)` collapse to the interval itself - the backoff never grew at all.
+    #[test]
+    fn a_backoff_grows_at_a_poll_interval_above_the_old_default() {
+        let config = config_polled_every(Duration::from_secs(5));
+
+        assert_eq!(
+            Worker::calculate_backed_off_poll_interval(&config, Duration::from_secs(5)),
+            Duration::from_secs(10)
+        );
     }
 
     /// Deadline of the task the pass below runs, and so how long its executor waits for the token.
@@ -1211,16 +1333,17 @@ mod tests {
         let worker =
             worker_running(job_def, Arc::new(InMemoryStorage::new())).expect("the test worker must be constructible");
 
-        let work_done = tokio::time::timeout(
+        let outcome = tokio::time::timeout(
             PROGRESS_TIMEOUT,
             worker.process_job(&job_code, &CancellationToken::new()),
         )
         .await
         .expect("the deadline must release the executor and let the pass finish");
 
-        assert!(
-            work_done,
-            "a pass released by the task's own deadline must not be counted as an idle one"
+        assert_eq!(
+            outcome,
+            JobPassOutcome::Processed,
+            "a pass released by the task's own deadline must count as progress, not as a stall"
         );
     }
 
@@ -1252,6 +1375,497 @@ mod tests {
         assert_task_failed_by("self_cancelled_job", executor).await;
     }
 
+    /// Stores `job_def`'s first iteration already finished, which is the state a pass reads as
+    /// "start the next one": built through the production API, so no state a legal run cannot
+    /// reach is persisted.
+    async fn store_with_a_finished_iteration(
+        job_def: &JobDefinition,
+        worker_id: Uuid,
+    ) -> Result<Arc<InMemoryStorage>, Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemoryStorage::new());
+        let cancel_token = CancellationToken::new();
+        let mut job = Job::new(job_def, HashMap::new(), worker_id)?;
+        job.work(&worker_id)?;
+        let TaskPickup::Ready(task_id) = job.pick_task_to_execute(&worker_id)? else {
+            return Err("the fixture must leave a task to finish".into());
+        };
+        job.start_task(&task_id, worker_id)?;
+        job.complete_task(&task_id, Vec::new())?;
+        job.try_to_complete(&worker_id)?;
+        storage.save_job(&mut job, &cancel_token).await?;
+
+        Ok(storage)
+    }
+
+    /// A pass whose write of the new iteration was refused moved nothing, so it has to back off
+    /// like any other empty pass. Counted as work done - which is what it used to be - the worker
+    /// would keep the base interval and repeat the same refused write at full rate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pass_that_cannot_save_the_iteration_it_started_counts_as_stalled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let job_def = job_running(
+            "unsavable_iteration_job",
+            UNCANCELLED_TASK_TIMEOUT,
+            task_fn(|_ctx| async { Ok(TaskOutcome::empty()) }),
+        );
+        let job_code = job_def.code().clone();
+        let worker_id = Uuid::from_u128(1);
+        let storage = store_with_a_finished_iteration(&job_def, worker_id).await?;
+        let refusing_storage = Arc::new(SaveRefusingStorage::new(Arc::clone(&storage) as Arc<dyn Storage>));
+        let worker = worker_running(job_def, Arc::clone(&refusing_storage) as Arc<dyn Storage>)?;
+        let cancel_token = CancellationToken::new();
+
+        let outcome = tokio::time::timeout(PROGRESS_TIMEOUT, worker.process_job(&job_code, &cancel_token))
+            .await
+            .map_err(|_| "a refused save must fail the pass rather than be retried forever")?;
+
+        assert_eq!(
+            refusing_storage.refused_saves(),
+            1,
+            "the pass must have reached the write of the new iteration, and reached it once"
+        );
+        assert_eq!(
+            outcome,
+            JobPassOutcome::Stalled,
+            "a pass that wrote nothing is not a pass that moved the job"
+        );
+        let stored = storage.get_job(&job_code, &cancel_token).await?;
+        assert_eq!(stored.iter_num(), 1, "the refused iteration must not be stored");
+        assert_eq!(*stored.status(), JobStatus::Completed, "got: {}", stored.status());
+        Ok(())
+    }
+
+    /// Base interval every scheduling test below measures against.
+    const BASE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+    /// Slack allowed when comparing a scheduled moment: the moment is taken before the assertion,
+    /// so the delay measured is always a little shorter than the interval it was set from.
+    const SCHEDULING_SLACK: Duration = Duration::from_millis(50);
+
+    /// A legal one-task description whose code is all the scheduling tests below need: they call
+    /// the scheduler directly and never let a worker reach storage.
+    fn idle_job(job_code: &str) -> JobDefinition {
+        job_running(
+            job_code,
+            UNCANCELLED_TASK_TIMEOUT,
+            task_fn(|_ctx| async { Ok(TaskOutcome::empty()) }),
+        )
+    }
+
+    /// Jitter is off here: it has tests of its own, and a random addend would make every scheduled
+    /// moment below a range rather than a value.
+    fn worker_over_jobs(job_defs: Vec<JobDefinition>, storage: Arc<dyn Storage>) -> Worker {
+        worker_over_jobs_with_config(
+            job_defs,
+            storage,
+            config_polled_every(BASE_POLL_INTERVAL).with_poll_jitter(Duration::ZERO),
+        )
+    }
+
+    /// The same worker built with settings the test names itself, for the two rules whose oracle is
+    /// a setting: a ceiling or a jitter read back out of the config is the value the scheduler takes
+    /// it from, so the comparison would hold whatever that value became.
+    fn worker_over_jobs_with_config(
+        job_defs: Vec<JobDefinition>,
+        storage: Arc<dyn Storage>,
+        config: WorkerConfig,
+    ) -> Worker {
+        Worker::new(
+            Arc::new(JobRegistry::new(job_defs).expect("the test registry must build")),
+            storage,
+            config,
+            Arc::new(NoopMetrics),
+            None,
+            Arc::new(IgnoredIterations),
+        )
+    }
+
+    /// How long from now the worker will wait before polling `job_code` again.
+    fn scheduled_delay(worker: &Worker, job_code: &JobCode) -> Duration {
+        worker
+            .job_cache
+            .read()
+            .get(job_code)
+            .expect("the job must have been scheduled")
+            .next_poll
+            .saturating_duration_since(std::time::Instant::now())
+    }
+
+    fn assert_delay_near(actual: Duration, expected: Duration, what: &str) {
+        assert!(
+            actual <= expected && actual + SCHEDULING_SLACK >= expected,
+            "{what}: got {actual:?}, expected about {expected:?}"
+        );
+    }
+
+    #[test]
+    fn a_pass_with_work_schedules_the_next_poll_at_the_base_interval() {
+        let job_def = idle_job("worked_job");
+        let job_code = job_def.code().clone();
+        let worker = worker_over_jobs(vec![job_def], Arc::new(InMemoryStorage::new()));
+
+        worker.schedule_next_poll(&job_code, JobPassOutcome::Stalled);
+        worker.schedule_next_poll(&job_code, JobPassOutcome::Processed);
+
+        assert_delay_near(
+            scheduled_delay(&worker, &job_code),
+            BASE_POLL_INTERVAL,
+            "a pass that moved the job must schedule the next poll at the base interval",
+        );
+    }
+
+    /// The backoff step a job carries is dropped back to the base interval by a pass that moved it,
+    /// and only the next stalled pass reads that step: without the reset, a job that was idle for a
+    /// while would go on backing off from where it left off, however much work it has since done.
+    #[test]
+    fn a_pass_with_work_resets_the_backoff_step_of_its_job() {
+        let job_def = idle_job("resumed_job");
+        let job_code = job_def.code().clone();
+        let worker = worker_over_jobs(vec![job_def], Arc::new(InMemoryStorage::new()));
+
+        worker.schedule_next_poll(&job_code, JobPassOutcome::Stalled);
+        worker.schedule_next_poll(&job_code, JobPassOutcome::Stalled);
+        worker.schedule_next_poll(&job_code, JobPassOutcome::Processed);
+        worker.schedule_next_poll(&job_code, JobPassOutcome::Stalled);
+
+        assert_delay_near(
+            scheduled_delay(&worker, &job_code),
+            BASE_POLL_INTERVAL * 2,
+            "the stalled pass must back off from the base interval the pass with work restored",
+        );
+    }
+
+    #[test]
+    fn a_stalled_pass_doubles_the_interval_of_that_job() {
+        let job_def = idle_job("idle_job");
+        let job_code = job_def.code().clone();
+        let worker = worker_over_jobs(vec![job_def], Arc::new(InMemoryStorage::new()));
+
+        worker.schedule_next_poll(&job_code, JobPassOutcome::Stalled);
+
+        assert_delay_near(
+            scheduled_delay(&worker, &job_code),
+            BASE_POLL_INTERVAL * 2,
+            "a stalled pass must back the job's own interval off",
+        );
+    }
+
+    /// Ceiling the two tests below name for themselves, so what they compare against is a value of
+    /// the test rather than one the scheduler derives from the same config it reads. Three times
+    /// [`BASE_POLL_INTERVAL`], so the second stalled pass is already held down to it.
+    const NAMED_CEILING: Duration = Duration::from_millis(300);
+
+    /// Settings whose backoff stops at [`NAMED_CEILING`].
+    fn config_capped_at_the_named_ceiling() -> WorkerConfig {
+        config_polled_every(BASE_POLL_INTERVAL)
+            .with_max_poll_interval(NAMED_CEILING)
+            .expect("a ceiling above the base interval is accepted")
+            .with_poll_jitter(Duration::ZERO)
+    }
+
+    /// The ceiling bounds the job's own step, not just the formula: a scheduler that doubled the
+    /// step itself would push a quiet job past the rate its pool was configured to poll at.
+    #[test]
+    fn the_backoff_step_stops_at_the_ceiling_the_config_names() {
+        let job_def = idle_job("capped_job");
+        let job_code = job_def.code().clone();
+        let worker = worker_over_jobs_with_config(
+            vec![job_def],
+            Arc::new(InMemoryStorage::new()),
+            config_capped_at_the_named_ceiling(),
+        );
+
+        // Four passes: the step reaches the ceiling on the second and has to stay there for the
+        // two after it.
+        for _ in 0..4 {
+            worker.schedule_next_poll(&job_code, JobPassOutcome::Stalled);
+        }
+
+        assert_delay_near(
+            scheduled_delay(&worker, &job_code),
+            NAMED_CEILING,
+            "the backoff must stop at the ceiling the config was given",
+        );
+    }
+
+    /// The backoff of one job must not reach another: a pool running a busy job beside an idle one
+    /// used to hold both at the base interval, and holding both at the ceiling would be the same
+    /// mistake mirrored.
+    #[test]
+    fn the_backoff_of_an_idle_job_does_not_reach_a_busy_one() {
+        let idle = idle_job("idle_neighbour");
+        let busy = idle_job("busy_neighbour");
+        let idle_code = idle.code().clone();
+        let busy_code = busy.code().clone();
+        let worker = worker_over_jobs(vec![idle, busy], Arc::new(InMemoryStorage::new()));
+
+        worker.schedule_next_poll(&idle_code, JobPassOutcome::Stalled);
+        worker.schedule_next_poll(&idle_code, JobPassOutcome::Stalled);
+        worker.schedule_next_poll(&busy_code, JobPassOutcome::Processed);
+
+        assert_delay_near(
+            scheduled_delay(&worker, &busy_code),
+            BASE_POLL_INTERVAL,
+            "the busy job keeps the base interval",
+        );
+        assert!(
+            scheduled_delay(&worker, &idle_code) > BASE_POLL_INTERVAL,
+            "the idle job must have backed off independently"
+        );
+    }
+
+    /// The whole point of the change: a completed job costs nothing until its next iteration is
+    /// allowed to begin.
+    #[test]
+    fn a_completed_job_is_polled_when_its_next_iteration_is_due() {
+        let job_def = idle_job("scheduled_job");
+        let job_code = job_def.code().clone();
+        let worker = worker_over_jobs(vec![job_def], Arc::new(InMemoryStorage::new()));
+
+        worker.schedule_next_poll(
+            &job_code,
+            JobPassOutcome::NextIterationDueAt(Utc::now() + chrono::Duration::seconds(30)),
+        );
+
+        assert_delay_near(
+            scheduled_delay(&worker, &job_code),
+            Duration::from_secs(30),
+            "a job due in thirty seconds must not be polled before then",
+        );
+    }
+
+    /// A moment already past is polled at once: the job is due, and the pass that starts its
+    /// iteration is the one thing that can move it.
+    #[test]
+    fn a_due_moment_in_the_past_schedules_an_immediate_poll() {
+        let job_def = idle_job("overdue_job");
+        let job_code = job_def.code().clone();
+        let worker = worker_over_jobs(vec![job_def], Arc::new(InMemoryStorage::new()));
+
+        worker.schedule_next_poll(
+            &job_code,
+            JobPassOutcome::NextIterationDueAt(Utc::now() - chrono::Duration::seconds(30)),
+        );
+
+        assert_eq!(
+            scheduled_delay(&worker, &job_code),
+            Duration::ZERO,
+            "an overdue job must not be made to wait"
+        );
+    }
+
+    /// Moment the job below is due at: inside the base interval, which is what the regression was
+    /// about, and far enough from it that the slack of the comparison cannot bridge the two.
+    const DUE_SOONER_THAN_BASE: Duration = Duration::from_millis(10);
+
+    /// Regression: the delay used to be raised to the base interval, so a job whose iterations come
+    /// round faster than the pool polls started every one of them late, by the difference.
+    #[test]
+    fn a_moment_due_sooner_than_the_base_interval_is_not_delayed_to_it() {
+        let job_def = idle_job("soon_due_job");
+        let job_code = job_def.code().clone();
+        let worker = worker_over_jobs(vec![job_def], Arc::new(InMemoryStorage::new()));
+
+        worker.schedule_next_poll(
+            &job_code,
+            JobPassOutcome::NextIterationDueAt(
+                Utc::now() + chrono::Duration::from_std(DUE_SOONER_THAN_BASE).expect("the test delay must convert"),
+            ),
+        );
+
+        assert_delay_near(
+            scheduled_delay(&worker, &job_code),
+            DUE_SOONER_THAN_BASE,
+            "a job due before the next base interval must be polled when it is due",
+        );
+    }
+
+    /// A moment an executor sets through `JobHandle::set_next_start_at` passes no boundary check,
+    /// unlike a configured interval, and the scheduler adds it to an `Instant`, which panics on
+    /// overflow. The furthest moment a `DateTime` can hold is therefore scheduled as the longest
+    /// interval a worker accepts.
+    #[test]
+    fn a_moment_beyond_the_longest_accepted_interval_is_scheduled_at_it() {
+        let job_def = idle_job("far_future_job");
+        let job_code = job_def.code().clone();
+        let worker = worker_over_jobs(vec![job_def], Arc::new(InMemoryStorage::new()));
+
+        worker.schedule_next_poll(&job_code, JobPassOutcome::NextIterationDueAt(DateTime::<Utc>::MAX_UTC));
+
+        assert_delay_near(
+            scheduled_delay(&worker, &job_code),
+            WorkerConfig::LONGEST_ACCEPTED_POLL_INTERVAL,
+            "a moment past the accepted range must be capped at it",
+        );
+    }
+
+    /// The counterpart of the reset a pass with work makes: a pass that found the next iteration
+    /// scheduled moved nothing either, but it learned exactly when the job is worth polling again,
+    /// so the step it carried into that pass has answered for nothing and must not survive it.
+    #[test]
+    fn a_pass_that_found_the_next_iteration_scheduled_resets_the_backoff_step() {
+        let job_def = idle_job("rescheduled_job");
+        let job_code = job_def.code().clone();
+        let worker = worker_over_jobs(vec![job_def], Arc::new(InMemoryStorage::new()));
+
+        worker.schedule_next_poll(&job_code, JobPassOutcome::Stalled);
+        worker.schedule_next_poll(&job_code, JobPassOutcome::Stalled);
+        worker.schedule_next_poll(
+            &job_code,
+            JobPassOutcome::NextIterationDueAt(Utc::now() + chrono::Duration::seconds(30)),
+        );
+        worker.schedule_next_poll(&job_code, JobPassOutcome::Stalled);
+
+        assert_delay_near(
+            scheduled_delay(&worker, &job_code),
+            BASE_POLL_INTERVAL * 2,
+            "the stalled pass must back off from the base interval the scheduled pass restored",
+        );
+    }
+
+    #[test]
+    fn an_exhausted_job_is_not_polled_again() {
+        let job_def = idle_job("exhausted_job");
+        let job_code = job_def.code().clone();
+        let worker = worker_over_jobs(vec![job_def], Arc::new(InMemoryStorage::new()));
+
+        worker.schedule_next_poll(&job_code, JobPassOutcome::IterationBudgetSpent);
+
+        assert!(
+            !worker.should_poll_job(&job_code),
+            "an exhausted job must not be polled"
+        );
+    }
+
+    /// The gate is what turns a scheduled moment into a pass that never reaches storage, so both
+    /// sides of the moment are asserted: a job scheduled ahead is skipped, one whose moment has
+    /// passed is polled.
+    #[test]
+    fn a_job_is_polled_only_once_its_scheduled_moment_has_passed() {
+        let job_def = idle_job("gated_job");
+        let job_code = job_def.code().clone();
+        let worker = worker_over_jobs(vec![job_def], Arc::new(InMemoryStorage::new()));
+
+        worker.schedule_next_poll(
+            &job_code,
+            JobPassOutcome::NextIterationDueAt(Utc::now() + chrono::Duration::seconds(30)),
+        );
+        assert!(
+            !worker.should_poll_job(&job_code),
+            "a job due in thirty seconds must not be polled yet"
+        );
+
+        worker.schedule_next_poll(
+            &job_code,
+            JobPassOutcome::NextIterationDueAt(Utc::now() - chrono::Duration::seconds(1)),
+        );
+        assert!(
+            worker.should_poll_job(&job_code),
+            "a job whose moment has passed must be polled"
+        );
+    }
+
+    /// The wait is what turns per-job scheduling into saved requests: a worker that kept waking on
+    /// a fixed interval would poll nothing and still burn a pass.
+    #[test]
+    fn the_wait_lasts_until_the_nearest_scheduled_poll() {
+        let near = idle_job("near_job");
+        let far = idle_job("far_job");
+        let near_code = near.code().clone();
+        let far_code = far.code().clone();
+        let worker = worker_over_jobs(vec![near, far], Arc::new(InMemoryStorage::new()));
+
+        worker.schedule_next_poll(
+            &far_code,
+            JobPassOutcome::NextIterationDueAt(Utc::now() + chrono::Duration::seconds(30)),
+        );
+        worker.schedule_next_poll(&near_code, JobPassOutcome::Processed);
+
+        assert_delay_near(
+            worker.calculate_wait_duration(),
+            BASE_POLL_INTERVAL,
+            "the wait must end when the nearest job is due",
+        );
+    }
+
+    /// A job the worker has not polled yet has no scheduled moment, so it must not be waited past.
+    #[test]
+    fn an_unpolled_job_keeps_the_base_wait() {
+        let scheduled = idle_job("scheduled_neighbour");
+        let unpolled = idle_job("unpolled_neighbour");
+        let scheduled_code = scheduled.code().clone();
+        let worker = worker_over_jobs(vec![scheduled, unpolled], Arc::new(InMemoryStorage::new()));
+
+        worker.schedule_next_poll(
+            &scheduled_code,
+            JobPassOutcome::NextIterationDueAt(Utc::now() + chrono::Duration::seconds(30)),
+        );
+
+        assert_delay_near(
+            worker.calculate_wait_duration(),
+            BASE_POLL_INTERVAL,
+            "a job that was never polled must be polled on the next step",
+        );
+    }
+
+    /// Jitter of the wait below: half the base interval, which is orders of magnitude above the
+    /// time the draws themselves take, so a wait that was not spread cannot pass for a spread one.
+    const WAIT_JITTER: Duration = Duration::from_millis(50);
+
+    /// The jitter is not cosmetic: it is the only thing that spreads the moment every worker of
+    /// every pool wakes to one scheduled job, and all but one of them pay a rejected write for
+    /// waking together (see [`WorkerConfig::poll_jitter`]).
+    ///
+    /// One job is left unpolled, which is what makes the wait the configured interval itself rather
+    /// than the remainder until a scheduled moment: the remainder is measured against the clock on
+    /// every call, so the draws would differ with no jitter at all.
+    #[test]
+    fn the_wait_between_passes_is_spread_by_the_jitter() {
+        let scheduled = idle_job("jittered_neighbour");
+        let unpolled = idle_job("unpolled_jittered_neighbour");
+        let scheduled_code = scheduled.code().clone();
+        let worker = worker_over_jobs_with_config(
+            vec![scheduled, unpolled],
+            Arc::new(InMemoryStorage::new()),
+            config_polled_every(BASE_POLL_INTERVAL).with_poll_jitter(WAIT_JITTER),
+        );
+        worker.schedule_next_poll(&scheduled_code, JobPassOutcome::Processed);
+
+        let waits: Vec<Duration> = (0..JITTER_DRAWS).map(|_| worker.calculate_wait_duration()).collect();
+
+        for wait in &waits {
+            assert!(
+                (BASE_POLL_INTERVAL..BASE_POLL_INTERVAL + WAIT_JITTER).contains(wait),
+                "a wait of {wait:?} is outside the jitter of {WAIT_JITTER:?} on top of \
+                 {BASE_POLL_INTERVAL:?}"
+            );
+        }
+        assert!(
+            waits.iter().any(|wait| *wait != waits[0]),
+            "every wait was {:?}, so the workers were not spread at all",
+            waits[0]
+        );
+    }
+
+    #[test]
+    fn a_worker_whose_jobs_are_all_exhausted_waits_the_ceiling() {
+        let job_def = idle_job("spent_job");
+        let job_code = job_def.code().clone();
+        let worker = worker_over_jobs_with_config(
+            vec![job_def],
+            Arc::new(InMemoryStorage::new()),
+            config_capped_at_the_named_ceiling(),
+        );
+
+        worker.schedule_next_poll(&job_code, JobPassOutcome::IterationBudgetSpent);
+
+        assert_delay_near(
+            worker.calculate_wait_duration(),
+            NAMED_CEILING,
+            "a worker with nothing to poll must wait the ceiling it was given",
+        );
+    }
+
     /// Runs one pass of a worker over a job whose only task `executor` refuses, and asserts the
     /// refusal was recorded as a failure rather than honoured as a cancellation.
     async fn assert_task_failed_by(job_code: &str, executor: Arc<dyn TaskExecutor>) {
@@ -1262,11 +1876,15 @@ mod tests {
             .expect("the test worker must be constructible");
         let cancel_token = CancellationToken::new();
 
-        let work_done = tokio::time::timeout(PROGRESS_TIMEOUT, worker.process_job(&job_code, &cancel_token))
+        let outcome = tokio::time::timeout(PROGRESS_TIMEOUT, worker.process_job(&job_code, &cancel_token))
             .await
             .expect("the pass must finish without waiting for the deadline");
 
-        assert!(work_done, "a pass that failed a task is not an idle one");
+        assert_eq!(
+            outcome,
+            JobPassOutcome::Processed,
+            "a pass that failed a task is not an idle one"
+        );
         let job = storage
             .get_job(&job_code, &cancel_token)
             .await

@@ -82,9 +82,9 @@ pub(crate) struct JobMeta {
 ///
 /// What a save keeps and how a load rebuilds it belongs to [`state`] and is the same for every
 /// implementation; a backend owns its codec and its object keys, not the set of persisted fields.
+// TODO(low): opening this trait to consumers means opening `Job` with it - think about how.
 #[async_trait]
-#[allow(private_interfaces)] // TODO(low): think about how to open Job to public
-pub trait Storage: Send + Sync {
+pub(crate) trait Storage: Send + Sync {
     /// Get latest job by code
     async fn get_job(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<Job>;
 
@@ -93,6 +93,26 @@ pub trait Storage: Send + Sync {
 
     /// Find job metadata without loading full job
     async fn find_job_meta(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<JobMeta>;
+
+    /// Reads the iteration `job_meta` names, but only if it moved past the version `job_meta`
+    /// carries. `None` means the stored object still carries that version.
+    ///
+    /// Answers about that one iteration and no other: a backend never returns a later iteration
+    /// here, because the caller uses this to check a state it already holds, not to discover a new
+    /// one - that is [`Storage::find_job_meta`]'s job.
+    ///
+    /// Does **not** retry internally, like the two reads it stands between: the caller owns the
+    /// retry policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::NotFound`] if the named iteration is not stored - it was never
+    /// written, or cleanup has since deleted it. A backend keeping only a job's current iteration
+    /// answers so for every earlier one as well, so the caller must not read `NotFound` as "the job
+    /// has moved to a later iteration": a backend keeping its history answers about the named
+    /// iteration itself, whatever the job has moved on to.
+    async fn get_changed_job(&self, job_meta: &JobMeta, cancel_token: &CancellationToken)
+    -> StorageResult<Option<Job>>;
 
     /// Save job with optimistic locking. Updates job.version on success. Returns `ConcurrentModification` if version mismatch.
     async fn save_job(&self, job: &mut Job, cancel_token: &CancellationToken) -> StorageResult<()>;

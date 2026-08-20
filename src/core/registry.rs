@@ -77,6 +77,12 @@ impl JobRegistry {
         self.jobs_by_code.keys().cloned().collect()
     }
 
+    /// How many jobs are registered, for a caller that needs the count rather than the codes -
+    /// [`Self::list_jobs`] clones every code to answer that.
+    pub(crate) fn jobs_count(&self) -> usize {
+        self.jobs_by_code.len()
+    }
+
     fn task_executor_key(job_code: &JobCode, task_code: &TaskCode) -> String {
         format!("{job_code}:{task_code}")
     }

@@ -14,8 +14,9 @@ production function.
   visibility; the visibility boundary is the contract and the test location follows from it.
 - The harness already exists — use it rather than rolling your own: `S3TestContainer` (starts and
   tears down the store), `ManagerEnv` (manager lifecycle, bounded wait, aborts workers on drop),
-  `CountingStorage` (counts backend calls), `InMemoryStorage` (current iteration of every job,
-  conditional writes, no persistence),
+  `CountingStorage` (counts backend calls), `CountingMetrics` (counts the requests a backend was
+  billed for, by operation and status), `InMemoryStorage` (current iteration of every job,
+  conditional writes, no persistence), `waiting` (bounded waits and `measure_settled_requests`),
   `init_tracing`.
 
 ## Choosing the boundary
@@ -79,9 +80,8 @@ The areas listed below represent a minimum set, not an exhaustive list.
 - Expected values come from the documented contract or are stated literally — never computed by the
   code under test or by its helpers. Do not derive an expected object key from the key builder.
 - Arrange code may use production builders; assertions about the result stay independent of them.
-- The number of requests sent to Object Storage is **critical**. Many providers charge for each
-  request. Therefore, for each method, the storage component **must** track how many requests are sent to S3. A request
-  quota must be specified for each method (based on the task requirements). Any increase in the quota must be approved.
+- The number of requests sent to Object Storage is **critical** — see
+  [Request quotas](#request-quotas) below.
 - Prove the fixture reaches the condition under test when that is not obvious: that a deadline really
   expired, that a budget is really spent, that two workers really contended.
 - Assert counts or non-emptiness before inspecting results — never guard an assertion behind
@@ -89,12 +89,65 @@ The areas listed below represent a minimum set, not an exhaustive list.
 - Task iteration order is `HashMap` order and is **not** a contract. Canonicalize before comparing.
 - For errors assert the variant and its retryability, not the message text.
 
+## Request quotas
+
+Providers bill per request, and a pass that grew by one is paid on every poll of every worker, for
+as long as the job exists. Every scenario the pool repeats therefore has a **quota**: a number of
+requests fixed by a test and asserted against a real store. The quotas live together in
+[`request_quota_test.rs`](../src/tests/request_quota_test.rs), which is what gives them one address
+to review and one command to run — `make quota`. That command prints test names and nothing else,
+so the names are what carry the numbers, and no test outside the file is named after what it costs.
+Raising a number is agreed before it lands; see the invariant in [AGENTS.md](../AGENTS.md).
+
+A count of `Storage` calls is **not** a quota. It measures whether the cache reached the backend,
+which is behavior; it belongs beside the behavior it protects and is named after that behavior —
+one call turns into as many requests as its retries and the SDK's make of it.
+
+### Two shapes
+
+- A **run quota** bounds a scenario that ends, and states a total: the whole of what the store was
+  asked for, the requests the fixture itself owed included.
+- A **steady-state quota** bounds a scenario that does not end — a pool polling a job it must not
+  reach the store for. It states what an observation window may add to the class of requests it
+  names, which is zero, and is measured as a delta across that window rather than as a total. The
+  window is the one place where a real sleep is load-bearing, because the window is what the number
+  means; its baseline still comes from waiting for a counter to settle, never from a sleep chosen
+  to be long enough.
+
+### Every quota test
+
+A quota is worth its number only if the test cannot be green while the scenario did not happen.
+Every quota test therefore:
+
+- **names its number in the test name**, so a number cannot move without the name moving with it,
+  and so what `make quota` prints is the register of what the system costs;
+- **counts on the storage metric**, under the operation and status pair the request was answered
+  with, never on `Storage` calls;
+- **asserts the whole of what it counts, not only the pairs it names**, so a status nobody thought
+  to name — a `429`, a `500` — cannot disappear from the oracle: a run quota asserts the total, a
+  steady-state one asserts everything outside the class it excludes;
+- **proves its fixture reached the state under test**: the iteration really finished, the race was
+  really lost. A count taken from a scenario that never happened is the failure mode a quota test
+  has, and it looks exactly like a pass;
+- **keeps the requests of the test itself out of the count**: probes and doubles reach the store
+  through one of their own, recorded by nothing;
+- **reads the counters only once the requests it bounds have settled**, never the moment its
+  condition holds — the passes already in flight still have theirs to issue;
+- **fixes what makes the number exact** — how many workers, how many tasks, how many iterations —
+  because each of those turns the quota into a range;
+- **is checked by breaking the behavior it guards**, once per number, with the break named in the
+  test's doc comment. A number that no deliberate break moves is guarding nothing, and a break
+  nobody wrote down is a claim. Where two mechanisms hold one number — the wait between passes and
+  the poll gate both keep a waiting job off the store — the break disables both: either alone
+  leaves the number where it was and reads as a test that guards nothing.
+
 ## Determinism and isolation
 
 - **`--test-threads=1` is mandatory** — see the [`Makefile`](../Makefile). Do not drop it to make a
   run faster.
 - Real sleeps must not determine correctness or ordering. Coordinate with channels, atomics, or a
-  poll-until-condition.
+  poll-until-condition. The one exception is the observation window of a steady-state quota, where
+  the sleep is the measurement itself — its baseline is still taken by poll-until-condition.
 - Every wait has a bounded timeout that fails with a diagnostic. A test that can hang forever is
   broken.
 - Tests sharing infrastructure use distinct bucket names or `bucket_prefix` values.

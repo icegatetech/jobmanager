@@ -144,6 +144,19 @@ crate-wide precisely so that promise stays honest.
 - `.clone()` is explicit and deliberate: cloning an `Arc` is cheap and fine, cloning a whole job
   state is not. Prefer `Arc::make_mut` where copy-on-write already applies.
 
+### Cost is justified on its own, never against a neighbor
+
+- Added work — a loop, a pass, an allocation, a copy — **MUST** be justified by what it buys,
+  never by what it is smaller than. "Negligible next to the sort", "noise against the S3 call",
+  "there are already two allocations per element" are **NOT** justifications: they pass for any
+  addition whatsoever, so they gate nothing, and the service pays CPU and memory for every one
+  of them.
+- If the same result is available at a lower complexity, take the lower one and move the
+  expensive form onto the failing path, where it is paid for by a request that is already lost.
+- **Acid test:** if the sentence defending the code contains "compared to", "on the background
+  of", "anyway", or "one more won't matter", it is not an argument. Replace it with "costs X per
+  element, buys Y, and Y is not available cheaper" — or make it cheaper.
+
 ## Imports and dependencies
 
 - **MUST** avoid wildcard imports except in test modules (`use super::*`).

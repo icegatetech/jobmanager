@@ -11,6 +11,10 @@ have everything this needs.
 A **job** is a named unit of work made of one or more **tasks**. A **worker** polls storage for
 jobs that have runnable tasks, executes one task at a time, and writes the updated job back.
 
+Each job is polled on its own schedule: `JobsManagerBuilder::poll_interval` sets the interval a job
+with work to do is polled at, and a job waiting for its next iteration is not polled until the
+moment that iteration is due — set per job with `JobBuilder::every` or moved by an executor.
+
 ```
 JobsManager ──┬── Worker ──┐
               ├── Worker ──┼──► Storage ──► S3 object per job

@@ -5,12 +5,22 @@ use std::time::Duration;
 
 use tracing_subscriber::{EnvFilter, fmt};
 
-use crate::WorkerConfig;
+use crate::{Job, JobMeta, WorkerConfig};
 
 pub mod counting_metrics;
 pub mod manager_env;
 pub mod s3_container;
 pub mod storage_wrapper;
+pub mod waiting;
+
+/// The iteration and version `job` stands at - what a conditional read asks the store about.
+pub fn meta_of(job: &Job) -> JobMeta {
+    JobMeta {
+        code: job.code().clone(),
+        iter_num: job.iter_num(),
+        version: job.version().to_string(),
+    }
+}
 
 /// Worker settings a test polls by: an interval short enough that a test does not wait out the
 /// defaults, plus the jitter it wants the workers spread by.

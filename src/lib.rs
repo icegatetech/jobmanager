@@ -71,7 +71,7 @@ pub use uuid::Uuid;
 pub use crate::core::error::{Error, Result, TaskError};
 pub(crate) use crate::core::error::{InternalError, JobError};
 pub use crate::core::job::{DEFAULT_ITERATION_RETENTION, JobCode, JobStatus, TaskLimits};
-pub(crate) use crate::core::job::{Job, JobDefinition, JobDefinitionId, TaskPickup};
+pub(crate) use crate::core::job::{IterationStep, Job, JobDefinition, JobDefinitionId, TaskPickup};
 pub(crate) use crate::core::registry::JobRegistry;
 pub(crate) use crate::core::task::Task;
 pub use crate::core::task::{

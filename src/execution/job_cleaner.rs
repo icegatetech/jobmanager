@@ -317,6 +317,14 @@ mod tests {
             self.inner.find_job_meta(job_code, cancel_token).await
         }
 
+        async fn get_changed_job(
+            &self,
+            job_meta: &JobMeta,
+            cancel_token: &CancellationToken,
+        ) -> StorageResult<Option<Job>> {
+            self.inner.get_changed_job(job_meta, cancel_token).await
+        }
+
         async fn save_job(&self, job: &mut Job, cancel_token: &CancellationToken) -> StorageResult<()> {
             self.inner.save_job(job, cancel_token).await
         }

@@ -15,7 +15,7 @@ use tracing::{debug, info};
 use crate::{
     Error, Job, JobCode, JobDefinitionRegistry, JobMeta, MetricsSink, Retrier, RetrierConfig, RetryStep, Storage,
     StorageError, StorageResult,
-    storage::s3_error::{classify_delete_failures, map_s3_error},
+    storage::s3_error::{classify_delete_failures, is_not_modified, map_s3_error},
     storage::state::StoredJob,
 };
 
@@ -352,8 +352,14 @@ impl S3Storage {
         })
     }
 
+    /// Records one S3 operation under `status`, which is either an HTTP status or a label for a
+    /// failure that has none of its own.
+    fn record_s3_status(&self, operation: &str, status: &str, start: Instant) {
+        self.metrics.record_storage_operation(operation, status, start.elapsed());
+    }
+
     fn record_s3_ok(&self, operation: &str, start: Instant) {
-        self.metrics.record_storage_operation(operation, "OK", start.elapsed());
+        self.record_s3_status(operation, "OK", start);
     }
 
     fn record_s3_err<E: std::fmt::Debug>(&self, operation: &str, err: &aws_sdk_s3::error::SdkError<E>, start: Instant) {
@@ -371,7 +377,7 @@ impl S3Storage {
     /// Such a failure has no HTTP status of its own - the status was `200` - so it is labelled
     /// `ERR` rather than a code that would read as if the request itself had failed.
     fn record_s3_response_failure(&self, operation: &str, start: Instant) {
-        self.metrics.record_storage_operation(operation, "ERR", start.elapsed());
+        self.record_s3_status(operation, "ERR", start);
     }
 
     fn build_job_path(&self, job_code: &JobCode) -> String {
@@ -563,7 +569,6 @@ impl S3Storage {
 }
 
 #[async_trait::async_trait]
-#[allow(private_interfaces)]
 impl Storage for S3Storage {
     async fn get_job(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<Job> {
         if cancel_token.is_cancelled() {
@@ -675,6 +680,57 @@ impl Storage for S3Storage {
         Err(StorageError::NotFound(
             "No job state objects found for requested job".to_string(),
         ))
+    }
+
+    #[tracing::instrument(skip(self, cancel_token), fields(job_version = %job_meta.version))]
+    async fn get_changed_job(
+        &self,
+        job_meta: &JobMeta,
+        cancel_token: &CancellationToken,
+    ) -> StorageResult<Option<Job>> {
+        if cancel_token.is_cancelled() {
+            return Err(StorageError::Cancelled);
+        }
+        let key = self.build_state_path(&job_meta.code, job_meta.iter_num);
+
+        let start = Instant::now();
+        let result = self
+            .client
+            .get_object()
+            .bucket(&self.bucket_name)
+            .key(&key)
+            .if_none_match(&job_meta.version)
+            .send()
+            .await;
+
+        let output = match result {
+            Ok(output) => output,
+            Err(e) if is_not_modified(&e) => {
+                self.record_s3_status("GET", "304", start);
+                return Ok(None);
+            }
+            Err(e) => {
+                self.record_s3_err("GET", &e, start);
+                return Err(map_s3_error(&e));
+            }
+        };
+
+        let Some(version) = output.e_tag().map(Self::normalize_etag) else {
+            self.record_s3_response_failure("GET", start);
+            return Err(StorageError::S3(format!("Missing etag reading iteration {key}")));
+        };
+        let data = output
+            .body
+            .collect()
+            .await
+            .map_err(|e| {
+                self.record_s3_response_failure("GET", start);
+                StorageError::S3(format!("Failed to read job body: {e}"))
+            })?
+            .into_bytes();
+        self.record_s3_ok("GET", start);
+
+        Ok(Some(self.deserialize_job(&data, &version)?))
     }
 
     // SaveJob saves job atomically with Version check
@@ -865,6 +921,7 @@ mod tests {
 
     use super::*;
     use crate::JobDefinition;
+    use crate::tests::common::counting_metrics::CountingMetrics;
 
     fn build_config() -> S3StorageConfig {
         S3StorageConfig::new("http://localhost:9000", "key", "secret", "jobs", "us-east-1")
@@ -882,13 +939,19 @@ mod tests {
         }
     }
 
-    /// Builds a storage whose S3 client answers with `response`.
+    /// Builds a storage whose S3 client answers with `response` and whose requests nobody counts.
+    fn build_storage_answering(response: http::Response<SdkBody>) -> S3Storage {
+        build_storage_recording(response, Arc::new(crate::NoopMetrics))
+    }
+
+    /// Builds a storage whose S3 client answers with `response`, recording every request it makes
+    /// into `metrics`.
     ///
     /// Constructed field by field rather than through [`S3Storage::new`], which reaches a real
     /// endpoint to check the bucket and builds a client of its own; there is no other seam for a
     /// canned response, and adding one to the production configuration for a test would be a
     /// second way to configure the same thing.
-    fn build_storage_answering(response: http::Response<SdkBody>) -> S3Storage {
+    fn build_storage_recording(response: http::Response<SdkBody>, metrics: Arc<dyn MetricsSink>) -> S3Storage {
         let request = http::Request::builder()
             .uri("http://localhost:9000/jobs")
             .body(SdkBody::empty())
@@ -914,7 +977,7 @@ mod tests {
             codec: JobStateCodecKind::Json.build(),
             registry: Arc::new(UnusedJobRegistry),
             retrier: Retrier::new(RetrierConfig::default()),
-            metrics: Arc::new(crate::NoopMetrics),
+            metrics,
             list_page_size: DEFAULT_LIST_PAGE_SIZE,
             delete_batch_size: DEFAULT_DELETE_BATCH_SIZE,
         }
@@ -989,6 +1052,162 @@ mod tests {
             .delete_state_objects(&build_deleted_keys())
             .await
             .expect("a body reporting no failure is a successful delete");
+    }
+
+    /// The `304` a store answers a conditional read with: a status and no body, exactly as the
+    /// protocol prescribes.
+    fn build_not_modified_response() -> http::Response<SdkBody> {
+        http::Response::builder()
+            .status(304)
+            .body(SdkBody::empty())
+            .expect("the scripted response must build")
+    }
+
+    /// A failed request carrying the error document S3 answers with, so the status under test is
+    /// what decides the mapping rather than an unparsable body.
+    fn build_failure_response(status: u16) -> http::Response<SdkBody> {
+        http::Response::builder()
+            .status(status)
+            .header("content-type", "application/xml")
+            .body(SdkBody::from(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                 <Error><Code>Scripted</Code><Message>scripted failure</Message></Error>",
+            ))
+            .expect("the scripted response must build")
+    }
+
+    /// The iteration every conditional read below asks about.
+    fn build_read_meta() -> JobMeta {
+        JobMeta {
+            code: JobCode::new("job"),
+            iter_num: 1,
+            version: "an-etag".to_string(),
+        }
+    }
+
+    /// `304` is the answer a conditional read asks for, not a failure to translate. Taken for one,
+    /// every poll of an unmoved iteration would come back as an error and cost the cold read the
+    /// conditional read exists to avoid.
+    #[tokio::test]
+    async fn a_conditional_read_of_an_unmoved_iteration_returns_nothing() {
+        let storage = build_storage_answering(build_not_modified_response());
+
+        let read = storage
+            .get_changed_job(&build_read_meta(), &CancellationToken::new())
+            .await
+            .expect("a store answering 304 must not report a failure");
+
+        assert!(read.is_none(), "an unmoved iteration must read as nothing to apply");
+    }
+
+    /// The table [`StorageError::is_retryable`] answers a backend's failures from, asserted through
+    /// the read that produces them: a status the store itself clears has to reach the caller as a
+    /// retryable variant, and everything else as one that is attempted exactly once. A status
+    /// nobody mapped is the case that decides what an unfamiliar backend costs.
+    #[tokio::test]
+    async fn the_status_of_a_failed_conditional_read_decides_the_error_it_becomes() {
+        let cases: Vec<(u16, fn(&StorageError) -> bool, bool, &str)> = vec![
+            (401, |error| matches!(error, StorageError::Auth(_)), false, "Auth"),
+            (403, |error| matches!(error, StorageError::Auth(_)), false, "Auth"),
+            (
+                404,
+                |error| matches!(error, StorageError::NotFound(_)),
+                false,
+                "NotFound",
+            ),
+            (408, |error| matches!(error, StorageError::Timeout), true, "Timeout"),
+            (
+                412,
+                |error| matches!(error, StorageError::ConcurrentModification(_)),
+                false,
+                "ConcurrentModification",
+            ),
+            (
+                429,
+                |error| matches!(error, StorageError::RateLimited),
+                true,
+                "RateLimited",
+            ),
+            (
+                500,
+                |error| matches!(error, StorageError::ServiceUnavailable),
+                true,
+                "ServiceUnavailable",
+            ),
+            (
+                502,
+                |error| matches!(error, StorageError::ServiceUnavailable),
+                true,
+                "ServiceUnavailable",
+            ),
+            (
+                503,
+                |error| matches!(error, StorageError::ServiceUnavailable),
+                true,
+                "ServiceUnavailable",
+            ),
+            (
+                504,
+                |error| matches!(error, StorageError::ServiceUnavailable),
+                true,
+                "ServiceUnavailable",
+            ),
+            (418, |error| matches!(error, StorageError::S3(_)), false, "S3"),
+        ];
+
+        for (status, is_expected_variant, is_retryable, expected_variant) in cases {
+            let storage = build_storage_answering(build_failure_response(status));
+
+            let Err(error) = storage.get_changed_job(&build_read_meta(), &CancellationToken::new()).await else {
+                panic!("status {status} must not read as a job")
+            };
+
+            assert!(
+                is_expected_variant(&error),
+                "status {status} must map to {expected_variant}, got: {error:?}"
+            );
+            assert_eq!(
+                error.is_retryable(),
+                is_retryable,
+                "status {status} must be repeated: {is_retryable}, got: {error:?}"
+            );
+        }
+    }
+
+    /// A request the store refused is billed exactly like one it answered, so it has to be recorded
+    /// under the status it came back with. A run quota states the *whole* of what a scenario cost,
+    /// and a request that reached the store without reaching the metric makes that statement false
+    /// without failing anything.
+    #[tokio::test]
+    async fn a_failed_conditional_read_is_recorded_under_the_status_it_came_back_with() {
+        let metrics = Arc::new(CountingMetrics::default());
+
+        for status in [503_u16, 429_u16] {
+            let storage = build_storage_recording(
+                build_failure_response(status),
+                Arc::clone(&metrics) as Arc<dyn MetricsSink>,
+            );
+
+            let read = storage.get_changed_job(&build_read_meta(), &CancellationToken::new()).await;
+
+            assert!(read.is_err(), "status {status} must not read as a job");
+        }
+
+        assert_eq!(
+            metrics.storage_operations("GET", "503"),
+            1,
+            "a read the store refused as unavailable must be recorded as a GET that returned 503"
+        );
+        assert_eq!(
+            metrics.storage_operations("GET", "429"),
+            1,
+            "and a throttled one as a GET that returned 429"
+        );
+        assert_eq!(
+            metrics.storage_operations_total(),
+            2,
+            "and nothing was recorded under any other pair"
+        );
     }
 
     #[test]
