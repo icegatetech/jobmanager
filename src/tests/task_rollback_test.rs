@@ -8,12 +8,14 @@ use std::{
 
 use tokio_util::sync::CancellationToken;
 
+use super::common::counting_metrics::CountingMetrics;
 use super::common::manager_env::ManagerEnv;
 use super::common::storage_wrapper::{ContendedSave, ContendingStorage};
 use crate::storage::in_memory::InMemoryStorage;
 use crate::{
-    Error, JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStatus, JobsManagerConfig, Storage, TaskCode,
-    TaskContext, TaskDefinition, TaskExecutor, TaskLimits, TaskOutcome, TaskRef, TaskStatus, task_fn,
+    Error, JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStatus, JobsManagerConfig, MetricsSink,
+    NoopMetrics, Storage, TaskCode, TaskContext, TaskDefinition, TaskExecutor, TaskLimits, TaskOutcome, TaskRef,
+    TaskRetry, TaskStatus, task_fn,
 };
 
 const PLAN_TASK_CODE: &str = "plan";
@@ -71,6 +73,25 @@ fn planning_executor(executions: &Arc<AtomicU32>, failing_executions: u32) -> Ar
     })
 }
 
+/// An executor that plans a chain of tasks and then refuses its own task for good through
+/// [`TaskOutcome::TerminallyFailed`] - a refusal, so the rollback covers it like any other.
+fn terminally_refusing_planning_executor(executions: &Arc<AtomicU32>) -> Arc<dyn TaskExecutor> {
+    let executions = Arc::clone(executions);
+    task_fn(move |ctx| {
+        let executions = Arc::clone(&executions);
+
+        async move {
+            executions.fetch_add(1, Ordering::SeqCst);
+
+            plan_tasks(&ctx)?;
+
+            Ok(TaskOutcome::TerminallyFailed(
+                "planning refused the work for good".to_string(),
+            ))
+        }
+    })
+}
+
 /// An executor that plans a chain of tasks and then fails its own task through the job handle,
 /// returning [`TaskOutcome::Deferred`] - the deliberate failure, which the rollback covers like any
 /// other.
@@ -83,7 +104,11 @@ fn self_failing_planning_executor(executions: &Arc<AtomicU32>) -> Arc<dyn TaskEx
             executions.fetch_add(1, Ordering::SeqCst);
 
             plan_tasks(&ctx)?;
-            ctx.job().fail_task(ctx.id(), "planning refused the work deliberately")?;
+            ctx.job().fail_task(
+                ctx.id(),
+                "planning refused the work deliberately",
+                TaskRetry::WhileBudgetLasts,
+            )?;
 
             Ok(TaskOutcome::Deferred)
         }
@@ -107,7 +132,11 @@ fn planning_after_its_own_failure_executor(
         async move {
             executions.fetch_add(1, Ordering::SeqCst);
 
-            ctx.job().fail_task(ctx.id(), "planning refused the work deliberately")?;
+            ctx.job().fail_task(
+                ctx.id(),
+                "planning refused the work deliberately",
+                TaskRetry::WhileBudgetLasts,
+            )?;
             if ctx
                 .job()
                 .add_task(TaskDefinition::new(TaskCode::new(PLANNED_TASK_CODE), TASK_TIMEOUT))
@@ -164,6 +193,18 @@ async fn run_job(
     max_attempts: u32,
     storage: Arc<dyn Storage>,
 ) -> Result<crate::Job, Box<dyn std::error::Error>> {
+    run_job_measured(job_code, plan_executor, max_attempts, storage, Arc::new(NoopMetrics)).await
+}
+
+/// The same run reporting to `metrics`, for the test whose expectation is what a save was measured
+/// under rather than what it stored.
+async fn run_job_measured(
+    job_code: &JobCode,
+    plan_executor: Arc<dyn TaskExecutor>,
+    max_attempts: u32,
+    storage: Arc<dyn Storage>,
+    metrics: Arc<dyn MetricsSink>,
+) -> Result<crate::Job, Box<dyn std::error::Error>> {
     let plan_def = TaskDefinition::new(TaskCode::new(PLAN_TASK_CODE), TASK_TIMEOUT).with_max_attempts(max_attempts);
     let planned_executor = task_fn(|_ctx| async { Ok(TaskOutcome::empty()) });
     let job_def = JobDefinition::new(
@@ -177,11 +218,12 @@ async fn run_job(
     .with_max_iterations(1)?;
 
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
-    let mut manager_env = ManagerEnv::new(
+    let mut manager_env = ManagerEnv::with_metrics(
         Arc::clone(&storage),
         manager_config(),
         Arc::clone(&job_registry),
         vec![job_def],
+        metrics,
     )?;
 
     manager_env.wait_for_all_jobs_completion(WAIT_TIMEOUT).await?;
@@ -394,6 +436,64 @@ async fn test_a_result_its_executor_completed_survives_a_conflicting_save() -> R
     Ok(())
 }
 
+/// The same conflict read off the metrics: the phase a save is measured under is the state the task
+/// ended in, not the branch the worker took to get there. This execution failed, and its task is
+/// stored completed - a conflict measured as a refusal would send an operator looking for a failure
+/// that never happened.
+///
+/// The break that proves it: returning the literal `"save_failed_task"` from the error arm of
+/// `Worker::execute_task` instead of reading the label off the resolved task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_conflict_on_a_result_its_executor_completed_is_measured_under_the_completion()
+-> Result<(), Box<dyn std::error::Error>> {
+    super::common::init_tracing();
+
+    let executions = Arc::new(AtomicU32::new(0));
+    let sink = Arc::new(CountingMetrics::default());
+    let storage = Arc::new(
+        ContendingStorage::new(Arc::new(InMemoryStorage::new())).with_contended_save(ContendedSave::OfTask {
+            code: TaskCode::new(PLAN_TASK_CODE),
+            status: TaskStatus::Completed,
+        }),
+    );
+    let job = run_job_measured(
+        &JobCode::new("rollback_completed_conflict_phase_job"),
+        failing_after_its_own_completion_executor(&executions),
+        1,
+        Arc::clone(&storage) as Arc<dyn Storage>,
+        Arc::clone(&sink) as Arc<dyn MetricsSink>,
+    )
+    .await?;
+
+    assert_eq!(
+        storage.interferences(),
+        1,
+        "the fixture must have made the save of the completed task lose its race"
+    );
+    assert_eq!(
+        *job.status(),
+        JobStatus::Completed,
+        "and the retry must have gone through"
+    );
+    assert_eq!(
+        sink.save_conflict_retries(),
+        1,
+        "the lost race is the one retry the run pays, so the phases below account for all of it"
+    );
+    assert_eq!(
+        sink.save_conflict_retries_of_phase("save_completed_task"),
+        1,
+        "the task reached storage completed, which is what the retry has to be measured under"
+    );
+    assert_eq!(
+        sink.save_conflict_retries_of_phase("save_failed_task"),
+        0,
+        "the execution failing around a completed task must not be measured as a refused task"
+    );
+
+    Ok(())
+}
+
 /// The rollback has to survive the conflict path too: the save carrying the failed task loses its
 /// race, and the merge that follows must not carry the rolled-back tasks back into the stored
 /// iteration.
@@ -432,6 +532,48 @@ async fn test_tasks_of_a_failed_execution_stay_dropped_when_its_save_conflicts()
         1,
         "the iteration must hold nothing but the planning task"
     );
+
+    Ok(())
+}
+
+/// A refusal declared final is a refusal, so what the execution planned goes with it: the outcome
+/// that skips the retry must not thereby skip the rollback. Without it the iteration would end
+/// failed while holding the plan of the execution that failed - the one part of an execution
+/// outliving its own rollback.
+///
+/// The break that proves it, and that no other rollback test catches: routing the `TerminallyFailed`
+/// branch of `Worker::execute_task` past `Job::fail_task` - `job.skip_task_by_executor(&task_id, &reason)` ends
+/// the task without rolling anything back, and the plan of the refused execution reaches storage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plan_of_a_terminally_refused_execution_is_not_stored() -> Result<(), Box<dyn std::error::Error>> {
+    super::common::init_tracing();
+
+    let executions = Arc::new(AtomicU32::new(0));
+    // A budget of three, so a single execution proves the refusal itself ended the task rather
+    // than the budget running out on it.
+    let job = run_job(
+        &JobCode::new("terminal_rollback_job"),
+        terminally_refusing_planning_executor(&executions),
+        3,
+        Arc::new(InMemoryStorage::new()),
+    )
+    .await?;
+
+    assert!(
+        job.get_tasks_by_code(&TaskCode::new(PLANNED_TASK_CODE)).is_empty(),
+        "the tasks the refused execution created must be gone"
+    );
+    assert_eq!(
+        job.tasks_as_iter().count(),
+        1,
+        "the iteration must hold nothing but the planning task"
+    );
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        1,
+        "a refusal declared final must be executed once, whatever the budget allows"
+    );
+    assert_eq!(*job.status(), JobStatus::Failed);
 
     Ok(())
 }

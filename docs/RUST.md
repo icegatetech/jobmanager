@@ -82,6 +82,10 @@ crate-wide precisely so that promise stays honest.
   (`JobCode`, `TaskCode`). A raw `String` identifier crossing an API boundary is a defect.
 - Prefer `Option<T>` over sentinel values; prefer an enum over a bool pair when the states are not
   independent.
+- **A `match` over an enum names every variant.** Listing them is what turns a new variant into a
+  compile error at every site that has to answer for it; a `_` arm turns that into silence, and the
+  site keeps answering the old way. Use `_` only where the variants cannot be listed — a
+  `#[non_exhaustive]` type from a dependency — and say why in a comment.
 - Make fields private by default; expose accessors. Prefer `const fn` accessors where possible —
   the existing code does, and clippy's `nursery` set will ask for it.
 - Derive `Debug`, `Clone`, `PartialEq` where appropriate; `Default` only when a sensible default
@@ -153,6 +157,10 @@ crate-wide precisely so that promise stays honest.
   of them.
 - If the same result is available at a lower complexity, take the lower one and move the
   expensive form onto the failing path, where it is paid for by a request that is already lost.
+- **One pass is the default.** Build a result in a single pass over a collection; a second pass
+  over the same data lives only with a comment naming what one pass cannot produce — an order the
+  merged pass would decide by visit order, a value the next pass needs whole. Readability is such
+  a reason and is written down as one; "it is only one more pass" is not a reason at all.
 - **Acid test:** if the sentence defending the code contains "compared to", "on the background
   of", "anyway", or "one more won't matter", it is not an argument. Replace it with "costs X per
   element, buys Y, and Y is not available cheaper" — or make it cheaper.

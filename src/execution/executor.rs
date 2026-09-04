@@ -12,6 +12,25 @@ use crate::{TaskContext, TaskError};
 pub enum TaskOutcome {
     /// The task finished; the worker stores this payload as its output.
     Completed(Vec<u8>),
+    /// The task failed and the failure will not become a success: the worker stores this reason and
+    /// the task is terminal at once, whatever is left of its attempt budget.
+    ///
+    /// For a refusal that is worth repeating - a flaky call, a busy store - return `Err` instead:
+    /// that is the ordinary path and the budget is what bounds it.
+    ///
+    /// What this execution created through [`JobHandle`](crate::JobHandle) is rolled back, exactly
+    /// as it is for `Err`: a terminal refusal is a refusal.
+    TerminallyFailed(String),
+    /// The task's branch has no meaning: neither this task nor what waits on it is worth running.
+    ///
+    /// Not a failure - an iteration whose branches were skipped and whose remaining work finished
+    /// ends as completed. The string is why, and a dependent reads it through
+    /// [`ImmutableTask::get_resolution_reason`](crate::ImmutableTask::get_resolution_reason).
+    ///
+    /// Nothing this execution registered through [`JobHandle`](crate::JobHandle) is rolled back - a
+    /// decision is not a refusal; see
+    /// [`JobHandle::skip_task_branch`](crate::JobHandle::skip_task_branch).
+    SkippedBranch(String),
     /// Neither finished nor failed: the worker persists nothing and stops. Return it when the
     /// cancellation came from outside this execution - see
     /// [`TaskContext::cancel_token`](crate::TaskContext::cancel_token) for what cancels one.
@@ -29,8 +48,10 @@ pub enum TaskOutcome {
     /// worker must not touch it. Needed by executors that fan out work and decide themselves when
     /// to close their own task.
     ///
-    /// Resolving means completing or failing the task; returning this without having done either
-    /// fails the task immediately rather than leaving it open until its deadline.
+    /// Resolving means completing the task, failing it, or calling its branch pointless through
+    /// [`JobHandle::skip_task_branch`](crate::JobHandle::skip_task_branch); returning this
+    /// without having done any of the three fails the task immediately rather than leaving it open
+    /// until its deadline.
     Deferred,
 }
 

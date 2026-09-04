@@ -13,9 +13,9 @@ use uuid::Uuid;
 use crate::execution::job_cleaner::JobIterationStarted;
 use crate::execution::job_handle::{JobHandleImpl, JobHandleState};
 use crate::{
-    Error, InternalError, IterationStep, Job, JobCode, JobError, JobHandle, JobRegistry, JobStatus, MetricsSink,
+    Error, InternalError, IterationStep, IterationVerdict, Job, JobCode, JobError, JobHandle, JobRegistry, MetricsSink,
     Retrier, RetrierConfig, RetryStep, Storage, StorageError, TaskCode, TaskContext, TaskOutcome, TaskPickup,
-    TaskResult,
+    TaskResult, TaskRetry,
 };
 // TODO(low): implement subscription mechanism for job updates between workers - if worker received/saved job, other workers should update their state to reduce races.
 // Can be done via storage wrapper.
@@ -203,8 +203,9 @@ struct JobMergeContext<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SaveOutcome {
     Saved,
-    Skipped,
-    Stolen,
+    /// Another worker got there first, so this worker's state was dropped rather than written.
+    JobStolen,
+    TaskStolen,
 }
 
 enum MergeDecision {
@@ -440,7 +441,7 @@ impl Worker {
                     saved_job.updated_by_worker_id()
                 );
                 // TODO(low): in saveJobState on ConcurrentModification error we re-read job, which is unnecessary in this case.
-                Ok(MergeDecision::Done(saved_job, SaveOutcome::Skipped)) // Someone beat us to it
+                Ok(MergeDecision::Done(saved_job, SaveOutcome::JobStolen)) // Someone beat us to it
             })
             .await?;
 
@@ -558,7 +559,7 @@ impl Worker {
                 );
                 // TODO(low): in saveJobState on ErrConcurrentModification we re-read job, which is unnecessary in
                 // this case.
-                Ok(MergeDecision::Done(saved_job, SaveOutcome::Skipped)) // Someone beat us to it
+                Ok(MergeDecision::Done(saved_job, SaveOutcome::JobStolen)) // Someone beat us to it
             })
             .await?;
 
@@ -605,8 +606,8 @@ impl Worker {
                 debug!("Tasks for job {} not found", job.code());
                 return Ok(false);
             }
-            TaskPickup::Exhausted => {
-                return self.save_failed_iteration(job, cancel_token).await;
+            TaskPickup::IterationSettled => {
+                return self.save_settled_job_iteration(job, cancel_token).await;
             }
         };
         let task_code = job.get_task(&task_id)?.code().clone();
@@ -647,7 +648,7 @@ impl Worker {
                             "pick_start_conflict",
                         );
                         debug!("Job has concurrent modification when picking task - skip");
-                        Ok(MergeDecision::Done(saved_job, SaveOutcome::Stolen))
+                        Ok(MergeDecision::Done(saved_job, SaveOutcome::TaskStolen))
                     }
                     Err(e) => {
                         Err(InternalError::from(e)) // Don't retry
@@ -656,8 +657,8 @@ impl Worker {
             })
             .await?;
 
-        if outcome == SaveOutcome::Stolen {
-            info!("Job was stolen");
+        if outcome == SaveOutcome::TaskStolen {
+            info!("Task was stolen");
             return Ok(true);
         }
 
@@ -743,12 +744,33 @@ impl Worker {
             }
         };
 
-        let result = match outcome {
+        // The reason the save is labelled with rides on the resolution succeeding: one that failed
+        // is recorded below as a refusal and labelled there instead.
+        let result: Result<&'static str, InternalError> = match outcome {
             // The worker closes the task itself, so an executor cannot leave one hanging by
             // forgetting to.
-            Ok(Ok(TaskOutcome::Completed(output))) => job.complete_task(&task_id, output).map_err(InternalError::from),
-            // The executor resolved the task through its handle; touching it again would fail.
-            Ok(Ok(TaskOutcome::Deferred)) => Self::check_task_resolution(&job, &task_id),
+            Ok(Ok(TaskOutcome::Completed(output))) => job
+                .complete_task(&task_id, output, self.id)
+                .map(|()| "save_completed_task")
+                .map_err(InternalError::from),
+            // A refusal the executor ruled out repeating: recorded here rather than below, because
+            // below is where a refusal that may be repeated is recorded.
+            Ok(Ok(TaskOutcome::TerminallyFailed(reason))) => job
+                .fail_task(&task_id, &reason, TaskRetry::Never, self.id)
+                .map(|rolled_back_tasks| {
+                    info!(rolled_back_tasks, "Task '{}' refused terminally: {}", task_id, reason);
+                    "save_failed_task"
+                })
+                .map_err(InternalError::from),
+            Ok(Ok(TaskOutcome::SkippedBranch(reason))) => job
+                .skip_task_by_executor(&task_id, &reason, self.id)
+                .map(|()| "save_skipped_task")
+                .map_err(InternalError::from),
+            // The executor resolved the task through its handle; touching it again would fail, so
+            // the label is read off the state it left rather than decided here.
+            Ok(Ok(TaskOutcome::Deferred)) => {
+                Self::check_task_resolution(&job, &task_id).and_then(|()| Self::describe_resolved_task(&job, &task_id))
+            }
             // A shutdown was ruled out above, so the executor was released by its own deadline. The
             // task stays as it is for another worker to take over, and the pass counts as work done:
             // backing the poll interval off before a takeover that is already due would only delay
@@ -762,8 +784,8 @@ impl Worker {
             // its own token. Honouring it would leave the task held until its deadline runs out, on
             // an attempt already spent, and report a cancellation that never happened.
             Ok(Ok(TaskOutcome::Cancelled)) => Err(InternalError::Other(
-                "executor returned Cancelled without a cancellation of its execution: return the outcome of \
-                 the work, or select on the token and return Cancelled once it fires"
+                "executor returned Cancelled without a cancellation of its execution: return the outcome of the \
+                 work, or select on the token and return Cancelled once it fires"
                     .to_string(),
             )),
             Ok(Err(e)) => Err(InternalError::Other(e.to_string())),
@@ -784,13 +806,16 @@ impl Worker {
         // completes the iteration exactly like a successful one.
         let save_reason = match result {
             Err(e) => {
-                let rolled_back_tasks = job.record_task_execution_failure(&task_id, &e.to_string())?;
+                let rolled_back_tasks =
+                    job.record_task_execution_failure(&task_id, &e.to_string(), TaskRetry::WhileBudgetLasts, self.id)?;
                 info!(rolled_back_tasks, "Task '{}' execution failed: {}", task_id, e);
-                "save_failed_task"
+                // The failure may have found the task already resolved by its own executor, in
+                // which case that resolution is what the save carries.
+                Self::describe_resolved_task(&job, &task_id)?
             }
-            Ok(()) => {
+            Ok(resolved_save_reason) => {
                 info!("Task '{}' handled successfully", task_id);
-                "save_completed_task"
+                resolved_save_reason
             }
         };
 
@@ -800,34 +825,58 @@ impl Worker {
         let task_code_for_metrics = task_code.clone();
         let job_code_for_metrics = job_code.clone();
 
-        job.try_to_complete(&worker_id)?;
+        // The iteration is closed in the pass that saves the result of its last task; left to the
+        // next poll, the verdict would cost a write of its own.
+        //
+        // A verdict that cannot be reached must not cost the result: propagating the error with `?`
+        // would drop the save, the work was done once, and a task this save does not carry stays
+        // `Started` in storage for takeover after takeover to repeat it. An iteration nothing can
+        // move is left for a later pass to answer for.
+        if let Err(e) = job.try_settle_iteration(&worker_id) {
+            error!("Job {} iteration {} left open: {}", job.code(), job.iter_num(), e);
+        }
 
-        let job = self
+        let (job, outcome) = self
             .save_processed_task(job, &task_id, &cancel_token, move |ctx| {
                 let JobMergeContext {
                     current_job,
                     mut saved_job,
                 } = ctx;
                 match saved_job.merge_with_processed_task(current_job, &worker_id, &task_id_clone) {
-                    Ok(()) => {
-                        metrics.record_save_conflict_retry(&job_code_for_metrics, save_reason);
-                        // conditions for job completion might have been met (another worker completed task)
-                        saved_job.try_to_complete(&worker_id)?;
-                        debug!("Retry to save processed task ({save_reason})");
-                        Ok(MergeDecision::Retry(saved_job))
+                    Ok(()) => debug!("Retry to save processed task ({save_reason})"),
+                    // The merge carried the result over and left the iteration open, which a later
+                    // pass answers for; costing the retry the result it carries would leave the
+                    // task `Started` in storage instead.
+                    Err(e @ JobError::IterationDeadlock { .. }) => error!(
+                        "Job {} iteration {} left open after a merge: {e}",
+                        saved_job.code(),
+                        saved_job.iter_num()
+                    ),
+                    // The stored iteration is closed, so it takes no result: the next iteration is
+                    // planned from scratch, and the task is lost to the worker that closed it
+                    // exactly as a taken-over one is - which is what it is measured as.
+                    Err(JobError::IterationAlreadySettled { job_code }) => {
+                        metrics.record_task_stolen(&job_code_for_metrics, &task_code_for_metrics, "settled_iteration");
+                        info!("Job {job_code} iteration was settled by another worker - the result is dropped");
+                        return Ok(MergeDecision::Done(saved_job, SaveOutcome::JobStolen));
                     }
                     Err(JobError::TaskWorkerMismatch) => {
                         metrics.record_task_stolen(&job_code_for_metrics, &task_code_for_metrics, save_reason);
                         debug!("Task has stolen when try to save processed task ({save_reason}) - skip");
-                        Ok(MergeDecision::Done(saved_job, SaveOutcome::Stolen))
+                        return Ok(MergeDecision::Done(saved_job, SaveOutcome::TaskStolen));
                     }
-                    Err(e) => Err(InternalError::from(e)),
+                    Err(e) => return Err(InternalError::from(e)),
                 }
+
+                // The two arms that reach here repeat the write, so one repetition is one
+                // measurement however the merge that led to it ended.
+                metrics.record_save_conflict_retry(&job_code_for_metrics, save_reason);
+                Ok(MergeDecision::Retry(saved_job))
             })
             .await?;
 
-        if job.is_processed() {
-            self.job_completed(&job);
+        if outcome == SaveOutcome::Saved {
+            self.job_iteration_settled(&job);
         }
 
         Ok(())
@@ -914,15 +963,17 @@ impl Worker {
         task_id: &Uuid,
         cancel_token: &CancellationToken,
         concurrent_modification_handler: F,
-    ) -> Result<Job, InternalError>
+    ) -> Result<(Job, SaveOutcome), InternalError>
     where
         F: for<'a> Fn(JobMergeContext<'a>) -> Result<MergeDecision, InternalError> + Send + Sync,
     {
         let (job, outcome) = self.save_job_state(job, cancel_token, concurrent_modification_handler).await?;
 
-        if outcome == SaveOutcome::Stolen {
-            info!("Task '{}' was stolen during save, skipping merge", task_id);
-            return Ok(job);
+        // Neither outcome put the result in storage, so the task it carries was processed by nobody
+        // as far as the stored state is concerned.
+        if matches!(outcome, SaveOutcome::TaskStolen | SaveOutcome::JobStolen) {
+            info!("Task '{task_id}' did not reach storage ({outcome:?}), so it is not measured as processed");
+            return Ok((job, outcome));
         }
 
         debug!(
@@ -933,7 +984,11 @@ impl Worker {
             job.version()
         );
 
-        if let Ok(task) = job.find_task(task_id) {
+        if let Some((task, resolution)) = job
+            .find_task(task_id)
+            .ok()
+            .and_then(|task| task.resolution().map(|resolution| (task, resolution)))
+        {
             // Calculate duration if start/complete times are available
             let duration = match (task.completed_at(), task.started_at()) {
                 (Some(completed), Some(started)) => completed
@@ -944,46 +999,56 @@ impl Worker {
             };
 
             self.metrics
-                .record_task_processed(job.code(), task.code(), task.status(), duration);
+                .record_task_processed(job.code(), task.code(), resolution, duration);
         }
 
-        Ok(job)
+        Ok((job, outcome))
     }
 
-    /// Persist an iteration that cannot progress because tasks ran out of either limit - their
-    /// attempt budget or their maximum lifetime.
+    /// Persists an iteration the domain has already closed, under the verdict it closed with.
     ///
-    /// [`Job::pick_task_to_execute`] has already moved the job to `Failed`;
-    /// saving that state is what lets the scheduler start the next iteration,
-    /// which replans from scratch. A concurrent modification means another
-    /// worker advanced the job, so this worker drops its verdict and re-derives
-    /// it on the next poll.
-    async fn save_failed_iteration(&self, job: Job, cancel_token: &CancellationToken) -> Result<bool, InternalError> {
-        error!(
-            "Job {} iteration {} failed - tasks ran out of their attempt budget or maximum lifetime ({})",
-            job.code(),
-            job.iter_num(),
-            job.tasks_as_string()
-        );
-
+    /// [`Job::pick_task_to_execute`] settled it; saving that state is what lets the scheduler start
+    /// the next iteration, which replans from scratch. A concurrent modification means another
+    /// worker advanced the job, so this worker drops its verdict and re-derives it on the next
+    /// poll.
+    async fn save_settled_job_iteration(
+        &self,
+        job: Job,
+        cancel_token: &CancellationToken,
+    ) -> Result<bool, InternalError> {
         let (job, outcome) = self
             .save_job_state(job, cancel_token, |ctx| {
-                debug!("Job has concurrent modification when failing iteration - skip");
-                Ok(MergeDecision::Done(ctx.saved_job, SaveOutcome::Skipped))
+                debug!("Job has concurrent modification when settling the iteration - skip");
+                Ok(MergeDecision::Done(ctx.saved_job, SaveOutcome::JobStolen))
             })
             .await?;
 
         if outcome == SaveOutcome::Saved {
-            self.record_job_iteration(&job, &JobStatus::Failed);
-            self.report_finished_iteration(&job);
+            self.job_iteration_settled(&job);
         }
 
         Ok(true)
     }
 
-    fn job_completed(&self, job: &Job) {
-        info!("Job {} completed (iter: {})", job.code(), job.iter_num());
-        self.record_job_iteration(job, &JobStatus::Completed);
+    /// Reports an iteration the domain closed, under the verdict it actually carries.
+    ///
+    /// Called by the worker whose write closed the iteration, so a verdict is logged and measured
+    /// once however many workers read that state afterwards.
+    fn job_iteration_settled(&self, job: &Job) {
+        let Some(verdict) = job.iteration_verdict() else {
+            return;
+        };
+        match verdict {
+            IterationVerdict::Failed => error!(
+                "Job {} iteration {} failed - a failure was left unhandled ({})",
+                job.code(),
+                job.iter_num(),
+                job.tasks_as_string()
+            ),
+            IterationVerdict::Completed => info!("Job {} completed (iter: {})", job.code(), job.iter_num()),
+        }
+
+        self.record_job_iteration(job, verdict);
         self.report_finished_iteration(job);
     }
 
@@ -992,8 +1057,8 @@ impl Worker {
         self.finished_iterations.record_finished_iteration(job.code(), job.iter_num());
     }
 
-    /// Record the duration of a finished job iteration under its final `status`.
-    fn record_job_iteration(&self, job: &Job, status: &JobStatus) {
+    /// Record the duration of a finished job iteration under the `verdict` it ended with.
+    fn record_job_iteration(&self, job: &Job, verdict: IterationVerdict) {
         let duration = job.completed_at().map_or_else(
             || Duration::from_secs(0),
             |completed| {
@@ -1004,7 +1069,7 @@ impl Worker {
             },
         );
 
-        self.metrics.record_job_iteration_complete(job.code(), status, duration);
+        self.metrics.record_job_iteration_complete(job.code(), verdict, duration);
     }
 
     /// Runs `execution` to completion, cancelling `deadline_cancel_token` once `deadline_at` has
@@ -1036,8 +1101,22 @@ impl Worker {
         execution.await
     }
 
+    /// The save label for a task its own executor resolved, which is the state that is about to be
+    /// stored rather than the outcome the executor returned.
+    fn describe_resolved_task(job: &Job, task_id: &Uuid) -> Result<&'static str, InternalError> {
+        let task = job.find_task(task_id)?;
+        if task.is_skipped() {
+            return Ok("save_skipped_task");
+        }
+        if task.is_failed() {
+            return Ok("save_failed_task");
+        }
+
+        Ok("save_completed_task")
+    }
+
     /// Checks that the task an executor returned [`TaskOutcome::Deferred`] for is no longer open.
-    /// Completing and failing are the only ways to resolve one, so anything else was left for
+    /// Completing, failing and skipping are the ways to resolve one, so anything else was left for
     /// nobody to close.
     fn check_task_resolution(job: &Job, task_id: &Uuid) -> Result<(), InternalError> {
         if job.find_task(task_id)?.is_resolved() {
@@ -1045,8 +1124,8 @@ impl Worker {
         }
 
         Err(InternalError::Other(format!(
-            "executor returned Deferred without resolving task '{task_id}': complete or fail it through \
-         the job handle, or return the outcome instead"
+            "executor returned Deferred without resolving task '{task_id}': complete it, fail it, or skip its \
+         branch through the job handle, or return the outcome instead"
         )))
     }
 }
@@ -1054,9 +1133,11 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::common::storage_wrapper::SaveRefusingStorage;
+    use crate::tests::common::counting_metrics::CountingMetrics;
+    use crate::tests::common::storage_wrapper::{DeadlockPlantingStorage, SaveRefusingStorage};
     use crate::{
-        InMemoryStorage, JobDefinition, JobDefinitionId, NoopMetrics, TaskDefinition, TaskExecutor, TaskLimits, task_fn,
+        InMemoryStorage, JobDefinition, JobDefinitionId, JobStatus, NoopMetrics, TaskDefinition, TaskExecutor,
+        TaskLimits, TaskStatus, task_fn,
     };
 
     /// How many draws a test takes when it asserts on the spread of the jitter rather than on a
@@ -1295,11 +1376,20 @@ mod tests {
     }
 
     fn worker_running(job_def: JobDefinition, storage: Arc<dyn Storage>) -> Result<Worker, Error> {
+        worker_measured_by(job_def, storage, Arc::new(NoopMetrics))
+    }
+
+    /// The same worker recording into `metrics`, for a pass whose measurement is what is asserted.
+    fn worker_measured_by(
+        job_def: JobDefinition,
+        storage: Arc<dyn Storage>,
+        metrics: Arc<dyn MetricsSink>,
+    ) -> Result<Worker, Error> {
         Ok(Worker::new(
             Arc::new(JobRegistry::new(vec![job_def])?),
             storage,
             config_polled_every(Duration::from_millis(10)),
-            Arc::new(NoopMetrics),
+            metrics,
             None,
             Arc::new(IgnoredIterations),
         ))
@@ -1310,12 +1400,65 @@ mod tests {
         JobDefinition::new(
             JobDefinitionId::new(),
             JobCode::new(job_code),
-            vec![(TaskDefinition::new(TaskCode::new("cancelled"), timeout), executor)],
+            vec![(TaskDefinition::new(TaskCode::new(RUNNING_TASK_CODE), timeout), executor)],
             Vec::new(),
             Vec::new(),
             TaskLimits::default(),
         )
         .expect("the test description must be legal")
+    }
+
+    /// The label a save of a `Deferred` outcome carries names the state the executor left, not the
+    /// outcome it returned: an executor that gave up on its branch through the handle stores a
+    /// skipped task, and a save labelled as a completion would send every conflict and every
+    /// takeover of that pass into the metrics under the wrong phase.
+    ///
+    /// The break that proves it: returning a fixed `"save_completed_task"` from
+    /// `Worker::describe_resolved_task`.
+    #[test]
+    fn a_task_its_executor_resolved_is_labelled_by_the_state_it_left() {
+        let job_def = job_running(
+            "labelled_job",
+            CANCELLED_TASK_TIMEOUT,
+            task_fn(|_ctx| async { Ok(TaskOutcome::empty()) }),
+        );
+        let worker_id = Uuid::from_u128(1);
+
+        for (resolve, expected) in [
+            (Resolution::Completed, "save_completed_task"),
+            (Resolution::Failed, "save_failed_task"),
+            (Resolution::Skipped, "save_skipped_task"),
+        ] {
+            let mut job = Job::new(&job_def, HashMap::new(), worker_id).expect("the description must build a job");
+            let task_id = *job.tasks_as_iter().next().expect("the description declares one task").id();
+            job.start_work(&worker_id).expect("a new job starts running");
+            job.start_task(&task_id, worker_id).expect("a todo task must start");
+            match resolve {
+                Resolution::Completed => job
+                    .complete_task(&task_id, Vec::new(), worker_id)
+                    .expect("a started task completes"),
+                Resolution::Failed => {
+                    job.fail_task(&task_id, "refused", TaskRetry::WhileBudgetLasts, worker_id)
+                        .map(|_| ())
+                        .expect("a started task fails");
+                }
+                Resolution::Skipped => job
+                    .skip_task_by_executor(&task_id, "pointless", worker_id)
+                    .expect("a started task is skipped"),
+            }
+
+            assert_eq!(
+                Worker::describe_resolved_task(&job, &task_id).expect("the task is part of the job"),
+                expected
+            );
+        }
+    }
+
+    /// How the fixture above resolves the task before the label is read.
+    enum Resolution {
+        Completed,
+        Failed,
+        Skipped,
     }
 
     /// A cancellation the executor reports after its own deadline passed is not the pool shutting
@@ -1385,13 +1528,13 @@ mod tests {
         let storage = Arc::new(InMemoryStorage::new());
         let cancel_token = CancellationToken::new();
         let mut job = Job::new(job_def, HashMap::new(), worker_id)?;
-        job.work(&worker_id)?;
+        job.start_work(&worker_id)?;
         let TaskPickup::Ready(task_id) = job.pick_task_to_execute(&worker_id)? else {
             return Err("the fixture must leave a task to finish".into());
         };
         job.start_task(&task_id, worker_id)?;
-        job.complete_task(&task_id, Vec::new())?;
-        job.try_to_complete(&worker_id)?;
+        job.complete_task(&task_id, Vec::new(), worker_id)?;
+        job.try_settle_iteration(&worker_id)?;
         storage.save_job(&mut job, &cancel_token).await?;
 
         Ok(storage)
@@ -1432,6 +1575,82 @@ mod tests {
         let stored = storage.get_job(&job_code, &cancel_token).await?;
         assert_eq!(stored.iter_num(), 1, "the refused iteration must not be stored");
         assert_eq!(*stored.status(), JobStatus::Completed, "got: {}", stored.status());
+        Ok(())
+    }
+
+    /// Code of the task every job built by [`job_running`] holds, which is the result the double
+    /// below plants its blocked task ahead of.
+    const RUNNING_TASK_CODE: &str = "cancelled";
+
+    /// A merge that leaves the iteration unable to progress must not cost the result it carried: the
+    /// task the executor finished is written and the iteration is left open for a later pass to
+    /// answer for. Dropping the save instead would leave the task `Started` in storage, for takeover
+    /// after takeover to repeat work that was already done. The repeated write is measured like any
+    /// other retry after a conflict, since the write is repeated for the same reason.
+    ///
+    /// Two breaks prove it: propagating the deadlock with `?` from the merge handler in
+    /// `Worker::execute_task` loses the result, and recording the conflict retry in the `Ok(())` arm
+    /// alone leaves this path unmeasured.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_merge_that_leaves_the_iteration_deadlocked_keeps_the_result_it_carried()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let job_def = job_running(
+            "deadlocked_merge_job",
+            UNCANCELLED_TASK_TIMEOUT,
+            task_fn(|_ctx| async { Ok(TaskOutcome::empty()) }),
+        );
+        let job_code = job_def.code().clone();
+        let inner: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
+        let storage = Arc::new(DeadlockPlantingStorage::new(
+            Arc::clone(&inner),
+            TaskCode::new("orphan"),
+            TaskCode::new(RUNNING_TASK_CODE),
+        ));
+        let metrics = Arc::new(CountingMetrics::default());
+        let worker = worker_measured_by(
+            job_def,
+            Arc::clone(&storage) as Arc<dyn Storage>,
+            Arc::clone(&metrics) as Arc<dyn MetricsSink>,
+        )?;
+        let cancel_token = CancellationToken::new();
+
+        let outcome = tokio::time::timeout(PROGRESS_TIMEOUT, worker.process_job(&job_code, &cancel_token))
+            .await
+            .map_err(|_| "a deadlocked merge must be retried once, not forever")?;
+
+        assert_eq!(outcome, JobPassOutcome::Processed);
+        assert_eq!(
+            storage.interferences(),
+            1,
+            "the fixture must have planted the blocked task ahead of the save carrying the result"
+        );
+        assert_eq!(
+            metrics.save_conflict_retries(),
+            1,
+            "the write repeated after the deadlocked merge is a conflict retry"
+        );
+
+        let stored = inner.get_job(&job_code, &cancel_token).await?;
+        assert_eq!(
+            *stored.status(),
+            JobStatus::Running,
+            "an iteration nothing can move stays open, got: {}",
+            stored.status()
+        );
+        let processed = stored
+            .tasks_as_iter()
+            .find(|task| task.code().as_str() == RUNNING_TASK_CODE)
+            .ok_or("the stored iteration must still hold the task the executor ran")?;
+        assert!(
+            processed.is_completed(),
+            "the result the merge carried must be stored, got status {}",
+            processed.status()
+        );
+        let planted = stored
+            .tasks_as_iter()
+            .find(|task| task.code() == storage.planted_task_code())
+            .ok_or("the merge must keep the stored task that deadlocked the iteration")?;
+        assert_eq!(*planted.status(), TaskStatus::Blocked, "got: {}", planted.status());
         Ok(())
     }
 
@@ -1892,9 +2111,9 @@ mod tests {
         let task = job.tasks_as_iter().next().expect("the iteration must still hold its task");
         assert!(task.is_failed(), "got status {}", task.status());
         assert!(
-            task.error_msg().contains("without a cancellation"),
+            task.resolution_reason().contains("without a cancellation"),
             "got: {}",
-            task.error_msg()
+            task.resolution_reason()
         );
     }
 }

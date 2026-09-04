@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use jobmanager::prelude::*;
-use jobmanager::{JobStatus, MetricsSink, TaskStatus};
+use jobmanager::{IterationVerdict, MetricsSink, TaskResolution};
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 use uuid::Uuid;
@@ -42,11 +42,11 @@ const WORK_DURATION: Duration = Duration::from_millis(200);
 struct LoggingMetrics;
 
 impl MetricsSink for LoggingMetrics {
-    fn record_job_iteration_complete(&self, code: &JobCode, status: &JobStatus, duration: StdDuration) {
+    fn record_job_iteration_complete(&self, code: &JobCode, verdict: IterationVerdict, duration: StdDuration) {
         tracing::info!(
             metric = "job_iteration",
             job = %code,
-            status = %status,
+            status = %verdict,
             millis = duration.as_millis(),
         );
     }
@@ -55,14 +55,14 @@ impl MetricsSink for LoggingMetrics {
         &self,
         job_code: &JobCode,
         task_code: &TaskCode,
-        status: &TaskStatus,
+        resolution: TaskResolution,
         duration: StdDuration,
     ) {
         tracing::info!(
             metric = "task_processed",
             job = %job_code,
             task = %task_code,
-            status = %status,
+            status = %resolution,
             millis = duration.as_millis(),
         );
     }

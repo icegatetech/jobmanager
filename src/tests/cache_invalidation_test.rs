@@ -47,7 +47,7 @@ async fn test_cache_invalidation() -> Result<(), Box<dyn std::error::Error>> {
     )?
     .with_max_iterations(1)?;
     let mut job = Job::new(&job_def, HashMap::new(), worker_id)?;
-    job.work(&worker_id)?;
+    job.start_work(&worker_id)?;
 
     // A write that bypasses the cache, as another worker's would.
     storage.save_job(&mut job, &cancel_token).await?;
@@ -133,7 +133,7 @@ async fn a_cache_hit_returns_the_job_the_worker_saved() -> Result<(), Box<dyn st
         .first()
         .ok_or("the description declares one task")?
         .id();
-    job.work(&worker_id)?;
+    job.start_work(&worker_id)?;
     job.start_task(&parent_id, worker_id)?;
     let child_id = job.add_task(
         &TaskDefinition::new(TaskCode::from("planned"), Duration::from_secs(5)),

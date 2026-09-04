@@ -45,6 +45,9 @@ second run would find the iteration budget already spent and wait forever.
 | [`idempotent_task`](idempotent_task.rs) | A deadline stops nobody: the takeover, and the guard the side effect needs. |
 | [`graceful_shutdown`](graceful_shutdown.rs) | Selecting on the cancellation token, and `TaskOutcome::Cancelled`. |
 | [`attempt_budget`](attempt_budget.rs) | An attempt budget running out, and the replan that follows. |
+| [`terminal_failure`](terminal_failure.rs) | `TaskOutcome::TerminallyFailed`: a refusal no retry can turn into a success, executed once. |
+| [`skipped_branch`](skipped_branch.rs) | `TaskOutcome::SkippedBranch`: a branch with no work in it, and the iteration that still completes. |
+| [`degraded_dependency`](degraded_dependency.rs) | `with_dependency_tolerance`: starting on a dependency that failed for good, and reading what it left. |
 | [`adaptive_schedule`](adaptive_schedule.rs) | `set_next_start_at` pulling the next iteration in or pushing it out. |
 
 `simple_job`, `simple_job_cbor`, `simple_sequence_job`, `chained_job` and `distributed_workers` model

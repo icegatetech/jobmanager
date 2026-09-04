@@ -1,11 +1,16 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::core::task::{TaskAvailability, TaskRefKind};
-use crate::{Error, ImmutableTask, JobError, Task, TaskCode, TaskDefinition, TaskExecutor, TaskRef, TaskStatus};
+use crate::core::task::{DependencyVerdict, SkipCause, TaskAvailability, TaskRefKind};
+use crate::{
+    Error, ImmutableTask, JobError, Task, TaskCode, TaskDefinition, TaskExecutor, TaskRef, TaskRetry, TaskStatus,
+};
 
 /// Job identifier used to select a job definition and persisted state.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -51,7 +56,7 @@ impl From<&str> for JobCode {
 /// Job lifecycle state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum JobStatus {
+pub(crate) enum JobStatus {
     /// New job created or new iteration started - tasks can be picked up for work.
     ///
     /// Entry state of every iteration. May move to `Running` or `Failed`.
@@ -61,7 +66,11 @@ pub enum JobStatus {
     /// Self-transition is legal, so a second worker picking up the same job does not fail.
     /// May move to `Completed` or `Failed`.
     Running,
-    /// Job completed successfully: every task of the iteration reached `TaskStatus::Completed`.
+    /// The iteration ended with no failure left unhandled.
+    ///
+    /// It does not mean every task completed: an iteration reaches this status while holding tasks
+    /// that were skipped, and a task that failed for good where a dependent declared it survives
+    /// one and resolved on its own.
     ///
     /// Terminal for the iteration; the only way out is back to `Started` when the next
     /// iteration becomes due.
@@ -69,9 +78,11 @@ pub enum JobStatus {
     /// The iteration ended in failure.
     ///
     /// Terminal for the iteration in the same way as `Completed`, and re-enterable only via
-    /// `Started`. A failed *task* moves the iteration here only once it has run out of either limit -
-    /// its attempt budget or its maximum lifetime - and nothing else is executing: until then it
-    /// stays pickable and is retried within the same iteration.
+    /// `Started`. A failed *task* moves the iteration here only once it is terminal - its attempt
+    /// budget or its maximum lifetime spent, or the refusal declared final by its executor - and
+    /// nothing else is executing: until then it stays pickable and is retried within the same
+    /// iteration. A terminal failure nobody answered for ends the iteration here wherever it
+    /// surfaces: on the task that refused, or on a task skipped because of it.
     Failed,
 }
 
@@ -82,6 +93,43 @@ impl std::fmt::Display for JobStatus {
             Self::Running => write!(f, "running"),
             Self::Completed => write!(f, "completed"),
             Self::Failed => write!(f, "failed"),
+        }
+    }
+}
+
+/// How a job iteration ended.
+///
+/// Narrower than the job's own state: the states an iteration passes through while it is open are
+/// not verdicts, and only a verdict is measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IterationVerdict {
+    /// The iteration ended with no failure left unhandled.
+    Completed,
+    /// The iteration ended with a failure nobody answered for.
+    Failed,
+}
+
+impl IterationVerdict {
+    /// Label this verdict is measured under.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl std::fmt::Display for IterationVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<IterationVerdict> for JobStatus {
+    fn from(verdict: IterationVerdict) -> Self {
+        match verdict {
+            IterationVerdict::Completed => Self::Completed,
+            IterationVerdict::Failed => Self::Failed,
         }
     }
 }
@@ -120,10 +168,10 @@ pub(crate) enum TaskPickup {
     /// Nothing can be started right now: the remaining tasks are either
     /// in flight or blocked behind tasks that are still running.
     Waiting,
-    /// The iteration cannot progress because tasks ran out of their attempt budget or of their
-    /// maximum lifetime; the job has been moved to [`JobStatus::Failed`]. The caller must persist
-    /// the job so the scheduler starts the next iteration, which replans from scratch.
-    Exhausted,
+    /// The iteration was closed by the verdict the domain settled it with, which the job itself
+    /// now carries. The caller must persist the job so the scheduler starts the next iteration,
+    /// which replans from scratch.
+    IterationSettled,
 }
 
 /// What a job's state allows to be done about its next iteration.
@@ -442,15 +490,25 @@ impl JobDefinition {
     ///
     /// Returns [`Error::Other`] if an initial task depends on a task of another description or on
     /// one created at runtime, if a positional reference names a position the description does not
-    /// have, or if the references form a cycle - any of which would leave a task waiting for
-    /// something that never completes.
+    /// have, if the references form a cycle - any of which would leave a task waiting for
+    /// something that never completes - or if a task declares a dependency tolerance while
+    /// depending on nothing.
+    ///
+    /// The tolerance is checked here rather than in [`TaskDefinition::validate`] because the
+    /// dependencies of an initial task are still being assembled at that point: `JobBuilder` is a
+    /// second channel for declaring them, and they are merged in afterwards.
     fn validate_initial_task_dependencies(
         id: JobDefinitionId,
         job_code: &JobCode,
         initial_tasks: &[TaskDefinition],
     ) -> Result<(), Error> {
         let mut positions_by_task = Vec::with_capacity(initial_tasks.len());
-        for task in initial_tasks {
+        for (position, task) in initial_tasks.iter().enumerate() {
+            if !task.is_declares_tolerance_valid() {
+                return Err(Error::Other(format!(
+                    "job '{job_code}' initial task {position}: dependency tolerance without dependencies"
+                )));
+            }
             let mut positions = Vec::with_capacity(task.depends_on().len());
             for dependency in task.depends_on() {
                 positions.push(Self::resolve_initial_position(
@@ -555,6 +613,15 @@ impl JobDefinition {
 
         None
     }
+}
+
+/// A blocked task the cascade is about to put out, and what put it out.
+struct UnreachableTask {
+    task_id: Uuid,
+    /// Cause this task hands down to whatever waits on it.
+    cause: SkipCause,
+    /// Dependency the cause was read from, which is what the recorded reason names.
+    dependency_id: Uuid,
 }
 
 #[derive(Clone)]
@@ -716,6 +783,7 @@ impl Job {
     /// # Errors
     ///
     /// Returns [`JobError::Other`] if `task_def` does not pass the job's limits, if it declares a
+    /// dependency tolerance while depending on nothing, if it declares a
     /// dependency on a task the iteration does not hold, if it names an initial task by position -
     /// a task created at runtime lies outside the job description those positions belong to - or if
     /// the execution named by `created_by_task` already failed its own task. That last one is what
@@ -730,6 +798,13 @@ impl Job {
         created_by_task: Option<Uuid>,
     ) -> Result<Uuid, JobError> {
         task_def.validate(self.task_limits)?;
+
+        if !task_def.is_declares_tolerance_valid() {
+            return Err(JobError::Other(format!(
+                "task '{}' declares a dependency tolerance without dependencies",
+                task_def.code()
+            )));
+        }
 
         if let Some(parent_id) = created_by_task {
             let parent = self.get_task_arc(&parent_id)?;
@@ -777,9 +852,17 @@ impl Job {
         Ok(())
     }
 
-    pub(crate) fn complete_task(&mut self, task_id: &Uuid, output: Vec<u8>) -> Result<(), JobError> {
+    /// Stores `output` as the result of `task_id` on behalf of `worker_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::TaskNotFound`] if the job does not hold the task,
+    /// [`JobError::TaskWorkerMismatch`] if another worker holds it, or [`JobError::Other`] if the
+    /// output exceeds the job's limits or the task is not in a state that can complete.
+    pub(crate) fn complete_task(&mut self, task_id: &Uuid, output: Vec<u8>, worker_id: Uuid) -> Result<(), JobError> {
         Self::validate_task_output(&output, self.task_limits)?;
         let task_arc = self.get_task_arc_mut(task_id)?;
+        Self::check_task_owner(task_arc, worker_id)?;
 
         let task = Arc::make_mut(task_arc);
         task.complete(output)
@@ -789,81 +872,66 @@ impl Job {
     /// maximum lifetime on the way.
     pub(crate) fn pick_task_to_execute(&mut self, worker_id: &Uuid) -> Result<TaskPickup, JobError> {
         if !matches!(self.status, JobStatus::Running) {
-            self.work(worker_id)?;
+            self.start_work(worker_id)?;
         }
 
+        // TODO(med): optimize task iterations
         // TODO(low): with a large number of tasks in the job, iteration can add overhead. Solution: pending tasks can be cached.
-        // Since map iteration is randomized, no additional randomization is needed.
-        let mut blocked_to_unblock: Option<Uuid> = None;
-        let mut expired_to_fail: Vec<Uuid> = Vec::new();
-        for (task_id, task_arc) in &self.tasks_by_id {
-            let status = task_arc.status();
 
-            match status {
-                TaskStatus::Completed => {}
-                TaskStatus::Blocked => {
-                    if !self.dependencies_satisfied(task_arc.as_ref()) {
-                        continue;
-                    }
-                    blocked_to_unblock = Some(*task_id);
-                    break;
-                }
-                TaskStatus::Todo | TaskStatus::Failed | TaskStatus::Started => match task_arc.check_availability() {
-                    TaskAvailability::Pickable => return Ok(TaskPickup::Ready(*task_id)),
-                    TaskAvailability::ExpiredPastLifetime => expired_to_fail.push(*task_id),
-                    TaskAvailability::Unavailable => {}
-                },
-            }
+        self.fail_tasks_by_lifetime()?;
+
+        // The state as it stands may already hold work; only if it does not is anything derived.
+        if let Some(task_id) = self.find_pickable_task() {
+            return Ok(TaskPickup::Ready(task_id));
         }
 
-        // This mutates task state only; the iteration verdict below (`has_terminally_failed_task`)
-        // then sees them as terminal and ends the iteration as Failed. The verdict may not be
-        // reached in this pass - another task still in flight ends it as Waiting, which the worker
-        // does not persist - so the failure is re-derived on a later pass rather than guaranteed
-        // here.
+        // Settling applies the cascade and the unblocking, so work that appears through them is
+        // found by the second look rather than waiting for the next pass. A deadlock surfaces from
+        // there as an error.
+        if self.try_settle_iteration(worker_id)? {
+            return Ok(TaskPickup::IterationSettled);
+        }
+
+        if let Some(task_id) = self.find_pickable_task() {
+            return Ok(TaskPickup::Ready(task_id));
+        }
+
+        Ok(TaskPickup::Waiting)
+    }
+
+    /// Identifier of a task a worker may start right now, if the iteration holds one.
+    ///
+    /// Map iteration is randomized, which is what spreads the workers of a pool over the tasks
+    /// they could all pick.
+    fn find_pickable_task(&self) -> Option<Uuid> {
+        let now = Utc::now();
+        self.tasks_by_id
+            .iter()
+            .find(|(_, task)| task.can_be_picked_up_at(now))
+            .map(|(task_id, _)| *task_id)
+    }
+
+    /// Fails every task that outlived its maximum lifetime, which is the one resolution a worker
+    /// writes on behalf of an execution it does not hold.
+    fn fail_tasks_by_lifetime(&mut self) -> Result<(), JobError> {
+        let now = Utc::now();
+        let expired_to_fail: Vec<Uuid> = self
+            .tasks_by_id
+            .iter()
+            .filter(|(_, task)| matches!(task.check_availability_at(now), TaskAvailability::ExpiredPastLifetime))
+            .map(|(task_id, _)| *task_id)
+            .collect();
+
         for task_id in expired_to_fail {
             let task_arc = self.get_task_arc_mut(&task_id)?;
             let task = Arc::make_mut(task_arc);
             let error_msg = Self::describe_outlived_lifetime(task);
-            task.fail(&error_msg)?;
+            // The task is terminal because its lifetime ran out, not because anyone ruled the
+            // refusal out: the executor never got to say anything about this one.
+            task.fail(&error_msg, TaskRetry::WhileBudgetLasts)?;
         }
 
-        if let Some(task_id) = blocked_to_unblock {
-            let task_arc = self.get_task_arc_mut(&task_id)?;
-            let task = Arc::make_mut(task_arc);
-            task.unblock();
-            if task.can_be_picked_up() {
-                return Ok(TaskPickup::Ready(task_id));
-            }
-        }
-
-        if self.all_tasks_completed() {
-            return Err(JobError::Other(format!(
-                "wrong running job {} state - all tasks complete",
-                self.code
-            )));
-        }
-
-        // Tasks that spent either limit can never run again, and neither can whatever
-        // is blocked behind them. Wait while another task is still in flight (it may
-        // yet unblock work), otherwise end the iteration: the next scheduled one
-        // replans from scratch, which is what keeps a permanently failing task from
-        // blocking its dependents forever.
-        if !self.has_started_task() {
-            if self.has_terminally_failed_task() {
-                self.fail(worker_id)?;
-                return Ok(TaskPickup::Exhausted);
-            }
-
-            if self.is_deadlocked() {
-                return Err(JobError::Other(format!(
-                    "job {} deadlock: blocked tasks with unmet dependencies",
-                    self.code
-                )));
-            }
-        }
-
-        Ok(TaskPickup::Waiting)
+        Ok(())
     }
 
     // Accessors
@@ -926,8 +994,17 @@ impl Job {
     }
 
     // State checks
+    /// The verdict this iteration ended with, or `None` while it is still open.
+    pub(crate) const fn iteration_verdict(&self) -> Option<IterationVerdict> {
+        match self.status {
+            JobStatus::Completed => Some(IterationVerdict::Completed),
+            JobStatus::Failed => Some(IterationVerdict::Failed),
+            JobStatus::Started | JobStatus::Running => None,
+        }
+    }
+
     pub(crate) const fn is_processed(&self) -> bool {
-        matches!(self.status, JobStatus::Completed | JobStatus::Failed)
+        self.iteration_verdict().is_some()
     }
 
     pub(crate) const fn is_ready_for_processing(&self) -> bool {
@@ -1019,33 +1096,133 @@ impl Job {
         Ok(())
     }
 
-    pub(crate) fn work(&mut self, worker_id: &Uuid) -> Result<(), JobError> {
+    pub(crate) fn start_work(&mut self, worker_id: &Uuid) -> Result<(), JobError> {
         self.status.transition_to(JobStatus::Running)?;
         self.updated_by_worker_id = *worker_id;
         self.running_at = Some(Utc::now());
         Ok(())
     }
 
-    pub(crate) fn try_to_complete(&mut self, worker_id: &Uuid) -> Result<bool, JobError> {
-        if !self.all_tasks_completed() {
+    /// Applies what the state implies and closes the iteration if it cannot progress, answering
+    /// whether it is closed.
+    ///
+    /// Three steps in one place, because they answer one question: what is left to do with this
+    /// iteration. The cascade and the unblocking run first, so the verdict judges the state they
+    /// leave.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::IterationDeadlock`] if nothing can move and tasks are still unresolved -
+    /// a task waiting on a dependency the iteration does not hold - and the errors of the transition
+    /// it makes; an iteration is never assigned a status directly, so an iteration that is already
+    /// closed is refused here rather than judged a second time.
+    pub(crate) fn try_settle_iteration(&mut self, worker_id: &Uuid) -> Result<bool, JobError> {
+        // TODO(med): optimize task iterations
+        // One reading of the clock for the whole verdict. Taken apart, a lifetime running out
+        // between the cascade and the pickability check leaves a dependency still coming for the
+        // first and unreachable for the second, and the iteration is reported as a deadlock.
+        let now = Utc::now();
+        self.skip_unreachable_tasks(now)?;
+        self.unblock_satisfied_tasks(now)?;
+
+        if self.has_started_task() || self.tasks_as_iter().any(|task| task.can_be_picked_up_at(now)) {
             return Ok(false);
         }
 
-        self.status.transition_to(JobStatus::Completed)?;
+        // Nothing runs and nothing can be picked up. Either every task has settled - and the
+        // verdict below says how - or something is still waiting for a dependency no cascade can
+        // reach, which is a job whose description sent a task after a task the iteration does not
+        // hold.
+        if !self.all_tasks_resolved() {
+            return Err(JobError::IterationDeadlock {
+                job_code: self.code.clone(),
+                tasks: self.tasks_as_string(),
+            });
+        }
+
+        self.status.transition_to(self.derive_iteration_verdict(now).into())?;
         self.updated_by_worker_id = *worker_id;
         self.completed_at = Some(Utc::now());
 
         Ok(true)
     }
 
-    pub(crate) fn fail(&mut self, worker_id: &Uuid) -> Result<(), JobError> {
-        self.status.transition_to(JobStatus::Failed)?;
-        self.updated_by_worker_id = *worker_id;
-        self.completed_at = Some(Utc::now());
+    /// The verdict this iteration has earned: `Failed` where a failure was left for nobody to
+    /// handle, `Completed` otherwise.
+    ///
+    /// A failure takes two shapes: a task that failed with no dependent declaring it survives one,
+    /// and a task put out because something it needed failed. The second is that failure surfacing
+    /// further down the graph, which is why a decision to skip does not count here.
+    ///
+    /// The failures are struck off by whoever handled them rather than each of them asking every
+    /// task in turn, which is what keeps this linear in the size of the graph.
+    fn derive_iteration_verdict(&self, now: DateTime<Utc>) -> IterationVerdict {
+        // TODO(med): optimize task iterations
+        let mut unhandled_failures: HashSet<Uuid> = HashSet::new();
+        for task in self.tasks_as_iter() {
+            if task.skip_cause().is_some_and(SkipCause::carries_failure) {
+                return IterationVerdict::Failed;
+            }
+            if task.is_terminally_failed_at(now) {
+                unhandled_failures.insert(*task.id());
+            }
+        }
+        if unhandled_failures.is_empty() {
+            return IterationVerdict::Completed;
+        }
+
+        for task in self.tasks_as_iter() {
+            // A dependent handles a failure only by answering for it: one that failed itself did
+            // not survive what it declared it survives, and one the cascade put out never looked.
+            let has_resolved_itself = task.is_completed() || task.skip_cause() == Some(SkipCause::ExecutorDecision);
+            if !task.tolerance().allows_failed || !has_resolved_itself {
+                continue;
+            }
+            for dependency_id in task.depends_on() {
+                unhandled_failures.remove(dependency_id);
+            }
+        }
+
+        if unhandled_failures.is_empty() {
+            IterationVerdict::Completed
+        } else {
+            IterationVerdict::Failed
+        }
+    }
+
+    /// Unblocks every task whose dependencies have settled the way it accepts.
+    fn unblock_satisfied_tasks(&mut self, now: DateTime<Utc>) -> Result<(), JobError> {
+        let tasks_to_unblock: Vec<Uuid> = self
+            .tasks_by_id
+            .values()
+            .filter(|task| matches!(task.status(), TaskStatus::Blocked) && self.dependencies_satisfied(task, now))
+            .map(|task| *task.id())
+            .collect();
+
+        for task_id in tasks_to_unblock {
+            let task_arc = self.get_task_arc_mut(&task_id)?;
+            Arc::make_mut(task_arc).unblock();
+        }
+
         Ok(())
     }
 
-    // Merging. Call this method when worker picked and started a task but failed to save due to conflict.
+    /// Carries the task this worker started onto the state that won the race.
+    ///
+    /// What released the task was derived on the copy that lost: a task past its maximum lifetime is
+    /// failed by whoever looks at it, and the branches that failure puts out follow from it alone,
+    /// so neither is part of any other copy of the job. Both are therefore derived again here,
+    /// before the picked task is carried over - a dependent released against a dependency this state
+    /// still shows running would read neither a result nor a failure, and take its degraded path
+    /// against work in flight.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::TaskWorkerMismatch`] if another worker owns the task in the state merged
+    /// into, [`JobError::TaskNotFound`] if that state does not hold the task, and
+    /// [`JobError::Other`] if the two states belong to different jobs, if the task this worker
+    /// carries is not started, or if the status it carries is one the state merged into cannot move
+    /// to.
     pub(crate) fn merge_with_picked_task(
         &mut self,
         worker_job: &Self,
@@ -1076,6 +1253,11 @@ impl Job {
             ))
         })?;
 
+        // Derived after the transition above, which is what refuses an iteration already answered
+        // for: neither this failure nor the cascade it feeds belongs in one.
+        self.fail_tasks_by_lifetime()?;
+        self.skip_unreachable_tasks(Utc::now())?;
+
         self.tasks_by_id.insert(*task_id, Arc::clone(worker_task));
         self.updated_by_worker_id = *worker_id;
         if self.running_at.is_none() {
@@ -1085,7 +1267,22 @@ impl Job {
         Ok(())
     }
 
-    // Merging with saved state. Call this method after worker handled a task to merge saved state with worker state.
+    /// Carries the result this worker holds onto the state that was stored, and derives the
+    /// iteration's verdict again on what the two make together.
+    ///
+    /// The verdict the worker reached on the copy that lost the race is left behind rather than
+    /// carried: that copy never saw the tasks the stored state holds. A task another worker created
+    /// through [`JobHandle::add_task`](crate::JobHandle::add_task) would stay `Todo` inside an
+    /// iteration closed over a state that did not hold it, and it would never run - the next poll
+    /// reads [`Self::pick_iteration_step`] and moves the job to an iteration planned from scratch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::TaskWorkerMismatch`] if another worker owns the task in the stored state,
+    /// [`JobError::IterationAlreadySettled`] if the stored iteration is closed - it takes no result,
+    /// and the worker that closed it answers for it - [`JobError::TaskNotFound`] if the stored state
+    /// does not hold the task, and the errors of [`Self::try_settle_iteration`]. A deadlock leaves
+    /// the carried result in place: the state is merged before the verdict is derived.
     pub(crate) fn merge_with_processed_task(
         &mut self,
         worker_job: &Self,
@@ -1101,11 +1298,11 @@ impl Job {
 
         self.check_task_stolen(task_id, worker_id)?;
 
-        self.status.transition_to(worker_job.status.clone()).map_err(|e| {
-            // TODO(low): its may be ok when job was already saved as completed, but current worker is late with
-            // failed task (current worker job status is running)
-            JobError::Other(format!("merge job '{}' status failed: {}", self.code, e))
-        })?;
+        if self.is_processed() {
+            return Err(JobError::IterationAlreadySettled {
+                job_code: self.code.clone(),
+            });
+        }
 
         // The worker's copy is a snapshot from the moment it read the job, so it may only overwrite
         // what this worker changed since. Task by task:
@@ -1128,8 +1325,11 @@ impl Job {
         }
 
         self.updated_by_worker_id = *worker_id;
-        if let Some(completed) = worker_job.completed_at {
-            self.completed_at = Some(completed);
+        // The iteration is being worked on, whatever the stored state was written under; `work`
+        // comes first because it stamps `running_at` with the current moment and the worker's own
+        // moment is the one to keep.
+        if !matches!(self.status, JobStatus::Running) {
+            self.start_work(worker_id)?;
         }
         if let Some(running) = worker_job.running_at {
             self.running_at = Some(running);
@@ -1137,6 +1337,10 @@ impl Job {
         if let Some(next_start_at) = worker_job.next_start_at {
             self.next_start_at = Some(next_start_at);
         }
+
+        // The moment an iteration closed belongs to the state that closed it, so it is recorded by
+        // the settling below rather than carried over from the copy that lost the race.
+        self.try_settle_iteration(worker_id)?;
 
         Ok(())
     }
@@ -1167,22 +1371,52 @@ impl Job {
     /// an execution whose own task already failed, so nothing can be attributed to this one
     /// afterwards.
     ///
+    /// `retry` says whether the refusal is one worth repeating: under [`TaskRetry::Never`] the task
+    /// is terminal at once, whatever is left of its attempt budget and its maximum lifetime.
+    ///
     /// # Errors
     ///
-    /// Returns [`JobError::TaskNotFound`] if the job does not hold `task_id`, or [`JobError::Other`]
+    /// Returns [`JobError::TaskNotFound`] if the job does not hold `task_id`,
+    /// [`JobError::TaskWorkerMismatch`] if another worker holds the task, or [`JobError::Other`]
     /// if the task is not in a state that can fail. Either way the iteration is left as it was - the
     /// rollback follows the failure rather than preceding it.
-    pub(crate) fn fail_task(&mut self, task_id: &Uuid, error_msg: &str) -> Result<usize, JobError> {
+    pub(crate) fn fail_task(
+        &mut self,
+        task_id: &Uuid,
+        error_msg: &str,
+        retry: TaskRetry,
+        worker_id: Uuid,
+    ) -> Result<usize, JobError> {
         {
             let task_arc = self.get_task_arc_mut(task_id)?;
-            Arc::make_mut(task_arc).fail(error_msg)?;
+            Self::check_task_owner(task_arc, worker_id)?;
+            Arc::make_mut(task_arc).fail(error_msg, retry)?;
         }
 
-        // TODO(med): limit the failure of someone else’s task by the worker
         let task_count_before = self.tasks_by_id.len();
         self.tasks_by_id.retain(|_, task| task.created_by_task() != Some(*task_id));
 
         Ok(task_count_before - self.tasks_by_id.len())
+    }
+
+    /// Skips `task_id` on the decision of the executor running it.
+    ///
+    /// Nothing is rolled back: a decision is not a refusal, so the work this execution registered
+    /// stays, and whatever depended on the skipped task is put out by the cascade instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::TaskNotFound`] if the job does not hold the task,
+    /// [`JobError::TaskWorkerMismatch`] if another worker holds it, or the errors of [`Task::skip`].
+    pub(crate) fn skip_task_by_executor(
+        &mut self,
+        task_id: &Uuid,
+        reason: &str,
+        worker_id: Uuid,
+    ) -> Result<(), JobError> {
+        let task_arc = self.get_task_arc_mut(task_id)?;
+        Self::check_task_owner(task_arc, worker_id)?;
+        Arc::make_mut(task_arc).skip(reason, SkipCause::ExecutorDecision)
     }
 
     /// Records that the execution holding `task_id` ended in failure, failing the task unless its
@@ -1200,12 +1434,18 @@ impl Job {
     ///
     /// Returns [`JobError::TaskNotFound`] if the job does not hold `task_id`, or the errors of
     /// [`Self::fail_task`] for a task that is still open.
-    pub(crate) fn record_task_execution_failure(&mut self, task_id: &Uuid, error_msg: &str) -> Result<usize, JobError> {
+    pub(crate) fn record_task_execution_failure(
+        &mut self,
+        task_id: &Uuid,
+        error_msg: &str,
+        retry: TaskRetry,
+        worker_id: Uuid,
+    ) -> Result<usize, JobError> {
         if self.find_task(task_id)?.is_resolved() {
             return Ok(0);
         }
 
-        self.fail_task(task_id, error_msg)
+        self.fail_task(task_id, error_msg, retry, worker_id)
     }
 
     /// Borrows the task `task_id` names in the full domain state the crate works with, as opposed to
@@ -1252,14 +1492,111 @@ impl Job {
         summary
     }
 
-    pub(crate) fn all_tasks_completed(&self) -> bool {
-        !self.tasks_by_id.is_empty() && self.tasks_by_id.values().all(|task| task.is_completed())
+    /// Whether the iteration holds tasks and every one of them has reached a terminal state -
+    /// completed, failed or skipped.
+    pub(crate) fn all_tasks_resolved(&self) -> bool {
+        !self.tasks_by_id.is_empty() && self.tasks_by_id.values().all(|task| task.is_resolved())
     }
 
-    fn dependencies_satisfied(&self, task: &Task) -> bool {
+    /// Puts out every blocked task whose dependencies can no longer be satisfied, returning how
+    /// many were put out.
+    ///
+    /// The cascade runs whole, one generation at a time: the tasks put out in a generation are what
+    /// makes the next one unreachable. A generation is judged only once its predecessor has been
+    /// put out completely, because a task the cascade reaches along two branches has to take the
+    /// strongest cause of them - and that is what the iteration's verdict reads. Judging a
+    /// candidate as soon as one of its dependencies is skipped would make its cause depend on the
+    /// order the tasks happen to be visited in.
+    ///
+    /// Only the first generation looks at every task; each one after it looks at the dependents of
+    /// what was just put out, through an index of the blocked tasks built once per call.
+    fn skip_unreachable_tasks(&mut self, now: DateTime<Utc>) -> Result<usize, JobError> {
+        // TODO(med): optimize task iterations
+        let mut unreachable_tasks = self.find_unreachable_tasks(now);
+        if unreachable_tasks.is_empty() {
+            return Ok(0);
+        }
+
+        let dependents_by_dependency = self.index_blocked_dependents();
+        let mut skipped_count = 0;
+        while !unreachable_tasks.is_empty() {
+            for unreachable in &unreachable_tasks {
+                let reason = format!("dependency '{}' is unreachable", unreachable.dependency_id);
+                let task_arc = self.get_task_arc_mut(&unreachable.task_id)?;
+                Arc::make_mut(task_arc).skip(&reason, unreachable.cause)?;
+            }
+            skipped_count += unreachable_tasks.len();
+
+            let candidates: HashSet<Uuid> = unreachable_tasks
+                .iter()
+                .filter_map(|unreachable| dependents_by_dependency.get(&unreachable.task_id))
+                .flatten()
+                .copied()
+                .filter(|task_id| {
+                    self.tasks_by_id
+                        .get(task_id)
+                        .is_some_and(|task| matches!(task.status(), TaskStatus::Blocked))
+                })
+                .collect();
+
+            unreachable_tasks = candidates
+                .iter()
+                .filter_map(|task_id| self.tasks_by_id.get(task_id).map(AsRef::as_ref))
+                .filter_map(|task| self.find_unreachable_dependency_of(task, now))
+                .collect();
+        }
+
+        Ok(skipped_count)
+    }
+
+    /// Which blocked task waits for which dependency, for the cascade to walk the graph downwards.
+    fn index_blocked_dependents(&self) -> HashMap<Uuid, Vec<Uuid>> {
+        let mut dependents_by_dependency: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        for task in self.tasks_as_iter().filter(|task| matches!(task.status(), TaskStatus::Blocked)) {
+            for dependency_id in task.depends_on() {
+                dependents_by_dependency.entry(*dependency_id).or_default().push(*task.id());
+            }
+        }
+
+        dependents_by_dependency
+    }
+
+    /// Every blocked task the state already makes unreachable, which is the cascade's first
+    /// generation.
+    fn find_unreachable_tasks(&self, now: DateTime<Utc>) -> Vec<UnreachableTask> {
+        self.tasks_as_iter()
+            .filter(|task| matches!(task.status(), TaskStatus::Blocked))
+            .filter_map(|task| self.find_unreachable_dependency_of(task, now))
+            .collect()
+    }
+
+    /// The dependency that makes `task` unreachable, if any, and the cause it hands down. A failure
+    /// outranks a decision, so the scan reads every dependency rather than stopping at the first
+    /// hit.
+    fn find_unreachable_dependency_of(&self, task: &Task, now: DateTime<Utc>) -> Option<UnreachableTask> {
         task.depends_on()
             .iter()
-            .all(|dep_id| self.tasks_by_id.get(dep_id).is_some_and(|t| t.is_completed()))
+            .filter_map(|dependency_id| {
+                let dependency = self.tasks_by_id.get(dependency_id)?;
+                match task.judge_dependency(dependency, now) {
+                    DependencyVerdict::Skipped(cause) => Some(UnreachableTask {
+                        task_id: *task.id(),
+                        cause,
+                        dependency_id: *dependency_id,
+                    }),
+                    DependencyVerdict::Unblocked | DependencyVerdict::Blocked => None,
+                }
+            })
+            .max_by_key(|unreachable| unreachable.cause.carries_failure())
+    }
+
+    /// Whether every dependency of `task` has settled in a way `task` accepts.
+    fn dependencies_satisfied(&self, task: &Task, now: DateTime<Utc>) -> bool {
+        task.depends_on().iter().all(|dependency_id| {
+            self.tasks_by_id.get(dependency_id).is_some_and(|dependency| {
+                matches!(task.judge_dependency(dependency, now), DependencyVerdict::Unblocked)
+            })
+        })
     }
 
     /// Whether any task is currently being executed by a worker.
@@ -1267,18 +1604,6 @@ impl Job {
         self.tasks_by_id
             .values()
             .any(|task| matches!(task.status(), TaskStatus::Started))
-    }
-
-    /// Whether any task failed and ran out of either limit - its attempt budget or its maximum
-    /// lifetime - so it will never run again.
-    fn has_terminally_failed_task(&self) -> bool {
-        self.tasks_by_id.values().any(|task| task.is_terminally_failed())
-    }
-
-    fn is_deadlocked(&self) -> bool {
-        self.tasks_by_id
-            .values()
-            .any(|task| matches!(task.status(), TaskStatus::Blocked) && !self.dependencies_satisfied(task))
     }
 
     fn get_task_arc(&self, task_id: &Uuid) -> Result<&Arc<Task>, JobError> {
@@ -1292,8 +1617,14 @@ impl Job {
     fn check_task_stolen(&self, task_id: &Uuid, worker_id: &Uuid) -> Result<(), JobError> {
         // This validates the job fetched from storage.
         // If another worker already owns this task there, current worker must stop merging.
-        let exist_task = self.get_task_arc(task_id)?;
-        if exist_task.processing_by_worker().is_some() && exist_task.processing_by_worker() != Some(*worker_id) {
+        Self::check_task_owner(self.get_task_arc(task_id)?, *worker_id)
+    }
+
+    /// Refuses whatever `worker_id` is about to do with a task another worker holds: a resolution
+    /// written past the owner settles the iteration over work that owner is still doing, and the
+    /// result coming back then has nowhere to go.
+    fn check_task_owner(task: &Task, worker_id: Uuid) -> Result<(), JobError> {
+        if task.processing_by_worker().is_some_and(|owner| owner != worker_id) {
             return Err(JobError::TaskWorkerMismatch);
         }
 
@@ -1312,7 +1643,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::core::task::DEFAULT_MAX_ATTEMPTS;
+    use crate::DependencyTolerance;
+    use crate::core::task::{DEFAULT_MAX_ATTEMPTS, RestoredTask};
     use crate::{TaskOutcome, TaskRef, task_fn};
 
     fn noop_executor() -> Arc<dyn TaskExecutor> {
@@ -1356,6 +1688,79 @@ mod tests {
         .expect("the test description must be legal")
     }
 
+    /// Worker every fixture below is restored and settled by, so a test states an identity only
+    /// where two of them have to differ.
+    const WORKER_ID: Uuid = Uuid::from_u128(9);
+
+    /// How many times a test judges one graph when what it protects has to hold whichever order the
+    /// cascade happens to visit the tasks in. A cascade that took the first cause it met would have
+    /// to draw the same order this many times to pass.
+    const CASCADE_ORDER_DRAWS: usize = 20;
+
+    /// A running job holding `tasks`, which is the state the unblocking, the cascade and the
+    /// iteration verdict are all judged in.
+    fn running_job(tasks: Vec<Task>) -> Job {
+        restore_job(
+            Uuid::new_v4(),
+            JobStatus::Running,
+            tasks,
+            1,
+            Some(1),
+            None,
+            WORKER_ID,
+            Some(Utc::now()),
+            None,
+            None,
+            HashMap::new(),
+        )
+    }
+
+    /// A task that declares which unreachable dependencies it still starts on.
+    fn make_tolerant_task(id: Uuid, depends_on: Vec<Uuid>, tolerance: DependencyTolerance) -> Task {
+        let def = task_definition("dependent").with_dependency_tolerance(tolerance);
+        Task::new(id, WORKER_ID, None, &def, depends_on)
+    }
+
+    /// A task that failed and will never run again, its whole attempt budget spent.
+    fn make_terminally_failed_task(id: Uuid, code: &str) -> Task {
+        make_task_with_attempts(
+            id,
+            code,
+            TaskStatus::Failed,
+            Vec::new(),
+            DEFAULT_MAX_ATTEMPTS,
+            DEFAULT_MAX_ATTEMPTS,
+            Some(Duration::seconds(60)),
+        )
+    }
+
+    /// The fields every restored fixture below starts from: a task nobody has run yet, whose
+    /// bounds are the ones these tests place their moments against. Each fixture names only what
+    /// its own case is about and takes the rest from here.
+    fn restored_task_fields() -> RestoredTask {
+        RestoredTask {
+            id: Uuid::new_v4(),
+            code: TaskCode::new("task"),
+            status: TaskStatus::Todo,
+            processing_by_worker: None,
+            created_by_worker: Uuid::new_v4(),
+            timeout: Duration::seconds(5),
+            max_lifetime: Duration::seconds(25),
+            started_at: None,
+            completed_at: None,
+            deadline_at: None,
+            lifetime_deadline_at: None,
+            attempt: 0,
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            input: Vec::new(),
+            output: Vec::new(),
+            resolution_reason: String::new(),
+            retry: TaskRetry::WhileBudgetLasts,
+            tolerance: DependencyTolerance::default(),
+            depends_on: Vec::new(),
+        }
+    }
+
     fn make_task(id: Uuid, code: &str, status: TaskStatus, depends_on: Vec<Uuid>) -> Task {
         make_task_with_attempts(id, code, status, depends_on, 0, DEFAULT_MAX_ATTEMPTS, None)
     }
@@ -1374,25 +1779,16 @@ mod tests {
         max_attempts: u32,
         lifetime_left: Option<Duration>,
     ) -> Task {
-        Task::restore(
+        Task::restore(RestoredTask {
             id,
-            TaskCode::new(code),
+            code: TaskCode::new(code),
             status,
-            None,
-            Uuid::new_v4(),
-            Duration::seconds(5),
-            Duration::seconds(25),
-            None,
-            None,
-            None,
-            lifetime_left.map(|left| Utc::now() + left),
+            lifetime_deadline_at: lifetime_left.map(|left| Utc::now() + left),
             attempt,
             max_attempts,
-            Vec::new(),
-            Vec::new(),
-            String::new(),
             depends_on,
-        )
+            ..restored_task_fields()
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1426,6 +1822,15 @@ mod tests {
             iteration_interval,
             TaskLimits::default(),
         )
+    }
+
+    /// The label a consumer writes its dashboards and alerts against, read both by the metrics
+    /// attribute (`OtelMetrics`) and by `Display`. Stated literally rather than derived from the
+    /// variant, so renaming one fails here instead of silently in the consumer.
+    #[test]
+    fn an_iteration_verdict_is_measured_under_its_own_label() {
+        assert_eq!(IterationVerdict::Completed.as_str(), "completed");
+        assert_eq!(IterationVerdict::Failed.as_str(), "failed");
     }
 
     #[test]
@@ -1505,6 +1910,743 @@ mod tests {
         assert_eq!(commit_status, TaskStatus::Todo);
     }
 
+    /// A dependency that failed but may still run is not resolved: unblocking on it would send the
+    /// dependent into its degraded path while the data it wants is still coming.
+    #[test]
+    fn a_tolerant_task_waits_while_its_failed_dependency_may_still_run() {
+        let dependency = make_task_with_attempts(
+            Uuid::from_u128(1),
+            "dep",
+            TaskStatus::Failed,
+            Vec::new(),
+            1,
+            DEFAULT_MAX_ATTEMPTS,
+            Some(Duration::seconds(60)),
+        );
+        let dependent = make_tolerant_task(
+            Uuid::from_u128(2),
+            vec![Uuid::from_u128(1)],
+            DependencyTolerance {
+                allows_failed: true,
+                allows_skipped: false,
+            },
+        );
+        let mut job = running_job(vec![dependency, dependent]);
+
+        assert!(
+            !job.try_settle_iteration(&WORKER_ID).unwrap(),
+            "the iteration must stay open while the dependency can still run"
+        );
+        assert_eq!(
+            *job.find_task(&Uuid::from_u128(2)).unwrap().status(),
+            TaskStatus::Blocked,
+            "the dependent must stay blocked behind a refusal that may still be retried"
+        );
+    }
+
+    /// The dependency ran out of its budget, so it will never produce anything: the tolerant
+    /// dependent is what runs now.
+    #[test]
+    fn a_tolerant_task_starts_once_its_dependency_failed_for_good() {
+        let dependency = make_terminally_failed_task(Uuid::from_u128(1), "dep");
+        let dependent = make_tolerant_task(
+            Uuid::from_u128(2),
+            vec![Uuid::from_u128(1)],
+            DependencyTolerance {
+                allows_failed: true,
+                allows_skipped: false,
+            },
+        );
+        let mut job = running_job(vec![dependency, dependent]);
+
+        assert_eq!(
+            job.pick_task_to_execute(&WORKER_ID).unwrap(),
+            TaskPickup::Ready(Uuid::from_u128(2))
+        );
+    }
+
+    /// Tolerance is declared per state: one that survives a failure does not thereby survive a
+    /// decision to skip, so the cascade puts the dependent out rather than releasing it. The cause
+    /// it hands down is a decision and not a failure, which is why the iteration still completes.
+    #[test]
+    fn a_task_tolerating_only_a_failure_is_put_out_by_a_skipped_dependency() {
+        let mut dependency = make_task(Uuid::from_u128(1), "dep", TaskStatus::Blocked, Vec::new());
+        dependency.skip("pointless", SkipCause::ExecutorDecision).unwrap();
+        let dependent = make_tolerant_task(
+            Uuid::from_u128(2),
+            vec![Uuid::from_u128(1)],
+            DependencyTolerance {
+                allows_failed: true,
+                allows_skipped: false,
+            },
+        );
+        let mut job = running_job(vec![dependency, dependent]);
+
+        assert!(
+            job.try_settle_iteration(&WORKER_ID).unwrap(),
+            "the iteration must be settled"
+        );
+        assert_eq!(
+            job.find_task(&Uuid::from_u128(2)).unwrap().skip_cause(),
+            Some(SkipCause::SkippedDependency),
+            "the dependent must be put out as a task lost with the branch, not as a decision of its own"
+        );
+        assert_eq!(*job.status(), JobStatus::Completed);
+    }
+
+    /// The other half of the pair: a task that declared it survives a decision starts on one.
+    #[test]
+    fn a_task_tolerating_a_decision_starts_on_a_skipped_dependency() {
+        let mut dependency = make_task(Uuid::from_u128(1), "dep", TaskStatus::Blocked, Vec::new());
+        dependency.skip("pointless", SkipCause::ExecutorDecision).unwrap();
+        let dependent = make_tolerant_task(
+            Uuid::from_u128(2),
+            vec![Uuid::from_u128(1)],
+            DependencyTolerance {
+                allows_failed: false,
+                allows_skipped: true,
+            },
+        );
+        let mut job = running_job(vec![dependency, dependent]);
+
+        assert_eq!(
+            job.pick_task_to_execute(&WORKER_ID).unwrap(),
+            TaskPickup::Ready(Uuid::from_u128(2))
+        );
+    }
+
+    /// The cascade goes as far as the graph does: a decision at the root puts out everything
+    /// waiting behind it, one pass at a time.
+    #[test]
+    fn a_skipped_task_puts_out_the_chain_waiting_on_it() {
+        let mut root = make_task(Uuid::from_u128(1), "root", TaskStatus::Started, Vec::new());
+        root.skip("pointless", SkipCause::ExecutorDecision).unwrap();
+        let middle = make_task(
+            Uuid::from_u128(2),
+            "middle",
+            TaskStatus::Blocked,
+            vec![Uuid::from_u128(1)],
+        );
+        let leaf = make_task(
+            Uuid::from_u128(3),
+            "leaf",
+            TaskStatus::Blocked,
+            vec![Uuid::from_u128(2)],
+        );
+        let mut job = running_job(vec![root, middle, leaf]);
+
+        job.skip_unreachable_tasks(Utc::now()).unwrap();
+
+        assert!(job.find_task(&Uuid::from_u128(2)).unwrap().is_skipped());
+        assert!(job.find_task(&Uuid::from_u128(3)).unwrap().is_skipped());
+    }
+
+    /// The cause travels with the cascade, because that is what the iteration's verdict reads: a
+    /// task put out by a failure is that failure one step further down.
+    #[test]
+    fn the_cascade_carries_a_failure_as_the_cause() {
+        let dependency = make_terminally_failed_task(Uuid::from_u128(1), "dep");
+        let dependent = make_task(
+            Uuid::from_u128(2),
+            "dependent",
+            TaskStatus::Blocked,
+            vec![Uuid::from_u128(1)],
+        );
+        let mut job = running_job(vec![dependency, dependent]);
+
+        job.skip_unreachable_tasks(Utc::now()).unwrap();
+
+        assert_eq!(
+            job.find_task(&Uuid::from_u128(2)).unwrap().skip_cause(),
+            Some(SkipCause::FailedDependency)
+        );
+        // The task under test waits for exactly one dependency, so the identifier named is not a
+        // choice the visit order makes.
+        assert!(
+            job.find_task(&Uuid::from_u128(2))
+                .unwrap()
+                .resolution_reason()
+                .contains(&Uuid::from_u128(1).to_string()),
+            "the reason must name the dependency that put the task out, not the task itself"
+        );
+    }
+
+    /// A decision does not read as a failure two steps later, and it does not read as a decision
+    /// either: the task the cascade put out decided nothing, and telling the two apart is what
+    /// keeps it from answering for a failure it never looked at.
+    #[test]
+    fn the_cascade_carries_a_decision_down_as_a_skipped_dependency() {
+        let mut root = make_task(Uuid::from_u128(1), "root", TaskStatus::Started, Vec::new());
+        root.skip("pointless", SkipCause::ExecutorDecision).unwrap();
+        let dependent = make_task(
+            Uuid::from_u128(2),
+            "dependent",
+            TaskStatus::Blocked,
+            vec![Uuid::from_u128(1)],
+        );
+        let mut job = running_job(vec![root, dependent]);
+
+        job.skip_unreachable_tasks(Utc::now()).unwrap();
+
+        assert_eq!(
+            job.find_task(&Uuid::from_u128(1)).unwrap().skip_cause(),
+            Some(SkipCause::ExecutorDecision),
+            "the task that decided for itself keeps its own cause"
+        );
+        assert_eq!(
+            job.find_task(&Uuid::from_u128(2)).unwrap().skip_cause(),
+            Some(SkipCause::SkippedDependency)
+        );
+    }
+
+    /// The one cause that travels unchanged: a task two steps behind a failure is that failure
+    /// still, however many layers of the cascade it reached through. A task put out by a
+    /// dependency the cascade itself put out for a failure carries the failure, not the cascade.
+    #[test]
+    fn the_cascade_carries_a_failure_further_down() {
+        let failed = make_terminally_failed_task(Uuid::from_u128(1), "detect");
+        let middle = make_task(
+            Uuid::from_u128(2),
+            "middle",
+            TaskStatus::Blocked,
+            vec![Uuid::from_u128(1)],
+        );
+        let leaf = make_task(
+            Uuid::from_u128(3),
+            "leaf",
+            TaskStatus::Blocked,
+            vec![Uuid::from_u128(2)],
+        );
+        let mut job = running_job(vec![failed, middle, leaf]);
+
+        job.skip_unreachable_tasks(Utc::now()).unwrap();
+
+        assert_eq!(
+            job.find_task(&Uuid::from_u128(2)).unwrap().skip_cause(),
+            Some(SkipCause::FailedDependency),
+            "the first layer takes the cause from the failure itself"
+        );
+        assert_eq!(
+            job.find_task(&Uuid::from_u128(3)).unwrap().skip_cause(),
+            Some(SkipCause::FailedDependency),
+            "and the second takes it from a dependency that carries it"
+        );
+    }
+
+    /// The cascade goes on handing the same cause down: a task two steps behind a decision was put
+    /// out by the cascade just as its dependency was, and neither of them answers for anything.
+    #[test]
+    fn the_cascade_carries_a_skipped_dependency_further_down() {
+        let mut root = make_task(Uuid::from_u128(1), "root", TaskStatus::Started, Vec::new());
+        root.skip("pointless", SkipCause::ExecutorDecision).unwrap();
+        let middle = make_task(
+            Uuid::from_u128(2),
+            "middle",
+            TaskStatus::Blocked,
+            vec![Uuid::from_u128(1)],
+        );
+        let leaf = make_task(
+            Uuid::from_u128(3),
+            "leaf",
+            TaskStatus::Blocked,
+            vec![Uuid::from_u128(2)],
+        );
+        let mut job = running_job(vec![root, middle, leaf]);
+
+        job.skip_unreachable_tasks(Utc::now()).unwrap();
+
+        assert_eq!(
+            job.find_task(&Uuid::from_u128(3)).unwrap().skip_cause(),
+            Some(SkipCause::SkippedDependency)
+        );
+    }
+
+    /// A failure outranks a decision where both reach one task: the iteration has to speak about
+    /// the failure, and a cause that lost it would let the iteration pass as a success. Both orders
+    /// of the declaration, because a scan that stopped at the first unreachable dependency would
+    /// pass in one of them and fail in the other.
+    #[test]
+    fn a_failed_dependency_outranks_a_skipped_one_as_the_cause() {
+        for dependencies in [
+            vec![Uuid::from_u128(1), Uuid::from_u128(2)],
+            vec![Uuid::from_u128(2), Uuid::from_u128(1)],
+        ] {
+            let failed = make_terminally_failed_task(Uuid::from_u128(1), "failed");
+            let mut decided = make_task(Uuid::from_u128(2), "decided", TaskStatus::Started, Vec::new());
+            decided.skip("pointless", SkipCause::ExecutorDecision).unwrap();
+            let dependent = make_task(
+                Uuid::from_u128(3),
+                "dependent",
+                TaskStatus::Blocked,
+                dependencies.clone(),
+            );
+            let mut job = running_job(vec![failed, decided, dependent]);
+
+            job.skip_unreachable_tasks(Utc::now()).unwrap();
+
+            assert_eq!(
+                job.find_task(&Uuid::from_u128(3)).unwrap().skip_cause(),
+                Some(SkipCause::FailedDependency),
+                "declared as {dependencies:?}"
+            );
+        }
+    }
+
+    /// The same rule between generations of the cascade: the two dependencies of the task under
+    /// test are put out by the cascade itself, in one generation, and the task behind them takes the
+    /// stronger of the two causes. A candidate judged the moment one of its dependencies is skipped
+    /// would take whichever cause the visit order handed it first.
+    ///
+    /// The graph is judged [`CASCADE_ORDER_DRAWS`] times because that visit order is the iteration
+    /// order of a `HashMap`, which is drawn anew per run: one run of a cascade judging candidates
+    /// too early passes half the time, while the rule under test holds on every draw.
+    ///
+    /// The break that proves it: judging a candidate right after one of its dependencies is skipped,
+    /// instead of waiting for the generation to be put out whole.
+    #[test]
+    fn a_failure_outranks_a_decision_reaching_one_task_from_the_same_generation() {
+        for draw in 0..CASCADE_ORDER_DRAWS {
+            let mut decided = make_task(Uuid::from_u128(1), "decided", TaskStatus::Started, Vec::new());
+            decided.skip("pointless", SkipCause::ExecutorDecision).unwrap();
+            let failed = make_terminally_failed_task(Uuid::from_u128(2), "failed");
+            let skipped_branch = make_task(
+                Uuid::from_u128(3),
+                "skipped_branch",
+                TaskStatus::Blocked,
+                vec![Uuid::from_u128(1)],
+            );
+            let failed_branch = make_task(
+                Uuid::from_u128(4),
+                "failed_branch",
+                TaskStatus::Blocked,
+                vec![Uuid::from_u128(2)],
+            );
+            let dependent = make_task(
+                Uuid::from_u128(5),
+                "dependent",
+                TaskStatus::Blocked,
+                vec![Uuid::from_u128(3), Uuid::from_u128(4)],
+            );
+            let mut job = running_job(vec![decided, failed, skipped_branch, failed_branch, dependent]);
+
+            assert!(
+                job.try_settle_iteration(&WORKER_ID).unwrap(),
+                "the iteration must be settled"
+            );
+
+            assert_eq!(
+                job.find_task(&Uuid::from_u128(5)).unwrap().skip_cause(),
+                Some(SkipCause::FailedDependency),
+                "the task both branches reach must carry the failure, not the decision (draw {draw})"
+            );
+            assert_eq!(*job.status(), JobStatus::Failed);
+        }
+    }
+
+    /// The cascade stops where tolerance was declared: that task runs, which is the whole point of
+    /// declaring it.
+    #[test]
+    fn the_cascade_stops_at_a_tolerant_dependent() {
+        let mut root = make_task(Uuid::from_u128(1), "root", TaskStatus::Started, Vec::new());
+        root.skip("pointless", SkipCause::ExecutorDecision).unwrap();
+        let tolerant = make_tolerant_task(
+            Uuid::from_u128(2),
+            vec![Uuid::from_u128(1)],
+            DependencyTolerance {
+                allows_failed: false,
+                allows_skipped: true,
+            },
+        );
+        let mut job = running_job(vec![root, tolerant]);
+
+        assert_eq!(job.skip_unreachable_tasks(Utc::now()).unwrap(), 0);
+        assert!(!job.find_task(&Uuid::from_u128(2)).unwrap().is_skipped());
+    }
+
+    /// Both flags on one task, which is how the feature is meant to be declared: the task survives
+    /// a dependency that failed for good and one that was given up on, and runs on both. Two rules
+    /// have to agree for that - the cascade must leave it alone and the unblocking must release it -
+    /// and a task declaring one flag exercises neither of them against the other state.
+    #[test]
+    fn a_task_tolerating_both_states_starts_on_a_failed_and_a_skipped_dependency() {
+        let failed = make_terminally_failed_task(Uuid::from_u128(1), "detect");
+        let mut decided = make_task(Uuid::from_u128(2), "rules", TaskStatus::Started, Vec::new());
+        decided.skip("nothing to rule on", SkipCause::ExecutorDecision).unwrap();
+        let tolerant = make_tolerant_task(
+            Uuid::from_u128(3),
+            vec![Uuid::from_u128(1), Uuid::from_u128(2)],
+            DependencyTolerance {
+                allows_failed: true,
+                allows_skipped: true,
+            },
+        );
+        let mut job = running_job(vec![failed, decided, tolerant]);
+
+        assert_eq!(
+            job.skip_unreachable_tasks(Utc::now()).unwrap(),
+            0,
+            "a task that declared it survives both states must not be put out by either"
+        );
+        assert_eq!(
+            job.pick_task_to_execute(&WORKER_ID).unwrap(),
+            TaskPickup::Ready(Uuid::from_u128(3)),
+            "and it must be released to run rather than left blocked"
+        );
+    }
+
+    /// A dependency that failed with attempts to spare is not unreachable, so nothing behind it is
+    /// put out: the cascade must not pre-empt a retry that is still coming.
+    #[test]
+    fn the_cascade_leaves_a_dependent_of_a_retryable_failure_waiting() {
+        let dependency = make_task_with_attempts(
+            Uuid::from_u128(1),
+            "dep",
+            TaskStatus::Failed,
+            Vec::new(),
+            1,
+            DEFAULT_MAX_ATTEMPTS,
+            Some(Duration::seconds(60)),
+        );
+        let dependent = make_task(
+            Uuid::from_u128(2),
+            "dependent",
+            TaskStatus::Blocked,
+            vec![Uuid::from_u128(1)],
+        );
+        let mut job = running_job(vec![dependency, dependent]);
+
+        assert_eq!(job.skip_unreachable_tasks(Utc::now()).unwrap(), 0);
+    }
+
+    /// The verdict the cause of a skip exists for: the failure was handled by one dependent and
+    /// silently put out another, and an iteration that reported success here would hide lost work.
+    #[test]
+    fn a_failure_handled_by_one_dependent_still_fails_the_iteration_if_it_put_out_another() {
+        let failed = make_terminally_failed_task(Uuid::from_u128(1), "detect");
+        let mut tolerant = make_tolerant_task(
+            Uuid::from_u128(2),
+            vec![Uuid::from_u128(1)],
+            DependencyTolerance {
+                allows_failed: true,
+                allows_skipped: false,
+            },
+        );
+        tolerant.unblock();
+        tolerant.start(WORKER_ID).unwrap();
+        tolerant.complete(Vec::new()).unwrap();
+        let intolerant = make_task(
+            Uuid::from_u128(3),
+            "archive",
+            TaskStatus::Blocked,
+            vec![Uuid::from_u128(1)],
+        );
+        let mut job = running_job(vec![failed, tolerant, intolerant]);
+
+        assert!(
+            job.try_settle_iteration(&WORKER_ID).unwrap(),
+            "the iteration must be settled"
+        );
+        assert_eq!(*job.status(), JobStatus::Failed);
+    }
+
+    /// The feature's own case: the failure was handled, nothing else was put out by it.
+    #[test]
+    fn a_handled_failure_completes_the_iteration() {
+        let failed = make_terminally_failed_task(Uuid::from_u128(1), "detect");
+        let mut tolerant = make_tolerant_task(
+            Uuid::from_u128(2),
+            vec![Uuid::from_u128(1)],
+            DependencyTolerance {
+                allows_failed: true,
+                allows_skipped: false,
+            },
+        );
+        tolerant.unblock();
+        tolerant.start(WORKER_ID).unwrap();
+        tolerant.complete(Vec::new()).unwrap();
+        let mut job = running_job(vec![failed, tolerant]);
+
+        assert!(
+            job.try_settle_iteration(&WORKER_ID).unwrap(),
+            "the iteration must be settled"
+        );
+        assert_eq!(*job.status(), JobStatus::Completed);
+    }
+
+    /// A failure is struck off by name: the dependent below answered for the one it waits for and
+    /// said nothing about the other, so the iteration still has a failure to answer for. A verdict
+    /// reading "some dependent handled a failure" would report a success over the second one.
+    #[test]
+    fn a_handled_failure_does_not_answer_for_a_second_one() {
+        let handled = make_terminally_failed_task(Uuid::from_u128(1), "detect");
+        let unhandled = make_terminally_failed_task(Uuid::from_u128(2), "collect");
+        let mut tolerant = make_tolerant_task(
+            Uuid::from_u128(3),
+            vec![Uuid::from_u128(1)],
+            DependencyTolerance {
+                allows_failed: true,
+                allows_skipped: false,
+            },
+        );
+        tolerant.unblock();
+        tolerant.start(WORKER_ID).unwrap();
+        tolerant.complete(Vec::new()).unwrap();
+        let mut job = running_job(vec![handled, unhandled, tolerant]);
+
+        assert!(
+            job.try_settle_iteration(&WORKER_ID).unwrap(),
+            "the iteration must be settled"
+        );
+        assert_eq!(*job.status(), JobStatus::Failed);
+    }
+
+    /// A failure nobody declared they survive ends the iteration, exactly as it does today.
+    #[test]
+    fn a_lone_failure_fails_the_iteration() {
+        let failed = make_terminally_failed_task(Uuid::from_u128(1), "detect");
+        let mut job = running_job(vec![failed]);
+
+        assert!(
+            job.try_settle_iteration(&WORKER_ID).unwrap(),
+            "the iteration must be settled"
+        );
+        assert_eq!(*job.status(), JobStatus::Failed);
+    }
+
+    /// A dependent that declared it survives a failure and then failed itself handled nothing:
+    /// the iteration has two failures to answer for, not zero.
+    #[test]
+    fn a_tolerant_dependent_that_failed_itself_handles_nothing() {
+        let failed = make_terminally_failed_task(Uuid::from_u128(1), "detect");
+        let mut tolerant = make_tolerant_task(
+            Uuid::from_u128(2),
+            vec![Uuid::from_u128(1)],
+            DependencyTolerance {
+                allows_failed: true,
+                allows_skipped: false,
+            },
+        );
+        tolerant.unblock();
+        tolerant.start(WORKER_ID).unwrap();
+        tolerant.fail("degraded path refused too", TaskRetry::Never).unwrap();
+        let mut job = running_job(vec![failed, tolerant]);
+
+        assert!(
+            job.try_settle_iteration(&WORKER_ID).unwrap(),
+            "the iteration must be settled"
+        );
+        assert_eq!(*job.status(), JobStatus::Failed);
+    }
+
+    /// A decision is not a failure: an iteration whose branch was skipped and whose remaining work
+    /// finished is a success.
+    #[test]
+    fn a_skipped_branch_completes_the_iteration() {
+        let mut skipped = make_task(Uuid::from_u128(1), "detect", TaskStatus::Started, Vec::new());
+        skipped.skip("pointless", SkipCause::ExecutorDecision).unwrap();
+        let waiting = make_task(
+            Uuid::from_u128(2),
+            "prepare",
+            TaskStatus::Blocked,
+            vec![Uuid::from_u128(1)],
+        );
+        let mut job = running_job(vec![skipped, waiting]);
+
+        assert!(
+            job.try_settle_iteration(&WORKER_ID).unwrap(),
+            "the iteration must be settled"
+        );
+        assert_eq!(*job.status(), JobStatus::Completed);
+        assert!(
+            job.find_task(&Uuid::from_u128(2)).unwrap().is_skipped(),
+            "settling applies the cascade before it judges"
+        );
+    }
+
+    /// A dependent that started and decided for itself handles the failure it was told about.
+    #[test]
+    fn a_dependent_that_skipped_itself_handles_the_failure() {
+        let failed = make_terminally_failed_task(Uuid::from_u128(1), "detect");
+        let mut tolerant = make_tolerant_task(
+            Uuid::from_u128(2),
+            vec![Uuid::from_u128(1)],
+            DependencyTolerance {
+                allows_failed: true,
+                allows_skipped: false,
+            },
+        );
+        tolerant.unblock();
+        tolerant.start(WORKER_ID).unwrap();
+        tolerant.skip("nothing to prepare", SkipCause::ExecutorDecision).unwrap();
+        let mut job = running_job(vec![failed, tolerant]);
+
+        assert!(
+            job.try_settle_iteration(&WORKER_ID).unwrap(),
+            "the iteration must be settled"
+        );
+        assert_eq!(*job.status(), JobStatus::Completed);
+    }
+
+    /// A dependent the cascade put out answers for nothing: it never started, never read the
+    /// failure it was supposed to survive, and was ended by a decision taken elsewhere in the
+    /// graph. An iteration that let it cover the failure would report a success while the terminal
+    /// refusal reached nobody at all.
+    #[test]
+    fn a_tolerant_dependent_the_cascade_put_out_does_not_handle_the_failure() {
+        let failed = make_terminally_failed_task(Uuid::from_u128(1), "detect");
+        let mut decided = make_task(Uuid::from_u128(2), "rules", TaskStatus::Started, Vec::new());
+        decided.skip("nothing to rule on", SkipCause::ExecutorDecision).unwrap();
+        let tolerant = make_tolerant_task(
+            Uuid::from_u128(3),
+            vec![Uuid::from_u128(1), Uuid::from_u128(2)],
+            DependencyTolerance {
+                allows_failed: true,
+                allows_skipped: false,
+            },
+        );
+        let mut job = running_job(vec![failed, decided, tolerant]);
+
+        assert!(
+            job.try_settle_iteration(&WORKER_ID).unwrap(),
+            "the iteration must be settled"
+        );
+        assert_eq!(*job.status(), JobStatus::Failed);
+        assert!(
+            job.find_task(&Uuid::from_u128(3)).unwrap().is_skipped(),
+            "the fixture must really have put the tolerant dependent out rather than run it"
+        );
+    }
+
+    /// A branch the failure put out stays lost however well the failure itself was answered for.
+    /// The dependent here declared it survives both states and resolved itself, so a verdict
+    /// holding failures and put-out branches in one set would let it strike off both and report a
+    /// success over a branch that never ran.
+    #[test]
+    fn a_dependent_tolerating_both_states_does_not_handle_the_branch_the_failure_put_out() {
+        let failed = make_terminally_failed_task(Uuid::from_u128(1), "detect");
+        let archive = make_task(
+            Uuid::from_u128(2),
+            "archive",
+            TaskStatus::Blocked,
+            vec![Uuid::from_u128(1)],
+        );
+        let mut tolerant = make_tolerant_task(
+            Uuid::from_u128(3),
+            vec![Uuid::from_u128(1), Uuid::from_u128(2)],
+            DependencyTolerance {
+                allows_failed: true,
+                allows_skipped: true,
+            },
+        );
+        tolerant.unblock();
+        tolerant.start(WORKER_ID).unwrap();
+        tolerant.complete(Vec::new()).unwrap();
+        let mut job = running_job(vec![failed, archive, tolerant]);
+
+        assert!(
+            job.try_settle_iteration(&WORKER_ID).unwrap(),
+            "the iteration must be settled"
+        );
+        assert_eq!(
+            job.find_task(&Uuid::from_u128(2)).unwrap().skip_cause(),
+            Some(SkipCause::FailedDependency),
+            "the fixture must really have put the branch out through the failure"
+        );
+        assert_eq!(*job.status(), JobStatus::Failed);
+    }
+
+    /// A task waiting for a dependency the iteration does not hold moves nowhere and is put out by
+    /// nothing: settling has to refuse rather than report a success over work that never ran.
+    #[test]
+    fn a_task_waiting_for_a_dependency_that_is_not_there_is_a_deadlock() {
+        let orphan = make_task(
+            Uuid::from_u128(1),
+            "orphan",
+            TaskStatus::Blocked,
+            vec![Uuid::from_u128(404)],
+        );
+        let mut job = running_job(vec![orphan]);
+
+        let error = job
+            .try_settle_iteration(&WORKER_ID)
+            .expect_err("an iteration nothing can move must not be reported as settled");
+
+        assert!(matches!(error, JobError::IterationDeadlock { .. }), "got: {error}");
+    }
+
+    /// A verdict is reached once: an iteration that already carries one is judged over a state
+    /// nobody is working in any more, so settling refuses instead of closing it a second time.
+    #[test]
+    fn settling_an_already_closed_iteration_is_refused() {
+        let completed = make_task(Uuid::from_u128(1), "t", TaskStatus::Completed, Vec::new());
+        let mut job = restore_job(
+            Uuid::new_v4(),
+            JobStatus::Completed,
+            vec![completed],
+            1,
+            Some(1),
+            None,
+            WORKER_ID,
+            Some(Utc::now()),
+            Some(Utc::now()),
+            None,
+            HashMap::new(),
+        );
+
+        let error = job
+            .try_settle_iteration(&WORKER_ID)
+            .expect_err("a closed iteration must not be settled again");
+
+        assert!(
+            matches!(error, JobError::InvalidStatusTransition { .. }),
+            "got: {error}"
+        );
+    }
+
+    /// While a tolerant dependent can still run, the iteration is not settled at all - closing it
+    /// here is what would keep the dependent from ever starting.
+    #[test]
+    fn an_iteration_is_not_settled_while_a_tolerant_dependent_can_still_run() {
+        let failed = make_terminally_failed_task(Uuid::from_u128(1), "detect");
+        let tolerant = make_tolerant_task(
+            Uuid::from_u128(2),
+            vec![Uuid::from_u128(1)],
+            DependencyTolerance {
+                allows_failed: true,
+                allows_skipped: false,
+            },
+        );
+        let mut job = running_job(vec![failed, tolerant]);
+
+        assert!(
+            !job.try_settle_iteration(&WORKER_ID).unwrap(),
+            "the iteration must stay open"
+        );
+        assert_eq!(*job.status(), JobStatus::Running);
+    }
+
+    /// A refusal with budget to spare is resolved but still pickable, and closing the iteration on
+    /// it would cost the task every retry it has left.
+    #[test]
+    fn an_iteration_is_not_settled_while_a_failed_task_may_run_again() {
+        let failed = make_task_with_attempts(
+            Uuid::from_u128(1),
+            "flaky",
+            TaskStatus::Failed,
+            Vec::new(),
+            1,
+            DEFAULT_MAX_ATTEMPTS,
+            Some(Duration::seconds(60)),
+        );
+        let mut job = running_job(vec![failed]);
+
+        assert!(
+            !job.try_settle_iteration(&WORKER_ID).unwrap(),
+            "the iteration must stay open"
+        );
+        assert_eq!(*job.status(), JobStatus::Running);
+    }
+
     #[test]
     fn test_pick_task_to_execute_returns_none_when_no_pickable() {
         let started = make_task(Uuid::from_u128(6), "started", TaskStatus::Started, Vec::new());
@@ -1552,25 +2694,16 @@ mod tests {
 
     #[test]
     fn test_pick_task_to_execute_expired_started_task() {
-        let expired = Task::restore(
-            Uuid::from_u128(8),
-            TaskCode::new("expired"),
-            TaskStatus::Started,
-            None,
-            Uuid::from_u128(101),
-            Duration::seconds(5),
-            Duration::seconds(300),
-            Some(Utc::now() - Duration::seconds(10)),
-            None,
-            Some(Utc::now() - Duration::seconds(1)),
-            None,
-            0,
-            DEFAULT_MAX_ATTEMPTS,
-            Vec::new(),
-            Vec::new(),
-            String::new(),
-            Vec::new(),
-        );
+        let expired = Task::restore(RestoredTask {
+            id: Uuid::from_u128(8),
+            code: TaskCode::new("expired"),
+            status: TaskStatus::Started,
+            created_by_worker: Uuid::from_u128(101),
+            max_lifetime: Duration::seconds(300),
+            started_at: Some(Utc::now() - Duration::seconds(10)),
+            deadline_at: Some(Utc::now() - Duration::seconds(1)),
+            ..restored_task_fields()
+        });
 
         let worker_id = Uuid::from_u128(100);
         let mut job = restore_job(
@@ -1595,25 +2728,19 @@ mod tests {
     /// budget, and a lifetime deadline `lifetime_left` away, so a test can place it on either side
     /// of the limit it is about.
     fn make_expired_started_task(id: Uuid, attempt: u32, max_attempts: u32, lifetime_left: Duration) -> Task {
-        Task::restore(
+        Task::restore(RestoredTask {
             id,
-            TaskCode::new("expired"),
-            TaskStatus::Started,
-            Some(Uuid::from_u128(101)),
-            Uuid::from_u128(101),
-            Duration::seconds(5),
-            Duration::seconds(25),
-            Some(Utc::now() - Duration::seconds(10)),
-            None,
-            Some(Utc::now() - Duration::seconds(1)),
-            Some(Utc::now() + lifetime_left),
+            code: TaskCode::new("expired"),
+            status: TaskStatus::Started,
+            processing_by_worker: Some(Uuid::from_u128(101)),
+            created_by_worker: Uuid::from_u128(101),
+            started_at: Some(Utc::now() - Duration::seconds(10)),
+            deadline_at: Some(Utc::now() - Duration::seconds(1)),
+            lifetime_deadline_at: Some(Utc::now() + lifetime_left),
             attempt,
             max_attempts,
-            Vec::new(),
-            Vec::new(),
-            String::new(),
-            Vec::new(),
-        )
+            ..restored_task_fields()
+        })
     }
 
     #[test]
@@ -1672,7 +2799,7 @@ mod tests {
             );
 
             let picked = job.pick_task_to_execute(&worker_id).unwrap();
-            assert_eq!(picked, TaskPickup::Exhausted, "lifetime left: {lifetime_left:?}");
+            assert_eq!(picked, TaskPickup::IterationSettled, "lifetime left: {lifetime_left:?}");
             assert!(
                 matches!(job.status(), JobStatus::Failed),
                 "lifetime left: {lifetime_left:?}"
@@ -1690,25 +2817,18 @@ mod tests {
     #[test]
     fn test_pick_task_to_execute_fails_a_task_past_its_lifetime_within_its_deadline() {
         let running_id = Uuid::from_u128(146);
-        let running = Task::restore(
-            running_id,
-            TaskCode::new("running"),
-            TaskStatus::Started,
-            Some(Uuid::from_u128(101)),
-            Uuid::from_u128(101),
-            Duration::seconds(5),
-            Duration::seconds(25),
-            Some(Utc::now() - Duration::seconds(30)),
-            None,
-            Some(Utc::now() + Duration::seconds(5)),
-            Some(Utc::now() - Duration::seconds(1)),
-            1,
-            DEFAULT_MAX_ATTEMPTS,
-            Vec::new(),
-            Vec::new(),
-            String::new(),
-            Vec::new(),
-        );
+        let running = Task::restore(RestoredTask {
+            id: running_id,
+            code: TaskCode::new("running"),
+            status: TaskStatus::Started,
+            processing_by_worker: Some(Uuid::from_u128(101)),
+            created_by_worker: Uuid::from_u128(101),
+            started_at: Some(Utc::now() - Duration::seconds(30)),
+            deadline_at: Some(Utc::now() + Duration::seconds(5)),
+            lifetime_deadline_at: Some(Utc::now() - Duration::seconds(1)),
+            attempt: 1,
+            ..restored_task_fields()
+        });
         let worker_id = Uuid::from_u128(100);
         let mut job = restore_job(
             Uuid::from_u128(147),
@@ -1726,14 +2846,17 @@ mod tests {
 
         let picked = job.pick_task_to_execute(&worker_id).unwrap();
 
-        assert_eq!(picked, TaskPickup::Exhausted);
+        assert_eq!(picked, TaskPickup::IterationSettled);
         let running_status = job.get_task_arc(&running_id).unwrap().status().clone();
         assert_eq!(running_status, TaskStatus::Failed);
         assert!(matches!(job.status(), JobStatus::Failed));
     }
 
+    /// A pass that finds every task finished closes the iteration rather than reporting the state
+    /// as impossible: the worker that finished the last task may have lost the race to save its
+    /// verdict, and this pass is what closes it instead.
     #[test]
-    fn test_pick_task_to_execute_all_tasks_completed_error() {
+    fn test_pick_task_to_execute_settles_an_iteration_whose_tasks_all_finished() {
         let completed = make_task(Uuid::from_u128(9), "done", TaskStatus::Completed, Vec::new());
         let worker_id = Uuid::from_u128(100);
         let mut job = restore_job(
@@ -1750,8 +2873,11 @@ mod tests {
             HashMap::new(),
         );
 
-        let err = job.pick_task_to_execute(&worker_id).unwrap_err();
-        assert!(matches!(err, JobError::Other(_)));
+        assert_eq!(
+            job.pick_task_to_execute(&worker_id).unwrap(),
+            TaskPickup::IterationSettled
+        );
+        assert_eq!(*job.status(), JobStatus::Completed);
     }
 
     #[test]
@@ -1778,7 +2904,7 @@ mod tests {
         );
 
         let err = job.pick_task_to_execute(&worker_id).unwrap_err();
-        assert!(matches!(err, JobError::Other(_)));
+        assert!(matches!(err, JobError::IterationDeadlock { .. }), "got: {err}");
     }
 
     #[test]
@@ -1840,7 +2966,7 @@ mod tests {
         );
 
         let picked = job.pick_task_to_execute(&worker_id).unwrap();
-        assert_eq!(picked, TaskPickup::Exhausted);
+        assert_eq!(picked, TaskPickup::IterationSettled);
         assert!(matches!(job.status(), JobStatus::Failed));
         assert!(job.completed_at().is_some());
     }
@@ -1880,15 +3006,17 @@ mod tests {
 
         let picked = job.pick_task_to_execute(&worker_id).unwrap();
 
-        assert_eq!(picked, TaskPickup::Exhausted);
+        assert_eq!(picked, TaskPickup::IterationSettled);
         assert!(matches!(job.status(), JobStatus::Failed));
         assert!(job.completed_at().is_some(), "a failed iteration records when it ended");
     }
 
     #[test]
     fn test_pick_task_to_execute_fails_iteration_for_task_blocked_behind_exhausted_task() {
-        // The dependent task must never run once its dependency is terminal, and
-        // the iteration must end as Failed rather than as a "deadlock" error.
+        // The dependent task must never run once its dependency is terminal, and the iteration must
+        // end as Failed rather than as a "deadlock" error. The dependent is put out by the cascade
+        // and carries the failure as its cause, which is what keeps the verdict honest about work
+        // nobody did.
         let failed_id = Uuid::from_u128(16);
         let dependent_id = Uuid::from_u128(17);
         let failed = make_task_with_attempts(
@@ -1917,10 +3045,10 @@ mod tests {
         );
 
         let picked = job.pick_task_to_execute(&worker_id).unwrap();
-        assert_eq!(picked, TaskPickup::Exhausted);
+        assert_eq!(picked, TaskPickup::IterationSettled);
         assert!(matches!(job.status(), JobStatus::Failed));
-        let dependent_status = job.get_task_arc(&dependent_id).unwrap().status().clone();
-        assert_eq!(dependent_status, TaskStatus::Blocked);
+        let dependent = job.find_task(&dependent_id).unwrap();
+        assert_eq!(*dependent.status(), TaskStatus::Skipped(SkipCause::FailedDependency));
     }
 
     #[test]
@@ -1936,25 +3064,18 @@ mod tests {
             2,
             Some(Duration::seconds(60)),
         );
-        let started = Task::restore(
-            Uuid::from_u128(19),
-            TaskCode::new("started"),
-            TaskStatus::Started,
-            Some(Uuid::from_u128(114)),
-            Uuid::from_u128(114),
-            Duration::seconds(5),
-            Duration::seconds(300),
-            Some(Utc::now()),
-            None,
-            Some(Utc::now() + Duration::seconds(60)),
-            None,
-            1,
-            DEFAULT_MAX_ATTEMPTS,
-            Vec::new(),
-            Vec::new(),
-            String::new(),
-            Vec::new(),
-        );
+        let started = Task::restore(RestoredTask {
+            id: Uuid::from_u128(19),
+            code: TaskCode::new("started"),
+            status: TaskStatus::Started,
+            processing_by_worker: Some(Uuid::from_u128(114)),
+            created_by_worker: Uuid::from_u128(114),
+            max_lifetime: Duration::seconds(300),
+            started_at: Some(Utc::now()),
+            deadline_at: Some(Utc::now() + Duration::seconds(60)),
+            attempt: 1,
+            ..restored_task_fields()
+        });
         let worker_id = Uuid::from_u128(100);
         let mut job = restore_job(
             Uuid::from_u128(115),
@@ -2800,7 +3921,9 @@ mod tests {
         job.add_task(&task_definition("child"), worker_id, Some(task_id)).unwrap();
         assert_eq!(job.tasks_as_iter().count(), 2);
 
-        let rolled_back_tasks = job.fail_task(&task_id, "planning failed").unwrap();
+        let rolled_back_tasks = job
+            .fail_task(&task_id, "planning failed", TaskRetry::WhileBudgetLasts, worker_id)
+            .unwrap();
 
         assert_eq!(
             rolled_back_tasks, 1,
@@ -2821,7 +3944,9 @@ mod tests {
         job.start_task(&task_id, worker_id).unwrap();
         job.add_task(&task_definition("orphan"), worker_id, None).unwrap();
 
-        let rolled_back_tasks = job.fail_task(&task_id, "planning failed").unwrap();
+        let rolled_back_tasks = job
+            .fail_task(&task_id, "planning failed", TaskRetry::WhileBudgetLasts, worker_id)
+            .unwrap();
 
         assert_eq!(rolled_back_tasks, 0);
         assert_eq!(job.tasks_as_iter().count(), 2);
@@ -2837,9 +3962,11 @@ mod tests {
         let task_id = *job.tasks_as_iter().next().expect("the test job holds its initial task").id();
         job.start_task(&task_id, worker_id).unwrap();
         let child_id = job.add_task(&task_definition("child"), worker_id, Some(task_id)).unwrap();
-        job.complete_task(&task_id, Vec::new()).unwrap();
+        job.complete_task(&task_id, Vec::new(), worker_id).unwrap();
 
-        let error = job.fail_task(&task_id, "planning failed").unwrap_err();
+        let error = job
+            .fail_task(&task_id, "planning failed", TaskRetry::WhileBudgetLasts, worker_id)
+            .unwrap_err();
 
         assert!(error.to_string().contains("cannot fail task"), "got: {error}");
         assert!(
@@ -2849,9 +3976,9 @@ mod tests {
         assert!(job.get_task(&task_id).unwrap().is_completed());
     }
 
-    /// Failing a task another execution owns rolls nothing back, which is what `JobHandle::fail_task`
-    /// promises an executor free to name any task of the iteration: what this execution registered
-    /// belongs to its own task and survives the other one's failure.
+    /// Failing a task this execution did not create rolls nothing back: what this execution
+    /// registered belongs to its own task and survives the other one's failure. The two tasks are
+    /// held by the same worker, which is what the check on the owner leaves legal.
     #[test]
     fn test_fail_task_of_another_task_keeps_what_this_execution_created() {
         let mut job = job_with_one_task(TaskLimits::default());
@@ -2862,14 +3989,83 @@ mod tests {
         job.start_task(&other_task_id, worker_id).unwrap();
         let created_id = job.add_task(&task_definition("child"), worker_id, Some(own_task_id)).unwrap();
 
-        let rolled_back_tasks = job.fail_task(&other_task_id, "refused a task of another execution").unwrap();
+        let rolled_back_tasks = job
+            .fail_task(
+                &other_task_id,
+                "refused a task of another execution",
+                TaskRetry::WhileBudgetLasts,
+                worker_id,
+            )
+            .unwrap();
 
         assert_eq!(rolled_back_tasks, 0);
         assert!(
             job.get_task(&created_id).is_ok(),
-            "the task this execution created must survive the failure of a task it does not own"
+            "the task this execution created must survive the failure of a task it did not create"
         );
         assert!(job.get_task(&other_task_id).unwrap().is_failed());
+    }
+
+    /// The hole this closes: a refusal declared final on a task another worker holds ends that
+    /// task at once, and the iteration is settled over it while the owner's executor is still
+    /// running - so the owner's own result comes back into an iteration it has no way into.
+    #[test]
+    fn fail_task_of_a_task_another_worker_holds_is_refused() {
+        let mut job = job_with_one_task(TaskLimits::default());
+        let owner_id = Uuid::from_u128(1914);
+        let stranger_id = Uuid::from_u128(1915);
+        let task_id = *job.tasks_as_iter().next().expect("the test job holds its initial task").id();
+        job.start_task(&task_id, owner_id).unwrap();
+
+        let error = job
+            .fail_task(&task_id, "refused by a stranger", TaskRetry::Never, stranger_id)
+            .expect_err("a task another worker holds is not this one's to refuse");
+
+        assert!(matches!(error, JobError::TaskWorkerMismatch), "got: {error}");
+        let task = job.find_task(&task_id).unwrap();
+        assert!(task.is_started(), "a refused failure must leave the task running");
+        assert_eq!(task.resolution_reason(), "");
+        assert_eq!(task.retry(), TaskRetry::WhileBudgetLasts);
+    }
+
+    /// The same rule for the other resolution: a result written past the owner would close the
+    /// iteration under work the owner is still doing.
+    #[test]
+    fn complete_task_of_a_task_another_worker_holds_is_refused() {
+        let mut job = job_with_one_task(TaskLimits::default());
+        let owner_id = Uuid::from_u128(1916);
+        let stranger_id = Uuid::from_u128(1917);
+        let task_id = *job.tasks_as_iter().next().expect("the test job holds its initial task").id();
+        job.start_task(&task_id, owner_id).unwrap();
+
+        let error = job
+            .complete_task(&task_id, b"by a stranger".to_vec(), stranger_id)
+            .expect_err("a task another worker holds is not this one's to complete");
+
+        assert!(matches!(error, JobError::TaskWorkerMismatch), "got: {error}");
+        let task = job.find_task(&task_id).unwrap();
+        assert!(task.is_started(), "a refused completion must leave the task running");
+        assert!(task.output().is_empty());
+    }
+
+    /// The third resolution under the same rule: a decision made past the owner puts out the
+    /// branch below it and settles the iteration while the owner's executor is still running.
+    #[test]
+    fn skip_task_by_executor_of_a_task_another_worker_holds_is_refused() {
+        let mut job = job_with_one_task(TaskLimits::default());
+        let owner_id = Uuid::from_u128(1918);
+        let stranger_id = Uuid::from_u128(1919);
+        let task_id = *job.tasks_as_iter().next().expect("the test job holds its initial task").id();
+        job.start_task(&task_id, owner_id).unwrap();
+
+        let error = job
+            .skip_task_by_executor(&task_id, "branch is pointless", stranger_id)
+            .expect_err("a task another worker holds is not this one's to give up on");
+
+        assert!(matches!(error, JobError::TaskWorkerMismatch), "got: {error}");
+        let task = job.find_task(&task_id).unwrap();
+        assert!(task.is_started(), "a refused decision must leave the task running");
+        assert_eq!(task.resolution_reason(), "");
     }
 
     /// The ordinary end of a failed execution: its task was left open, so the failure is recorded on
@@ -2883,13 +4079,18 @@ mod tests {
         job.add_task(&task_definition("child"), worker_id, Some(task_id)).unwrap();
 
         let rolled_back_tasks = job
-            .record_task_execution_failure(&task_id, "executor returned an error")
+            .record_task_execution_failure(
+                &task_id,
+                "executor returned an error",
+                TaskRetry::WhileBudgetLasts,
+                worker_id,
+            )
             .unwrap();
 
         assert_eq!(rolled_back_tasks, 1);
         assert_eq!(job.tasks_as_iter().count(), 1);
         assert_eq!(
-            job.find_task(&task_id).unwrap().error_msg(),
+            job.find_task(&task_id).unwrap().resolution_reason(),
             "executor returned an error"
         );
     }
@@ -2903,13 +4104,18 @@ mod tests {
         let worker_id = Uuid::from_u128(1911);
         let task_id = *job.tasks_as_iter().next().expect("the test job holds its initial task").id();
         job.start_task(&task_id, worker_id).unwrap();
-        job.complete_task(&task_id, b"result".to_vec()).unwrap();
+        job.complete_task(&task_id, b"result".to_vec(), worker_id).unwrap();
         let created_id = job
             .add_task(&task_definition("continuation"), worker_id, Some(task_id))
             .unwrap();
 
         let rolled_back_tasks = job
-            .record_task_execution_failure(&task_id, "executor returned an error")
+            .record_task_execution_failure(
+                &task_id,
+                "executor returned an error",
+                TaskRetry::WhileBudgetLasts,
+                worker_id,
+            )
             .unwrap();
 
         assert_eq!(rolled_back_tasks, 0);
@@ -2931,14 +4137,23 @@ mod tests {
         let task_id = *job.tasks_as_iter().next().expect("the test job holds its initial task").id();
         job.start_task(&task_id, worker_id).unwrap();
         job.add_task(&task_definition("child"), worker_id, Some(task_id)).unwrap();
-        job.fail_task(&task_id, "rejected by executor").unwrap();
+        job.fail_task(&task_id, "rejected by executor", TaskRetry::WhileBudgetLasts, worker_id)
+            .unwrap();
 
         let rolled_back_tasks = job
-            .record_task_execution_failure(&task_id, "executor returned an error")
+            .record_task_execution_failure(
+                &task_id,
+                "executor returned an error",
+                TaskRetry::WhileBudgetLasts,
+                worker_id,
+            )
             .unwrap();
 
         assert_eq!(rolled_back_tasks, 0, "the rollback ran with the failure itself");
-        assert_eq!(job.find_task(&task_id).unwrap().error_msg(), "rejected by executor");
+        assert_eq!(
+            job.find_task(&task_id).unwrap().resolution_reason(),
+            "rejected by executor"
+        );
         assert_eq!(job.tasks_as_iter().count(), 1);
     }
 
@@ -2951,7 +4166,13 @@ mod tests {
         let worker_id = Uuid::from_u128(1907);
         let task_id = *job.tasks_as_iter().next().expect("the test job holds its initial task").id();
         job.start_task(&task_id, worker_id).unwrap();
-        job.fail_task(&task_id, "planning refused the work").unwrap();
+        job.fail_task(
+            &task_id,
+            "planning refused the work",
+            TaskRetry::WhileBudgetLasts,
+            worker_id,
+        )
+        .unwrap();
 
         let error = job.add_task(&task_definition("late"), worker_id, Some(task_id)).unwrap_err();
 
@@ -2972,11 +4193,30 @@ mod tests {
         let worker_id = Uuid::from_u128(1909);
         let task_id = *job.tasks_as_iter().next().expect("the test job holds its initial task").id();
         job.start_task(&task_id, worker_id).unwrap();
-        job.complete_task(&task_id, Vec::new()).unwrap();
+        job.complete_task(&task_id, Vec::new(), worker_id).unwrap();
 
         let created_id = job
             .add_task(&task_definition("continuation"), worker_id, Some(task_id))
             .expect("an execution that completed its own task may plan the work it hands over");
+
+        assert!(job.get_task(&created_id).is_ok());
+        assert_eq!(job.tasks_as_iter().count(), 2);
+    }
+
+    /// The third resolution an execution can reach before it plans: a decision is not a refusal, so
+    /// it rolled nothing back and the work registered after it has nothing to outlive - including
+    /// work outside the branch that was given up on.
+    #[test]
+    fn test_add_task_by_an_execution_that_skipped_its_own_task_is_accepted() {
+        let mut job = job_with_one_task(TaskLimits::default());
+        let worker_id = Uuid::from_u128(1913);
+        let task_id = *job.tasks_as_iter().next().expect("the test job holds its initial task").id();
+        job.start_task(&task_id, worker_id).unwrap();
+        job.skip_task_by_executor(&task_id, "branch is pointless", worker_id).unwrap();
+
+        let created_id = job
+            .add_task(&task_definition("planned"), worker_id, Some(task_id))
+            .expect("an execution that gave its branch up may still plan the work outside it");
 
         assert!(job.get_task(&created_id).is_ok());
         assert_eq!(job.tasks_as_iter().count(), 2);
@@ -2991,7 +4231,8 @@ mod tests {
         let worker_id = Uuid::from_u128(1908);
         let task_id = *job.tasks_as_iter().next().expect("the test job holds its initial task").id();
         job.start_task(&task_id, worker_id).unwrap();
-        job.fail_task(&task_id, "planning failed").unwrap();
+        job.fail_task(&task_id, "planning failed", TaskRetry::WhileBudgetLasts, worker_id)
+            .unwrap();
 
         job.add_task(&task_definition("orphan"), worker_id, None)
             .expect("a task claimed by no execution must be accepted");
@@ -3007,7 +4248,14 @@ mod tests {
         job.start_task(&task_id, worker_id).unwrap();
         job.add_task(&task_definition("child"), worker_id, Some(task_id)).unwrap();
 
-        let error = job.fail_task(&Uuid::from_u128(1905), "planning failed").unwrap_err();
+        let error = job
+            .fail_task(
+                &Uuid::from_u128(1905),
+                "planning failed",
+                TaskRetry::WhileBudgetLasts,
+                worker_id,
+            )
+            .unwrap_err();
 
         assert!(matches!(error, JobError::TaskNotFound), "got: {error}");
         assert_eq!(job.tasks_as_iter().count(), 2);
@@ -3066,25 +4314,18 @@ mod tests {
     #[test]
     fn test_start_task_worker_mismatch() {
         let task_id = Uuid::from_u128(52);
-        let task = Task::restore(
-            task_id,
-            TaskCode::new("started"),
-            TaskStatus::Started,
-            Some(Uuid::from_u128(600)),
-            Uuid::from_u128(601),
-            Duration::seconds(5),
-            Duration::seconds(300),
-            Some(Utc::now()),
-            None,
-            Some(Utc::now() + Duration::seconds(60)),
-            None,
-            1,
-            DEFAULT_MAX_ATTEMPTS,
-            Vec::new(),
-            Vec::new(),
-            String::new(),
-            Vec::new(),
-        );
+        let task = Task::restore(RestoredTask {
+            id: task_id,
+            code: TaskCode::new("started"),
+            status: TaskStatus::Started,
+            processing_by_worker: Some(Uuid::from_u128(600)),
+            created_by_worker: Uuid::from_u128(601),
+            max_lifetime: Duration::seconds(300),
+            started_at: Some(Utc::now()),
+            deadline_at: Some(Utc::now() + Duration::seconds(60)),
+            attempt: 1,
+            ..restored_task_fields()
+        });
         let worker_id = Uuid::from_u128(504);
         let mut job = restore_job(
             Uuid::from_u128(505),
@@ -3124,7 +4365,7 @@ mod tests {
         );
 
         job.start_task(&task_id, Uuid::from_u128(601)).unwrap();
-        job.complete_task(&task_id, vec![1, 2]).unwrap();
+        job.complete_task(&task_id, vec![1, 2], Uuid::from_u128(601)).unwrap();
         let task = job.get_task_arc(&task_id).unwrap();
         assert!(matches!(task.status(), TaskStatus::Completed));
         assert_eq!(task.output(), vec![1, 2]);
@@ -3150,7 +4391,7 @@ mod tests {
             HashMap::new(),
         );
 
-        let err = job.complete_task(&task_id, vec![1]).unwrap_err();
+        let err = job.complete_task(&task_id, vec![1], worker_id).unwrap_err();
         assert!(matches!(err, JobError::Other(_)));
     }
 
@@ -3173,7 +4414,7 @@ mod tests {
         );
 
         let worker_id = Uuid::from_u128(801);
-        job.work(&worker_id).unwrap();
+        job.start_work(&worker_id).unwrap();
         assert!(matches!(job.status, JobStatus::Running));
         assert_eq!(job.updated_by_worker_id, worker_id);
         assert!(job.running_at.is_some());
@@ -3196,60 +4437,44 @@ mod tests {
             HashMap::new(),
         );
 
-        let err = job.work(&Uuid::from_u128(803)).unwrap_err();
+        let err = job.start_work(&Uuid::from_u128(803)).unwrap_err();
         assert!(matches!(err, JobError::InvalidStatusTransition { .. }));
     }
 
+    /// The ordinary end of an iteration: everything finished, nothing refused anything.
     #[test]
-    fn test_try_to_complete_ok() {
+    fn settling_an_iteration_whose_tasks_all_completed_completes_it() {
         let task = make_task(Uuid::from_u128(90), "done", TaskStatus::Completed, Vec::new());
-        let mut job = restore_job(
-            Uuid::from_u128(91),
-            JobStatus::Running,
-            vec![task],
-            1,
-            None,
-            None,
-            Uuid::from_u128(900),
-            Some(Utc::now()),
-            None,
-            None,
-            HashMap::new(),
-        );
+        let mut job = running_job(vec![task]);
 
         let worker_id = Uuid::from_u128(901);
-        let completed = job.try_to_complete(&worker_id).unwrap();
-        assert!(completed);
-        assert!(matches!(job.status, JobStatus::Completed));
+        assert!(
+            job.try_settle_iteration(&worker_id).unwrap(),
+            "the iteration must be settled"
+        );
+        assert_eq!(*job.status(), JobStatus::Completed);
         assert_eq!(job.updated_by_worker_id, worker_id);
         assert!(job.completed_at.is_some());
     }
 
+    /// Work left to do is not a verdict: the iteration stays open and records nothing.
     #[test]
-    fn test_try_to_complete_not_ready() {
+    fn settling_an_iteration_with_work_left_leaves_it_running() {
         let task = make_task(Uuid::from_u128(92), "todo", TaskStatus::Todo, Vec::new());
-        let mut job = restore_job(
-            Uuid::from_u128(93),
-            JobStatus::Running,
-            vec![task],
-            1,
-            None,
-            None,
-            Uuid::from_u128(902),
-            Some(Utc::now()),
-            None,
-            None,
-            HashMap::new(),
-        );
+        let mut job = running_job(vec![task]);
 
-        let completed = job.try_to_complete(&Uuid::from_u128(903)).unwrap();
-        assert!(!completed);
-        assert!(matches!(job.status, JobStatus::Running));
+        assert!(
+            !job.try_settle_iteration(&Uuid::from_u128(903)).unwrap(),
+            "the iteration must stay open"
+        );
+        assert_eq!(*job.status(), JobStatus::Running);
         assert!(job.completed_at.is_none());
     }
 
+    /// An iteration is never assigned a status directly: a verdict the state machine does not allow
+    /// from where the job stands is an error rather than a silently corrupted state.
     #[test]
-    fn test_try_to_complete_invalid_transition() {
+    fn settling_from_a_status_that_cannot_reach_the_verdict_is_refused() {
         let task = make_task(Uuid::from_u128(94), "done", TaskStatus::Completed, Vec::new());
         let mut job = restore_job(
             Uuid::from_u128(95),
@@ -3265,52 +4490,7 @@ mod tests {
             HashMap::new(),
         );
 
-        let err = job.try_to_complete(&Uuid::from_u128(905)).unwrap_err();
-        assert!(matches!(err, JobError::InvalidStatusTransition { .. }));
-    }
-
-    #[test]
-    fn test_fail_ok() {
-        let task = make_task(Uuid::from_u128(100), "todo", TaskStatus::Todo, Vec::new());
-        let mut job = restore_job(
-            Uuid::from_u128(101),
-            JobStatus::Running,
-            vec![task],
-            1,
-            None,
-            None,
-            Uuid::from_u128(1000),
-            Some(Utc::now()),
-            None,
-            None,
-            HashMap::new(),
-        );
-
-        let worker_id = Uuid::from_u128(1001);
-        job.fail(&worker_id).unwrap();
-        assert!(matches!(job.status, JobStatus::Failed));
-        assert_eq!(job.updated_by_worker_id, worker_id);
-        assert!(job.completed_at.is_some());
-    }
-
-    #[test]
-    fn test_fail_invalid_transition() {
-        let task = make_task(Uuid::from_u128(102), "done", TaskStatus::Completed, Vec::new());
-        let mut job = restore_job(
-            Uuid::from_u128(103),
-            JobStatus::Completed,
-            vec![task],
-            1,
-            None,
-            None,
-            Uuid::from_u128(1002),
-            None,
-            Some(Utc::now()),
-            None,
-            HashMap::new(),
-        );
-
-        let err = job.fail(&Uuid::from_u128(1003)).unwrap_err();
+        let err = job.try_settle_iteration(&Uuid::from_u128(905)).unwrap_err();
         assert!(matches!(err, JobError::InvalidStatusTransition { .. }));
     }
 
@@ -3370,25 +4550,18 @@ mod tests {
         assert_eq!(picked, TaskPickup::Ready(task_id));
         worker_job.start_task(&task_id, worker_id).unwrap();
 
-        let started_by_other = Task::restore(
-            task_id,
-            TaskCode::new("todo"),
-            TaskStatus::Started,
-            Some(Uuid::from_u128(1069)),
-            Uuid::from_u128(1064),
-            Duration::seconds(5),
-            Duration::seconds(300),
-            Some(Utc::now()),
-            None,
-            Some(Utc::now() + Duration::seconds(60)),
-            None,
-            1,
-            DEFAULT_MAX_ATTEMPTS,
-            Vec::new(),
-            Vec::new(),
-            String::new(),
-            Vec::new(),
-        );
+        let started_by_other = Task::restore(RestoredTask {
+            id: task_id,
+            code: TaskCode::new("todo"),
+            status: TaskStatus::Started,
+            processing_by_worker: Some(Uuid::from_u128(1069)),
+            created_by_worker: Uuid::from_u128(1064),
+            max_lifetime: Duration::seconds(300),
+            started_at: Some(Utc::now()),
+            deadline_at: Some(Utc::now() + Duration::seconds(60)),
+            attempt: 1,
+            ..restored_task_fields()
+        });
         let mut saved_job = restore_job(
             *worker_job.id(),
             JobStatus::Running,
@@ -3620,6 +4793,138 @@ mod tests {
         assert_eq!(stored_task.processing_by_worker(), None);
     }
 
+    /// What a dependent of the cases below declares: it starts on a dependency that failed for good.
+    const TOLERATES_A_FAILURE: DependencyTolerance = DependencyTolerance {
+        allows_failed: true,
+        allows_skipped: false,
+    };
+
+    /// A dependency whose maximum lifetime has passed while the worker holding it is still named on
+    /// it - the one resolution every copy of the job derives for itself rather than reading.
+    fn make_dependency_past_its_lifetime(id: Uuid) -> Task {
+        make_expired_started_task(id, 1, DEFAULT_MAX_ATTEMPTS, -Duration::seconds(1))
+    }
+
+    /// The copy that lost the race is what released the picked task, and it released it on a failure
+    /// it derived itself. The state merged into never saw that failure, so it derives it again -
+    /// otherwise the dependent runs against a dependency this state still shows started, with
+    /// neither a result nor a reason on it to take its degraded path from.
+    #[test]
+    fn merging_a_pickup_fails_a_dependency_that_outlived_its_lifetime() {
+        let dependency_id = Uuid::from_u128(1110);
+        let dependent_id = Uuid::from_u128(1111);
+        let mut saved_job = running_job(vec![
+            make_dependency_past_its_lifetime(dependency_id),
+            make_tolerant_task(dependent_id, vec![dependency_id], TOLERATES_A_FAILURE),
+        ]);
+        let mut worker_job = saved_job.clone();
+        assert_eq!(
+            worker_job.pick_task_to_execute(&WORKER_ID).unwrap(),
+            TaskPickup::Ready(dependent_id)
+        );
+        worker_job.start_task(&dependent_id, WORKER_ID).unwrap();
+
+        saved_job
+            .merge_with_picked_task(&worker_job, &WORKER_ID, &dependent_id)
+            .unwrap();
+
+        let dependency = saved_job.find_task(&dependency_id).unwrap();
+        assert!(dependency.is_terminally_failed_at(Utc::now()));
+        assert!(
+            !dependency.resolution_reason().is_empty(),
+            "the dependent reads why its dependency will never run"
+        );
+        assert!(saved_job.find_task(&dependent_id).unwrap().is_started());
+    }
+
+    /// The same for a dependent one step further down: what released it is a branch the cascade put
+    /// out, and the cascade follows from the failure the state merged into has yet to derive.
+    #[test]
+    fn merging_a_pickup_puts_out_the_branch_a_lifetime_failure_left_unreachable() {
+        let dependency_id = Uuid::from_u128(1120);
+        let branch_id = Uuid::from_u128(1121);
+        let dependent_id = Uuid::from_u128(1122);
+        let mut saved_job = running_job(vec![
+            make_dependency_past_its_lifetime(dependency_id),
+            make_task(branch_id, "branch", TaskStatus::Blocked, vec![dependency_id]),
+            make_tolerant_task(
+                dependent_id,
+                vec![branch_id],
+                DependencyTolerance {
+                    allows_failed: false,
+                    allows_skipped: true,
+                },
+            ),
+        ]);
+        let mut worker_job = saved_job.clone();
+        assert_eq!(
+            worker_job.pick_task_to_execute(&WORKER_ID).unwrap(),
+            TaskPickup::Ready(dependent_id)
+        );
+        worker_job.start_task(&dependent_id, WORKER_ID).unwrap();
+
+        saved_job
+            .merge_with_picked_task(&worker_job, &WORKER_ID, &dependent_id)
+            .unwrap();
+
+        assert!(saved_job.find_task(&branch_id).unwrap().is_skipped());
+        assert!(saved_job.find_task(&dependent_id).unwrap().is_started());
+    }
+
+    /// The dependency finished before its lifetime ran out and another worker stored that result,
+    /// so what this worker derived on its own copy is a failure of a task that is no longer failing.
+    /// The result stands and the dependent starts on it.
+    #[test]
+    fn merging_a_pickup_leaves_a_dependency_another_worker_completed() {
+        let dependency_id = Uuid::from_u128(1130);
+        let dependent_id = Uuid::from_u128(1131);
+        let job_id = Uuid::from_u128(1132);
+        let mut worker_job = restore_job(
+            job_id,
+            JobStatus::Running,
+            vec![
+                make_dependency_past_its_lifetime(dependency_id),
+                make_tolerant_task(dependent_id, vec![dependency_id], TOLERATES_A_FAILURE),
+            ],
+            1,
+            None,
+            None,
+            WORKER_ID,
+            Some(Utc::now()),
+            None,
+            None,
+            HashMap::new(),
+        );
+        assert_eq!(
+            worker_job.pick_task_to_execute(&WORKER_ID).unwrap(),
+            TaskPickup::Ready(dependent_id)
+        );
+        worker_job.start_task(&dependent_id, WORKER_ID).unwrap();
+        let mut saved_job = restore_job(
+            job_id,
+            JobStatus::Running,
+            vec![
+                make_task(dependency_id, "expired", TaskStatus::Completed, Vec::new()),
+                make_tolerant_task(dependent_id, vec![dependency_id], TOLERATES_A_FAILURE),
+            ],
+            1,
+            None,
+            None,
+            Uuid::from_u128(1133),
+            Some(Utc::now()),
+            None,
+            None,
+            HashMap::new(),
+        );
+
+        saved_job
+            .merge_with_picked_task(&worker_job, &WORKER_ID, &dependent_id)
+            .unwrap();
+
+        assert!(saved_job.find_task(&dependency_id).unwrap().is_completed());
+        assert!(saved_job.find_task(&dependent_id).unwrap().is_started());
+    }
+
     #[test]
     fn test_merge_with_processed_task_different_id() {
         let task = make_task(Uuid::from_u128(110), "todo", TaskStatus::Todo, Vec::new());
@@ -3659,25 +4964,18 @@ mod tests {
     #[test]
     fn test_merge_with_processed_task_worker_mismatch() {
         let task_id = Uuid::from_u128(120);
-        let task = Task::restore(
-            task_id,
-            TaskCode::new("started"),
-            TaskStatus::Started,
-            Some(Uuid::from_u128(1200)),
-            Uuid::from_u128(1201),
-            Duration::seconds(5),
-            Duration::seconds(300),
-            Some(Utc::now()),
-            None,
-            Some(Utc::now() + Duration::seconds(60)),
-            None,
-            1,
-            DEFAULT_MAX_ATTEMPTS,
-            Vec::new(),
-            Vec::new(),
-            String::new(),
-            Vec::new(),
-        );
+        let task = Task::restore(RestoredTask {
+            id: task_id,
+            code: TaskCode::new("started"),
+            status: TaskStatus::Started,
+            processing_by_worker: Some(Uuid::from_u128(1200)),
+            created_by_worker: Uuid::from_u128(1201),
+            max_lifetime: Duration::seconds(300),
+            started_at: Some(Utc::now()),
+            deadline_at: Some(Utc::now() + Duration::seconds(60)),
+            attempt: 1,
+            ..restored_task_fields()
+        });
         let mut job = restore_job(
             Uuid::from_u128(121),
             JobStatus::Running,
@@ -3725,46 +5023,31 @@ mod tests {
             HashMap::new(),
         );
 
-        let processed_task = Task::restore(
-            processed_task_id,
-            TaskCode::new("shift"),
-            TaskStatus::Completed,
-            Some(worker_id),
-            worker_id,
-            Duration::seconds(60),
-            Duration::seconds(300),
-            Some(Utc::now()),
-            Some(Utc::now()),
-            Some(Utc::now() + Duration::seconds(60)),
-            None,
-            1,
-            DEFAULT_MAX_ATTEMPTS,
-            Vec::new(),
-            b"shifted".to_vec(),
-            String::new(),
-            Vec::new(),
-        );
+        let processed_task = Task::restore(RestoredTask {
+            id: processed_task_id,
+            code: TaskCode::new("shift"),
+            status: TaskStatus::Completed,
+            processing_by_worker: Some(worker_id),
+            created_by_worker: worker_id,
+            timeout: Duration::seconds(60),
+            max_lifetime: Duration::seconds(300),
+            started_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
+            deadline_at: Some(Utc::now() + Duration::seconds(60)),
+            attempt: 1,
+            output: b"shifted".to_vec(),
+            ..restored_task_fields()
+        });
         // Created by this worker and owned by nobody: the merge loop would carry it over, which is
         // what makes the refusal observable on the task count below.
-        let created_task = Task::restore(
-            created_task_id,
-            TaskCode::new("shift"),
-            TaskStatus::Todo,
-            None,
-            worker_id,
-            Duration::seconds(60),
-            Duration::seconds(300),
-            None,
-            None,
-            None,
-            None,
-            0,
-            DEFAULT_MAX_ATTEMPTS,
-            Vec::new(),
-            Vec::new(),
-            String::new(),
-            Vec::new(),
-        );
+        let created_task = Task::restore(RestoredTask {
+            id: created_task_id,
+            code: TaskCode::new("shift"),
+            created_by_worker: worker_id,
+            timeout: Duration::seconds(60),
+            max_lifetime: Duration::seconds(300),
+            ..restored_task_fields()
+        });
         let worker_job = restore_job(
             *saved_job.id(),
             JobStatus::Running,
@@ -3788,6 +5071,9 @@ mod tests {
         assert!(saved_job.tasks_by_id.contains_key(&next_iteration_task_id));
     }
 
+    /// The worker's copy closed its iteration and then lost the race, so the merge takes its tasks
+    /// and derives the verdict again over the state the two make together: the stored task is still
+    /// running, so the merged iteration stays open however the copy that lost ended.
     #[test]
     fn test_merge_with_processed_task_ok() {
         let base_task_id = Uuid::from_u128(130);
@@ -3809,65 +5095,34 @@ mod tests {
 
         let worker_id = Uuid::from_u128(1301);
         let created_task_id = Uuid::from_u128(132);
-        let created_task = Task::restore(
-            created_task_id,
-            TaskCode::new("created"),
-            TaskStatus::Todo,
-            None,
-            worker_id,
-            Duration::seconds(5),
-            Duration::seconds(300),
-            None,
-            None,
-            None,
-            None,
-            0,
-            DEFAULT_MAX_ATTEMPTS,
-            Vec::new(),
-            Vec::new(),
-            String::new(),
-            Vec::new(),
-        );
+        let created_task = Task::restore(RestoredTask {
+            id: created_task_id,
+            code: TaskCode::new("created"),
+            created_by_worker: worker_id,
+            max_lifetime: Duration::seconds(300),
+            ..restored_task_fields()
+        });
         let processed_task_id = Uuid::from_u128(133);
-        let processed_task = Task::restore(
-            processed_task_id,
-            TaskCode::new("processed"),
-            TaskStatus::Started,
-            Some(worker_id),
-            Uuid::from_u128(1302),
-            Duration::seconds(5),
-            Duration::seconds(300),
-            Some(Utc::now()),
-            None,
-            Some(Utc::now() + Duration::seconds(60)),
-            None,
-            1,
-            DEFAULT_MAX_ATTEMPTS,
-            Vec::new(),
-            Vec::new(),
-            String::new(),
-            Vec::new(),
-        );
+        let processed_task = Task::restore(RestoredTask {
+            id: processed_task_id,
+            code: TaskCode::new("processed"),
+            status: TaskStatus::Started,
+            processing_by_worker: Some(worker_id),
+            created_by_worker: Uuid::from_u128(1302),
+            max_lifetime: Duration::seconds(300),
+            started_at: Some(Utc::now()),
+            deadline_at: Some(Utc::now() + Duration::seconds(60)),
+            attempt: 1,
+            ..restored_task_fields()
+        });
         let other_task_id = Uuid::from_u128(134);
-        let other_task = Task::restore(
-            other_task_id,
-            TaskCode::new("other"),
-            TaskStatus::Todo,
-            None,
-            Uuid::from_u128(1303),
-            Duration::seconds(5),
-            Duration::seconds(300),
-            None,
-            None,
-            None,
-            None,
-            0,
-            DEFAULT_MAX_ATTEMPTS,
-            Vec::new(),
-            Vec::new(),
-            String::new(),
-            Vec::new(),
-        );
+        let other_task = Task::restore(RestoredTask {
+            id: other_task_id,
+            code: TaskCode::new("other"),
+            created_by_worker: Uuid::from_u128(1303),
+            max_lifetime: Duration::seconds(300),
+            ..restored_task_fields()
+        });
 
         let worker_job = restore_job(
             job.id,
@@ -3885,13 +5140,93 @@ mod tests {
 
         job.merge_with_processed_task(&worker_job, &worker_id, &base_task_id).unwrap();
 
-        assert!(matches!(job.status, JobStatus::Completed));
-        assert!(job.completed_at.is_some());
+        assert!(matches!(job.status, JobStatus::Running));
+        assert!(job.completed_at.is_none());
         assert!(job.running_at.is_some());
         assert!(job.tasks_by_id.contains_key(&base_task_id));
         assert!(job.tasks_by_id.contains_key(&created_task_id));
         assert!(job.tasks_by_id.contains_key(&processed_task_id));
         assert!(!job.tasks_by_id.contains_key(&other_task_id));
+    }
+
+    /// The stored state holds a task the worker's copy never saw - another worker registered it
+    /// while this one was executing. The copy that lost the race closed its own iteration without
+    /// that task, so a verdict carried over from it would store an iteration holding a task nobody
+    /// will ever run: the next poll moves the job to an iteration planned from scratch.
+    ///
+    /// The break that proves it: assigning the worker's status to the merged state.
+    #[test]
+    fn test_merge_with_processed_task_keeps_a_task_the_worker_never_saw_runnable() {
+        let worker_id = Uuid::from_u128(1401);
+        let processed_task_id = Uuid::from_u128(140);
+        let processed_in_storage = Task::restore(RestoredTask {
+            id: processed_task_id,
+            code: TaskCode::new("processed"),
+            status: TaskStatus::Started,
+            processing_by_worker: Some(worker_id),
+            max_lifetime: Duration::seconds(300),
+            started_at: Some(Utc::now()),
+            deadline_at: Some(Utc::now() + Duration::seconds(60)),
+            attempt: 1,
+            ..restored_task_fields()
+        });
+        let registered_task_id = Uuid::from_u128(141);
+        let registered_by_another_worker = Task::restore(RestoredTask {
+            id: registered_task_id,
+            code: TaskCode::new("registered"),
+            created_by_worker: Uuid::from_u128(1402),
+            max_lifetime: Duration::seconds(300),
+            ..restored_task_fields()
+        });
+        let mut job = restore_job(
+            Uuid::from_u128(142),
+            JobStatus::Running,
+            vec![processed_in_storage, registered_by_another_worker],
+            1,
+            None,
+            None,
+            Uuid::from_u128(1402),
+            Some(Utc::now()),
+            None,
+            None,
+            HashMap::new(),
+        );
+
+        let mut processed_by_worker = Task::restore(RestoredTask {
+            id: processed_task_id,
+            code: TaskCode::new("processed"),
+            status: TaskStatus::Started,
+            processing_by_worker: Some(worker_id),
+            max_lifetime: Duration::seconds(300),
+            started_at: Some(Utc::now()),
+            deadline_at: Some(Utc::now() + Duration::seconds(60)),
+            attempt: 1,
+            ..restored_task_fields()
+        });
+        processed_by_worker.complete(Vec::new()).unwrap();
+        let worker_job = restore_job(
+            job.id,
+            JobStatus::Completed,
+            vec![processed_by_worker],
+            1,
+            None,
+            None,
+            worker_id,
+            Some(Utc::now()),
+            Some(Utc::now()),
+            None,
+            HashMap::new(),
+        );
+
+        job.merge_with_processed_task(&worker_job, &worker_id, &processed_task_id)
+            .unwrap();
+
+        assert!(
+            job.find_task(&registered_task_id).unwrap().can_be_picked_up_at(Utc::now()),
+            "the task the worker never saw must still be runnable"
+        );
+        assert_eq!(*job.status(), JobStatus::Running);
+        assert!(job.completed_at.is_none());
     }
 
     /// A task this worker created in an earlier execution has moved on in the stored state, and the
@@ -3904,25 +5239,21 @@ mod tests {
         let processed_task_id = Uuid::from_u128(1362);
         let sibling_task_id = Uuid::from_u128(1363);
 
-        let sibling_in_storage = Task::restore(
-            sibling_task_id,
-            TaskCode::new("shift"),
-            TaskStatus::Completed,
-            Some(other_worker_id),
-            worker_id,
-            Duration::seconds(60),
-            Duration::seconds(300),
-            Some(Utc::now()),
-            Some(Utc::now()),
-            Some(Utc::now() + Duration::seconds(60)),
-            None,
-            1,
-            DEFAULT_MAX_ATTEMPTS,
-            Vec::new(),
-            b"shifted".to_vec(),
-            String::new(),
-            Vec::new(),
-        );
+        let sibling_in_storage = Task::restore(RestoredTask {
+            id: sibling_task_id,
+            code: TaskCode::new("shift"),
+            status: TaskStatus::Completed,
+            processing_by_worker: Some(other_worker_id),
+            created_by_worker: worker_id,
+            timeout: Duration::seconds(60),
+            max_lifetime: Duration::seconds(300),
+            started_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
+            deadline_at: Some(Utc::now() + Duration::seconds(60)),
+            attempt: 1,
+            output: b"shifted".to_vec(),
+            ..restored_task_fields()
+        });
         let mut job = restore_job(
             Uuid::from_u128(1364),
             JobStatus::Running,
@@ -3942,44 +5273,29 @@ mod tests {
 
         // The copy this worker read before the other one took the sibling: created by this worker
         // while it ran the planning task, and untouched since.
-        let sibling_in_worker_copy = Task::restore(
-            sibling_task_id,
-            TaskCode::new("shift"),
-            TaskStatus::Todo,
-            None,
-            worker_id,
-            Duration::seconds(60),
-            Duration::seconds(300),
-            None,
-            None,
-            None,
-            None,
-            0,
-            DEFAULT_MAX_ATTEMPTS,
-            Vec::new(),
-            Vec::new(),
-            String::new(),
-            Vec::new(),
-        );
-        let processed_task = Task::restore(
-            processed_task_id,
-            TaskCode::new("shift"),
-            TaskStatus::Completed,
-            Some(worker_id),
-            worker_id,
-            Duration::seconds(60),
-            Duration::seconds(300),
-            Some(Utc::now()),
-            Some(Utc::now()),
-            Some(Utc::now() + Duration::seconds(60)),
-            None,
-            1,
-            DEFAULT_MAX_ATTEMPTS,
-            Vec::new(),
-            b"shifted".to_vec(),
-            String::new(),
-            Vec::new(),
-        );
+        let sibling_in_worker_copy = Task::restore(RestoredTask {
+            id: sibling_task_id,
+            code: TaskCode::new("shift"),
+            created_by_worker: worker_id,
+            timeout: Duration::seconds(60),
+            max_lifetime: Duration::seconds(300),
+            ..restored_task_fields()
+        });
+        let processed_task = Task::restore(RestoredTask {
+            id: processed_task_id,
+            code: TaskCode::new("shift"),
+            status: TaskStatus::Completed,
+            processing_by_worker: Some(worker_id),
+            created_by_worker: worker_id,
+            timeout: Duration::seconds(60),
+            max_lifetime: Duration::seconds(300),
+            started_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
+            deadline_at: Some(Utc::now() + Duration::seconds(60)),
+            attempt: 1,
+            output: b"shifted".to_vec(),
+            ..restored_task_fields()
+        });
         let worker_job = restore_job(
             *job.id(),
             JobStatus::Running,
@@ -4000,7 +5316,10 @@ mod tests {
         let sibling = job.get_task_arc(&sibling_task_id).unwrap();
         assert_eq!(*sibling.status(), TaskStatus::Completed);
         assert_eq!(sibling.processing_by_worker(), Some(other_worker_id));
-        assert!(job.all_tasks_completed(), "the merge must leave every task completed");
+        assert!(
+            job.tasks_as_iter().all(Task::is_completed),
+            "the merge must leave every task completed"
+        );
     }
 
     #[test]
@@ -4025,25 +5344,18 @@ mod tests {
         let worker_job = restore_job(
             *job.id(),
             JobStatus::Completed,
-            vec![Task::restore(
-                task_id,
-                TaskCode::new("base"),
-                TaskStatus::Started,
-                Some(worker_id),
-                Uuid::from_u128(1343),
-                Duration::seconds(5),
-                Duration::seconds(300),
-                Some(Utc::now()),
-                None,
-                Some(Utc::now() + Duration::seconds(60)),
-                None,
-                1,
-                DEFAULT_MAX_ATTEMPTS,
-                Vec::new(),
-                Vec::new(),
-                String::new(),
-                Vec::new(),
-            )],
+            vec![Task::restore(RestoredTask {
+                id: task_id,
+                code: TaskCode::new("base"),
+                status: TaskStatus::Started,
+                processing_by_worker: Some(worker_id),
+                created_by_worker: Uuid::from_u128(1343),
+                max_lifetime: Duration::seconds(300),
+                started_at: Some(Utc::now()),
+                deadline_at: Some(Utc::now() + Duration::seconds(60)),
+                attempt: 1,
+                ..restored_task_fields()
+            })],
             1,
             None,
             None,
@@ -4080,25 +5392,18 @@ mod tests {
         let worker_job = restore_job(
             *job.id(),
             JobStatus::Completed,
-            vec![Task::restore(
-                task_id,
-                TaskCode::new("base"),
-                TaskStatus::Started,
-                Some(worker_id),
-                Uuid::from_u128(1353),
-                Duration::seconds(5),
-                Duration::seconds(300),
-                Some(Utc::now()),
-                None,
-                Some(Utc::now() + Duration::seconds(60)),
-                None,
-                1,
-                DEFAULT_MAX_ATTEMPTS,
-                Vec::new(),
-                Vec::new(),
-                String::new(),
-                Vec::new(),
-            )],
+            vec![Task::restore(RestoredTask {
+                id: task_id,
+                code: TaskCode::new("base"),
+                status: TaskStatus::Started,
+                processing_by_worker: Some(worker_id),
+                created_by_worker: Uuid::from_u128(1353),
+                max_lifetime: Duration::seconds(300),
+                started_at: Some(Utc::now()),
+                deadline_at: Some(Utc::now() + Duration::seconds(60)),
+                attempt: 1,
+                ..restored_task_fields()
+            })],
             1,
             None,
             None,
@@ -4113,8 +5418,69 @@ mod tests {
         assert_eq!(job.next_start_at(), Some(saved_next_start_at));
     }
 
+    /// The boundary of the rule that leaves a lost race's verdict behind: it is left behind so the
+    /// merged state can be judged, and an iteration another worker already closed is not going to
+    /// be judged again. Merging into one is refused, so a finished iteration is not written a
+    /// second time for a result its verdict cannot use.
     #[test]
-    fn test_merge_with_processed_task_invalid_transition() {
+    fn merging_a_closed_iteration_into_one_another_worker_closed_is_refused() {
+        let task_id = Uuid::from_u128(150);
+        let worker_id = Uuid::from_u128(1500);
+        let mut job = restore_job(
+            Uuid::from_u128(151),
+            JobStatus::Failed,
+            vec![make_task(task_id, "done", TaskStatus::Failed, Vec::new())],
+            1,
+            None,
+            None,
+            Uuid::from_u128(1501),
+            Some(Utc::now()),
+            Some(Utc::now()),
+            None,
+            HashMap::new(),
+        );
+        let worker_job = restore_job(
+            *job.id(),
+            JobStatus::Completed,
+            vec![Task::restore(RestoredTask {
+                id: task_id,
+                code: TaskCode::new("done"),
+                status: TaskStatus::Completed,
+                processing_by_worker: Some(worker_id),
+                created_by_worker: worker_id,
+                started_at: Some(Utc::now()),
+                completed_at: Some(Utc::now()),
+                attempt: 1,
+                ..restored_task_fields()
+            })],
+            1,
+            None,
+            None,
+            worker_id,
+            Some(Utc::now()),
+            Some(Utc::now()),
+            None,
+            HashMap::new(),
+        );
+
+        let error = job
+            .merge_with_processed_task(&worker_job, &worker_id, &task_id)
+            .expect_err("a merge into a closed iteration must be refused");
+
+        assert!(
+            matches!(error, JobError::IterationAlreadySettled { .. }),
+            "got: {error}"
+        );
+        assert!(
+            job.find_task(&task_id).unwrap().is_failed(),
+            "a refused merge must leave the stored iteration as its own worker wrote it"
+        );
+    }
+
+    /// The same refusal where the worker's own copy is still open: what rules the merge out is the
+    /// iteration that was stored, not the one the worker holds.
+    #[test]
+    fn merging_a_running_copy_into_a_closed_iteration_is_refused() {
         let task_id = Uuid::from_u128(140);
         let task = make_task(task_id, "done", TaskStatus::Completed, Vec::new());
         let mut job = restore_job(
@@ -4147,7 +5513,7 @@ mod tests {
         let err = job
             .merge_with_processed_task(&worker_job, &Uuid::from_u128(1401), &task_id)
             .unwrap_err();
-        assert!(matches!(err, JobError::Other(_)));
+        assert!(matches!(err, JobError::IterationAlreadySettled { .. }), "got: {err}");
     }
 
     #[test]
@@ -4361,6 +5727,79 @@ mod tests {
         assert!(error.to_string().contains("dependency cycle"), "got: {error}");
     }
 
+    /// Tolerance describes which unreachable dependencies a task starts on, so on a task that
+    /// waits for nothing it describes nothing and is a mistake to be reported rather than ignored.
+    #[test]
+    fn new_rejects_a_dependency_tolerance_on_a_task_without_dependencies() {
+        let task = task_definition("lonely").with_dependency_tolerance(DependencyTolerance {
+            allows_failed: true,
+            allows_skipped: false,
+        });
+
+        let error = JobDefinition::new(
+            test_definition_id(),
+            JobCode::new("job"),
+            vec![(task, noop_executor())],
+            Vec::new(),
+            Vec::new(),
+            TaskLimits::default(),
+        )
+        .err()
+        .expect("tolerance without dependencies must not describe a job");
+
+        assert!(
+            error.to_string().contains("dependency tolerance without dependencies"),
+            "got: {error}"
+        );
+    }
+
+    /// The declaration channel is what makes this check late: a task whose dependencies arrive
+    /// through `JobBuilder::depends_on` is legal, and rejecting it earlier would refuse a real
+    /// description.
+    #[test]
+    fn new_accepts_a_tolerance_whose_dependencies_arrive_by_declaration() {
+        let root = task_definition("root");
+        let dependent = task_definition("dependent").with_dependency_tolerance(DependencyTolerance {
+            allows_failed: true,
+            allows_skipped: false,
+        });
+
+        let description = JobDefinition::new(
+            test_definition_id(),
+            JobCode::new("job"),
+            vec![(root, noop_executor()), (dependent, noop_executor())],
+            Vec::new(),
+            vec![(initial_task_ref(1), vec![initial_task_ref(0)])],
+            TaskLimits::default(),
+        );
+
+        assert!(description.is_ok(), "got: {:?}", description.err());
+    }
+
+    /// The same rule for a task created at runtime, which never passes through a description.
+    #[test]
+    fn add_task_rejects_a_dependency_tolerance_without_dependencies() {
+        let mut job = running_job(vec![make_task(
+            Uuid::from_u128(1),
+            "root",
+            TaskStatus::Todo,
+            Vec::new(),
+        )]);
+        let tolerant = task_definition("tolerant").with_dependency_tolerance(DependencyTolerance {
+            allows_failed: false,
+            allows_skipped: true,
+        });
+
+        let error = job
+            .add_task(&tolerant, WORKER_ID, None)
+            .expect_err("tolerance without dependencies must not create a task");
+
+        assert!(
+            error.to_string().contains("dependency tolerance without dependencies"),
+            "got: {error}"
+        );
+    }
+
     /// A runtime task exists only inside an iteration, so a description cannot wait for one.
     #[test]
     fn new_rejects_an_initial_task_depending_on_a_runtime_task() {
@@ -4564,7 +6003,7 @@ mod tests {
         let task_id = *job.tasks_as_iter().next().unwrap().id();
         job.start_task(&task_id, Uuid::from_u128(1801)).unwrap();
 
-        let err = job.complete_task(&task_id, vec![0; 5]).err().unwrap();
+        let err = job.complete_task(&task_id, vec![0; 5], Uuid::from_u128(1801)).err().unwrap();
         assert!(matches!(err, JobError::Other(_)));
     }
 
@@ -4585,7 +6024,7 @@ mod tests {
 
         let task_id = *job.tasks_as_iter().next().unwrap().id();
         job.start_task(&task_id, Uuid::from_u128(1851)).unwrap();
-        job.complete_task(&task_id, vec![0; 4]).unwrap();
+        job.complete_task(&task_id, vec![0; 4], Uuid::from_u128(1851)).unwrap();
 
         let task = job.get_task_arc(&task_id).unwrap();
         assert!(matches!(task.status(), TaskStatus::Completed));

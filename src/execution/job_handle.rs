@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use uuid::Uuid;
 
-use crate::{Error, ImmutableTask, Job, JobError, TaskCode, TaskDefinition, TaskRef};
+use crate::{Error, ImmutableTask, Job, JobError, TaskCode, TaskDefinition, TaskRef, TaskRetry};
 
 // TODO(med): add method to complete all job iterations
 // TODO(med): add method to complete current job iteration
@@ -29,7 +29,9 @@ pub trait JobHandle: Send + Sync {
     /// a worker once the job holding it is persisted.
     ///
     /// What this execution creates is dropped if its task ends up failed - by an error from the
-    /// executor, by a panic, by a [`TaskOutcome::Deferred`](crate::TaskOutcome::Deferred) that leaves
+    /// executor, by a panic, by a
+    /// [`TaskOutcome::TerminallyFailed`](crate::TaskOutcome::TerminallyFailed), by a
+    /// [`TaskOutcome::Deferred`](crate::TaskOutcome::Deferred) that leaves
     /// the task open, or by [`Self::fail_task`]. Tasks registered by several calls are therefore
     /// dropped together: a failure takes back the whole plan of that execution, never a part of it.
     ///
@@ -46,38 +48,62 @@ pub trait JobHandle: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns an error if `task_def` does not pass the job's limits, if one of its declared
-    /// dependencies does not exist in the job, if this execution already failed its own task, or
-    /// if the handle is no longer valid.
+    /// Returns an error if `task_def` does not pass the job's limits, if it declares a dependency
+    /// tolerance while depending on nothing, if one of its declared dependencies does not exist in
+    /// the job, if this execution already failed its own task, or if the handle is no longer valid.
     fn add_task(&self, task_def: TaskDefinition) -> Result<TaskRef, Error>;
 
     /// Marks the task as completed and stores `output` as its result.
     ///
+    /// A task another worker holds is refused with an error: it is resolved by the execution that
+    /// owns it, and a result written past that owner closes the iteration under work still running.
+    ///
     /// # Errors
     ///
-    /// Returns an error if `task_id` is not part of the job, if `output` exceeds the
-    /// configured size limit, if the task is not in a state that can transition to completed, or
-    /// if the handle is no longer valid.
+    /// Returns an error if `task_id` is not part of the job, if another worker holds the task, if
+    /// `output` exceeds the configured size limit, if the task is not in a state that can transition
+    /// to completed, or if the handle is no longer valid.
     fn complete_task(&self, task_id: &Uuid, output: Vec<u8>) -> Result<(), Error>;
 
-    /// Marks the task as failed, recording `error_msg` as the failure reason.
+    /// Marks the task as failed, recording `error_msg` as the failure reason and `retry` as whether
+    /// the refusal is worth repeating.
     ///
-    /// A failure decided here is a failure like any other: the task is picked up again while its
-    /// attempt budget and its maximum lifetime last, so an executor failing its own task will run
-    /// again unless the task was defined with an attempt budget of one - and what this execution
-    /// registered through [`Self::add_task`] is dropped, so that retry starts from the tasks the
-    /// iteration held without it. There is no way to fail a task and leave the tasks it created
-    /// behind - failing its own task ends this execution, and [`Self::add_task`] registers nothing
-    /// afterwards; hand work on from a task that completes.
+    /// Under [`TaskRetry::WhileBudgetLasts`] a failure decided here is a failure like any other:
+    /// the task is picked up again while its attempt budget and its maximum lifetime last, so an
+    /// executor failing its own task will run again unless the task was defined with an attempt
+    /// budget of one. [`TaskRetry::Never`] ends it there instead - the task is terminal at once,
+    /// whatever is left of either limit.
     ///
-    /// Failing a task this execution does not own is legal and rolls nothing back - a created task
-    /// belongs to the execution that registered it, and this one registered none for that task.
+    /// Either way, what this execution registered through [`Self::add_task`] is dropped, so a retry
+    /// starts from the tasks the iteration held without it. There is no way to fail a task and
+    /// leave the tasks it created behind - failing its own task ends this execution, and
+    /// [`Self::add_task`] registers nothing afterwards; hand work on from a task that completes.
+    ///
+    /// A task another worker holds is refused with an error: it is resolved by the execution that
+    /// owns it, and a refusal written past that owner ends the iteration under work still running.
     ///
     /// # Errors
     ///
-    /// Returns an error if `task_id` is not part of the job, if the task is not in a state
-    /// that can transition to failed, or if the handle is no longer valid.
-    fn fail_task(&self, task_id: &Uuid, error_msg: &str) -> Result<(), Error>;
+    /// Returns an error if `task_id` is not part of the job, if another worker holds the task, if
+    /// the task is not in a state that can transition to failed, or if the handle is no longer
+    /// valid.
+    fn fail_task(&self, task_id: &Uuid, error_msg: &str, retry: TaskRetry) -> Result<(), Error>;
+
+    /// Ends this execution's own task without a result: its branch has no meaning.
+    ///
+    /// Takes no identifier, because there is exactly one task it could name - the one this handle
+    /// was opened for. Whatever waits on that task is put out by the domain, unless it declared it
+    /// survives a skipped dependency.
+    ///
+    /// Unlike [`Self::fail_task`], this rolls nothing back: a decision is not a refusal, so the work
+    /// this execution registered through [`Self::add_task`] stays - including tasks outside the
+    /// branch being skipped. An execution that wants its whole plan dropped fails instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the task is not in a state that can be skipped, if it has outlived its
+    /// maximum lifetime, or if the handle is no longer valid.
+    fn skip_task_branch(&self, reason: &str) -> Result<(), Error>;
 
     /// Sets the earliest time at which the job's next iteration is allowed to start.
     ///
@@ -200,16 +226,20 @@ impl JobHandle for JobHandleImpl {
     }
 
     fn complete_task(&self, task_id: &Uuid, output: Vec<u8>) -> Result<(), Error> {
-        self.write_job(|job| job.complete_task(task_id, output))
+        self.write_job(|job| job.complete_task(task_id, output, self.worker_id))
     }
 
-    fn fail_task(&self, task_id: &Uuid, error_msg: &str) -> Result<(), Error> {
+    fn fail_task(&self, task_id: &Uuid, error_msg: &str, retry: TaskRetry) -> Result<(), Error> {
         // The count of rolled-back tasks is for a log the worker writes about an execution it
         // refused; an executor failing a task through its own handle has nothing to report it to.
         self.write_job(|job| {
-            job.fail_task(task_id, error_msg)?;
+            job.fail_task(task_id, error_msg, retry, self.worker_id)?;
             Ok(())
         })
+    }
+
+    fn skip_task_branch(&self, reason: &str) -> Result<(), Error> {
+        self.write_job(|job| job.skip_task_by_executor(&self.task_id, reason, self.worker_id))
     }
 
     fn set_next_start_at(&self, next_start_at: DateTime<Utc>) -> Result<(), Error> {
@@ -303,6 +333,25 @@ mod tests {
         assert!(state.read().job().get_task(&task_id).unwrap().is_completed());
     }
 
+    /// The `Deferred` path for a decision: an executor that skipped its own task has resolved it,
+    /// so the worker has nothing left to do with it.
+    #[test]
+    fn skipping_its_own_task_resolves_it() {
+        let state = test_state();
+        let task_id = only_task_id(&state);
+        let handle = JobHandleImpl::new(Arc::clone(&state), Uuid::from_u128(2), task_id);
+        state.write().job.start_task(&task_id, Uuid::from_u128(2)).unwrap();
+
+        handle.skip_task_branch("branch is pointless").unwrap();
+
+        let task = state.read().job().find_task(&task_id).unwrap().clone();
+        assert!(task.is_skipped());
+        assert!(
+            task.is_resolved(),
+            "a resolved task is what Deferred is checked against"
+        );
+    }
+
     /// The runtime replacement for the compile-time guarantee the borrowed handle used to give:
     /// after the worker closes it, a handle that outlived its executor can neither read nor write.
     #[test]
@@ -316,7 +365,8 @@ mod tests {
 
         let failures = [
             handle.complete_task(&task_id, Vec::new()).err(),
-            handle.fail_task(&task_id, "late").err(),
+            handle.fail_task(&task_id, "late", TaskRetry::WhileBudgetLasts).err(),
+            handle.skip_task_branch("late").err(),
             handle.set_next_start_at(Utc::now()).err(),
             handle.get_task(&task_id).err(),
             handle.get_tasks_by_code(&TaskCode::new("task")).err(),

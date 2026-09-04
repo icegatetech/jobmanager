@@ -44,11 +44,11 @@ fn completed_job(job_def: &JobDefinition, worker_id: Uuid) -> Job {
         .expect("the description declares one task")
         .id();
 
-    job.work(&worker_id).expect("a new job must accept work");
+    job.start_work(&worker_id).expect("a new job must accept work");
     job.start_task(&task_id, worker_id).expect("a todo task must start");
-    job.complete_task(&task_id, b"done".to_vec())
+    job.complete_task(&task_id, b"done".to_vec(), worker_id)
         .expect("a started task must complete");
-    job.try_to_complete(&worker_id).expect("a finished job must complete");
+    job.try_settle_iteration(&worker_id).expect("a finished job must settle");
     job
 }
 
@@ -65,7 +65,7 @@ async fn save_job_refuses_a_write_from_a_version_that_moved() -> Result<(), Box<
     storage.save_job(&mut job, &cancel_token).await?;
 
     let mut winner = job.clone();
-    winner.work(&Uuid::from_u128(1))?;
+    winner.start_work(&Uuid::from_u128(1))?;
     storage.save_job(&mut winner, &cancel_token).await?;
 
     let mut loser = job;
@@ -142,7 +142,7 @@ async fn save_job_drops_the_execution_that_created_a_task() -> Result<(), Box<dy
         .first()
         .ok_or("the description declares one task")?
         .id();
-    job.work(&worker_id)?;
+    job.start_work(&worker_id)?;
     job.start_task(&parent_id, worker_id)?;
     let child_id = job.add_task(
         &TaskDefinition::new(TaskCode::new("child"), Duration::from_secs(5)),
@@ -177,7 +177,7 @@ async fn save_job_keeps_the_jobs_of_different_codes_apart() -> Result<(), Box<dy
     assert_eq!(stored_second.id(), second.id());
 
     // A version belongs to a job, so the second job's write must not make the first one's stale.
-    first.work(&Uuid::from_u128(1))?;
+    first.start_work(&Uuid::from_u128(1))?;
     storage.save_job(&mut first, &cancel_token).await?;
     assert_eq!(
         *storage.get_job(&first_code, &cancel_token).await?.status(),

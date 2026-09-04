@@ -38,9 +38,17 @@ takes an expired task over spends no attempt, so a task whose workers keep dying
 its lifetime runs out rather than after a handful of deaths. That bound is absolute: every deadline
 the task is given is capped by it, so the executor holding the task is signalled no later than the
 lifetime passes, the task is failed on the first pick afterwards, and a result returned past the
-lifetime is refused rather than stored. Once either limit is spent the task is
-terminal and its iteration ends as failed — which is not the end of the job: the next iteration is
-planned from scratch, so a permanently failing task delays work instead of blocking it forever.
+lifetime is refused rather than stored. Once either limit is spent the task is terminal and is never
+picked up again — which is not the end of the job: the next iteration is planned from scratch, so a
+permanently failing task delays work instead of blocking it forever.
+
+Besides finishing and refusing, an executor can call a refusal final with
+`TaskOutcome::TerminallyFailed` or a branch pointless with `TaskOutcome::SkippedBranch`, and a task
+can declare which unreachable dependencies it still starts on with
+`TaskDefinition::with_dependency_tolerance`. What each does to the task, to whatever waited on it,
+and to the verdict its iteration ends with is on the items themselves; the
+[`terminal_failure`](examples/terminal_failure.rs), [`skipped_branch`](examples/skipped_branch.rs)
+and [`degraded_dependency`](examples/degraded_dependency.rs) examples run one each.
 
 Old iterations do not pile up: each job keeps its most recent ones, set per job with
 `JobBuilder::keep_iterations`, and the rest are deleted in the background. Turn it off with

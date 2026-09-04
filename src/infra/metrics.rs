@@ -1,28 +1,37 @@
 use std::time::Duration;
 
-use crate::{JobCode, JobStatus, TaskCode, TaskStatus};
+use crate::{IterationVerdict, JobCode, TaskCode, TaskResolution};
 
 /// Where the crate writes its operational measurements.
 ///
 /// Every method has an empty default body, so an implementation overrides only the measurements it
 /// cares about. Implementations are called from worker and storage code paths and must not block:
 /// record and return.
+///
+/// A label whose values form a closed set of this crate's own is typed, so a sink can match it and
+/// the compiler answers for the match being whole; one whose values come from outside stays a
+/// `&str`. The operation and status of [`Self::record_storage_operation`] are read off the response
+/// of the storage SDK, and the phase of [`Self::record_task_stolen`] and
+/// [`Self::record_save_conflict_retry`] names a call site rather than a domain state.
 pub trait MetricsSink: Send + Sync {
-    /// The wall-clock duration of one job iteration, tagged with the job code and its final status.
+    /// The wall-clock duration of one job iteration, tagged with the job code and the verdict it
+    /// ended with.
     ///
-    /// Called once per iteration, when it reaches a terminal state. `status` therefore takes both
-    /// `Completed` (every task finished) and `Failed` (a task spent its attempt budget).
-    fn record_job_iteration_complete(&self, _code: &JobCode, _status: &JobStatus, _duration: Duration) {}
+    /// Called once per iteration, by the worker whose write closed it.
+    fn record_job_iteration_complete(&self, _code: &JobCode, _verdict: IterationVerdict, _duration: Duration) {}
 
-    /// The wall-clock duration of a single task execution, tagged with job code, task code and the
-    /// task's final status.
+    /// The wall-clock duration of a single task execution, tagged with job code, task code and what
+    /// the task ended as.
     ///
-    /// Called once per task, after it finishes processing, whether it completed or failed.
+    /// Called once per task a worker processed, under the resolution it stored: `Completed`,
+    /// `Failed` - a refusal, whether or not the task may be retried - or `Skipped` where the
+    /// executor called the task's branch pointless. A task the domain skipped because a dependency
+    /// became unreachable is not reported here - no worker processed it.
     fn record_task_processed(
         &self,
         _job_code: &JobCode,
         _task_code: &TaskCode,
-        _status: &TaskStatus,
+        _resolution: TaskResolution,
         _duration: Duration,
     ) {
     }

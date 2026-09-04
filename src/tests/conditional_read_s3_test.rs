@@ -114,7 +114,7 @@ async fn run_moved_iteration_read(codec: JobStateCodecKind) -> Result<(), Box<dy
     let job_code = JobCode::new("moved_job");
     let (storage, mut job) = s3_storage_with_saved_job(&container, &job_code, codec).await?;
     let stale_meta = meta_of(&job);
-    job.work(&Uuid::from_u128(1))?;
+    job.start_work(&Uuid::from_u128(1))?;
     storage.save_job(&mut job, &CancellationToken::new()).await?;
 
     let read = storage.get_changed_job(&stale_meta, &CancellationToken::new()).await?;

@@ -1,7 +1,8 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use crate::{
-    JobCode, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle, NoopMetrics, Storage,
+    JobCode, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle, MetricsSink, NoopMetrics,
+    Storage,
 };
 
 /// `ManagerEnv` manages `JobsManager` lifecycle for integration tests
@@ -12,14 +13,32 @@ pub struct ManagerEnv {
 }
 
 impl ManagerEnv {
-    /// Create a new `ManagerEnv`
+    /// Create a new `ManagerEnv` whose pool is not measured.
     pub fn new(
         storage: Arc<dyn Storage>,
         config: JobsManagerConfig,
         job_registry_handle: Arc<JobRegistry>,
         job_registry: Vec<JobDefinition>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let manager = JobsManager::new(storage.clone(), config, job_registry_handle, Arc::new(NoopMetrics))?;
+        Self::with_metrics(
+            storage,
+            config,
+            job_registry_handle,
+            job_registry,
+            Arc::new(NoopMetrics),
+        )
+    }
+
+    /// The same environment reporting to `metrics`, for a test whose expectation is a measurement
+    /// rather than the stored state.
+    pub fn with_metrics(
+        storage: Arc<dyn Storage>,
+        config: JobsManagerConfig,
+        job_registry_handle: Arc<JobRegistry>,
+        job_registry: Vec<JobDefinition>,
+        metrics: Arc<dyn MetricsSink>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let manager = JobsManager::new(storage.clone(), config, job_registry_handle, metrics)?;
         let manager_handle = manager.start()?;
 
         // Store job definitions for later checking

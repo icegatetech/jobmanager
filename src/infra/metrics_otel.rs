@@ -5,7 +5,7 @@ use opentelemetry::{
     metrics::{Counter, Histogram, Meter},
 };
 
-use crate::{JobCode, JobStatus, MetricsSink, TaskCode, TaskStatus};
+use crate::{IterationVerdict, JobCode, MetricsSink, TaskCode, TaskResolution};
 
 /// [`MetricsSink`] that records through `OpenTelemetry`.
 ///
@@ -83,24 +83,30 @@ impl OtelMetrics {
 
 impl MetricsSink for OtelMetrics {
     /// Records `jobmanager_job_duration`.
-    fn record_job_iteration_complete(&self, code: &JobCode, status: &JobStatus, duration: Duration) {
+    fn record_job_iteration_complete(&self, code: &JobCode, verdict: IterationVerdict, duration: Duration) {
         self.job_duration.record(
             duration.as_secs_f64(),
             &[
                 KeyValue::new("code", code.to_string()),
-                KeyValue::new("status", format!("{status:?}")),
+                KeyValue::new("status", verdict.as_str()),
             ],
         );
     }
 
     /// Records `jobmanager_task_duration`.
-    fn record_task_processed(&self, job_code: &JobCode, task_code: &TaskCode, status: &TaskStatus, duration: Duration) {
+    fn record_task_processed(
+        &self,
+        job_code: &JobCode,
+        task_code: &TaskCode,
+        resolution: TaskResolution,
+        duration: Duration,
+    ) {
         self.task_duration.record(
             duration.as_secs_f64(),
             &[
                 KeyValue::new("job_code", job_code.to_string()),
                 KeyValue::new("task_code", task_code.to_string()),
-                KeyValue::new("status", format!("{status:?}")),
+                KeyValue::new("status", resolution.as_str()),
             ],
         );
     }
