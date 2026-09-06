@@ -4,6 +4,23 @@ use uuid::Uuid;
 
 use crate::{JobDefinitionId, JobError, TaskLimits};
 
+/// Number of execution attempts a task gets before it is terminally failed.
+///
+/// An attempt is spent by the first start of the task and by every start following a refusal of
+/// the executor, never by a takeover of an expired task, so this budget bounds how often the task's
+/// own work may fail. Sized for transient failures (a
+/// flaky object-store call): five attempts absorb those, while a task failing deterministically
+/// stops retrying instead of blocking its dependents and the job's next iteration forever.
+pub const DEFAULT_MAX_ATTEMPTS: u32 = 5;
+
+/// How many times the default maximum lifetime of a task exceeds its deadline.
+///
+/// Takeovers are bounded by the lifetime rather than by the attempt budget, and five deadlines
+/// repeat the ceiling a budget of five starts used to give them. For a task that keeps failing the
+/// lifetime is a second, independent limit: it runs from the first start, so retries that are slow
+/// or start late can run out of it while attempts are still left.
+pub const DEFAULT_LIFETIME_MULTIPLIER: u32 = 5;
+
 /// Task identifier used in job definitions and execution.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -48,15 +65,18 @@ impl From<&str> for TaskCode {
 /// Task lifecycle state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum TaskStatus {
+pub(crate) enum TaskStatus {
     // TODO(med): add status transitions
     /// Task is waiting to be picked up by a worker.
     Todo,
     /// Task is blocked by dependencies.
     ///
-    /// Assigned at creation to any task declaring dependencies. It becomes `Todo` when every
-    /// dependency has reached `Completed`; the unblocking happens lazily while a worker looks
-    /// for work, not at the moment the last dependency finishes.
+    /// Assigned at creation to any task declaring dependencies. It becomes `Todo` once every
+    /// dependency has settled the way this task accepts: completed, or - where the task declared it
+    /// through [`TaskDefinition::with_dependency_tolerance`] - failed for good or skipped. The
+    /// unblocking happens lazily while a worker looks for work, not at the moment the last
+    /// dependency settles. A dependency that will never settle that way leaves the task `Skipped`
+    /// instead.
     Blocked,
     /// Task is currently being executed by a worker.
     ///
@@ -68,15 +88,26 @@ pub enum TaskStatus {
     Started,
     /// Task finished successfully.
     ///
-    /// Terminal - such a task is never picked up again, and a job iteration completes only when
-    /// all of its tasks are in this state.
+    /// Terminal - such a task is never picked up again. It is not what a completed job iteration is
+    /// made of: an iteration ends as `JobStatus::Completed` when no failure was left unhandled, so
+    /// it may hold tasks in this state alongside skipped ones and a failure a dependent answered
+    /// for.
     Completed,
-    /// Task execution failed, task will be processed again.
+    /// Task execution failed.
     ///
     /// Retried until the task's attempt budget is spent or its maximum lifetime has passed; after
-    /// that it is terminal - it is never picked up again and its job iteration ends as
-    /// `JobStatus::Failed`.
+    /// that it is terminal and never picked up again. A refusal the executor declared final through
+    /// [`TaskRetry::Never`] is terminal at once, whatever is left of either limit. A terminal
+    /// failure ends its job iteration as `JobStatus::Failed` unless a dependent declared it
+    /// survives one and resolved on its own.
     Failed,
+    /// The task was ended without being run to a result: its branch has no meaning.
+    ///
+    /// Terminal. Skipped on the decision of its executor, this is not a failure and does not by
+    /// itself keep the iteration from ending as `JobStatus::Completed`; skipped because a dependency
+    /// failed, it is that failure surfacing one step further down the graph and the iteration ends
+    /// as `JobStatus::Failed`. [`ImmutableTask::get_resolution_reason`] carries the reason that was recorded.
+    Skipped(SkipCause),
 }
 
 impl std::fmt::Display for TaskStatus {
@@ -87,26 +118,109 @@ impl std::fmt::Display for TaskStatus {
             Self::Started => write!(f, "started"),
             Self::Completed => write!(f, "completed"),
             Self::Failed => write!(f, "failed"),
+            Self::Skipped(cause) => write!(f, "skipped ({})", cause.as_str()),
         }
     }
 }
 
-/// Number of execution attempts a task gets before it is terminally failed.
+/// What a task a worker processed ended as.
 ///
-/// An attempt is spent by the first start of the task and by every start following a refusal of
-/// the executor, never by a takeover of an expired task, so this budget bounds how often the task's
-/// own work may fail. Sized for transient failures (a
-/// flaky object-store call): five attempts absorb those, while a task failing deterministically
-/// stops retrying instead of blocking its dependents and the job's next iteration forever.
-pub const DEFAULT_MAX_ATTEMPTS: u32 = 5;
+/// Narrower than the task's own state: this is what a resolved task ended as, and the states a task
+/// passes through on its way there are not measurements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskResolution {
+    /// The task finished successfully.
+    Completed,
+    /// The executor refused the task.
+    Failed,
+    /// The task was ended without being run to a result.
+    Skipped,
+}
 
-/// How many times the default maximum lifetime of a task exceeds its deadline.
+impl TaskResolution {
+    /// Label this resolution is measured under.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+impl std::fmt::Display for TaskResolution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Why a task ended up skipped.
 ///
-/// Takeovers are bounded by the lifetime rather than by the attempt budget, and five deadlines
-/// repeat the ceiling a budget of five starts used to give them. For a task that keeps failing the
-/// lifetime is a second, independent limit: it runs from the first start, so retries that are slow
-/// or start late can run out of it while attempts are still left.
-pub const DEFAULT_LIFETIME_MULTIPLIER: u32 = 5;
+/// The three are not interchangeable for the iteration's verdict: a decision is what the feature
+/// exists for, a task skipped because something it needed failed is that failure surfacing one step
+/// further down the graph, and one skipped because a branch above it was given up on is neither -
+/// it neither spoils the verdict nor answers for a failure, because nobody looked at that failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SkipCause {
+    /// The executor decided the branch has no meaning.
+    ExecutorDecision,
+    /// A dependency became unreachable through a failure - its own, or one further up the graph.
+    FailedDependency,
+    /// A dependency was given up on further up the graph, by a decision rather than by a failure.
+    SkippedDependency,
+}
+
+impl SkipCause {
+    /// Whether a task skipped for this cause carries a failure into the iteration's verdict.
+    pub(crate) const fn carries_failure(self) -> bool {
+        matches!(self, Self::FailedDependency)
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExecutorDecision => "executor decision",
+            Self::FailedDependency => "failed dependency",
+            Self::SkippedDependency => "skipped dependency",
+        }
+    }
+}
+
+/// Whether a refusal of the executor may be repeated.
+///
+/// The attempt budget bounds how many refusals a task gets; this says whether a given refusal is
+/// worth any of them. A deterministic failure - input that will not parse, a rule that is not
+/// registered - is not, and burning the budget on it only keeps a worker busy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRetry {
+    /// The refusal is repeated while the attempt budget and the maximum lifetime last.
+    #[default]
+    WhileBudgetLasts,
+    /// The refusal is final: the task is terminal at once, whatever is left of its budget.
+    Never,
+}
+
+/// States of a dependency a task still starts on.
+///
+/// Both default to false, which is the rule a task without them follows: it waits for every
+/// dependency to complete. Tolerance is about a dependency that will never run again - one that
+/// failed with attempts to spare is still coming, and is waited for either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DependencyTolerance {
+    /// Start even though a dependency failed for good.
+    pub allows_failed: bool,
+    /// Start even though a dependency was skipped.
+    pub allows_skipped: bool,
+}
+
+impl DependencyTolerance {
+    /// Whether anything was declared at all, which is what makes tolerance on a task without
+    /// dependencies a description nobody can act on.
+    pub(crate) const fn is_declared(self) -> bool {
+        self.allows_failed || self.allows_skipped
+    }
+}
 
 /// How a task names another task it waits for.
 ///
@@ -163,6 +277,7 @@ pub struct TaskDefinition {
     max_lifetime: std::time::Duration,
     depends_on: Vec<TaskRef>,
     max_attempts: u32,
+    tolerance: DependencyTolerance,
 }
 
 impl TaskDefinition {
@@ -189,6 +304,7 @@ impl TaskDefinition {
                 .unwrap_or(std::time::Duration::MAX),
             depends_on: Vec::new(),
             max_attempts: DEFAULT_MAX_ATTEMPTS,
+            tolerance: DependencyTolerance::default(),
         }
     }
 
@@ -273,13 +389,35 @@ impl TaskDefinition {
         self
     }
 
+    /// Declares which unreachable dependencies the task still starts on, replacing whatever was
+    /// declared before.
+    ///
+    /// A dependency that failed with attempts and lifetime to spare is not unreachable: it is
+    /// coming back, and the task waits for it whatever this says. Tolerance on a task that depends
+    /// on nothing is rejected where the task is created, since there is nothing for it to describe.
+    #[must_use]
+    pub const fn with_dependency_tolerance(mut self, tolerance: DependencyTolerance) -> Self {
+        self.tolerance = tolerance;
+        self
+    }
+
     /// Returns the execution attempt budget.
     const fn max_attempts(&self) -> u32 {
         self.max_attempts
     }
 
+    pub(crate) const fn tolerance(&self) -> DependencyTolerance {
+        self.tolerance
+    }
+
     pub(crate) fn depends_on(&self) -> &[TaskRef] {
         &self.depends_on
+    }
+
+    /// Whether the definition declares which unreachable dependencies it starts on while waiting
+    /// for none, which is a description of nothing and a mistake to report rather than ignore.
+    pub(crate) const fn is_declares_tolerance_valid(&self) -> bool {
+        !(self.tolerance.is_declared() && self.depends_on.is_empty())
     }
 
     /// Checks the definition against the limits of the job it is about to join.
@@ -350,13 +488,15 @@ pub trait ImmutableTask: Send + Sync {
     /// pending task from one that completed with no output.
     fn get_output(&self) -> &[u8];
 
-    /// Message of the last failure, empty if the task never failed.
+    /// Why the task did not complete: the message of its last refusal, or the reason its branch was
+    /// given up on. Empty while neither happened.
     ///
-    /// It is not cleared when the task is retried, so it may describe an earlier attempt of a
-    /// task that is currently running.
-    fn get_error(&self) -> &str;
+    /// The message of a refusal is not cleared when the task is retried, so it may describe an
+    /// earlier attempt of a task that is currently running.
+    fn get_resolution_reason(&self) -> &str;
 
-    /// Ids of tasks that must complete before this one becomes runnable.
+    /// Ids of tasks that must settle before this one becomes runnable - by completing, or, where
+    /// [`TaskDefinition::with_dependency_tolerance`] says so, by failing for good or being skipped.
     ///
     /// An existing task always has its dependencies resolved, so this is an id rather than a
     /// [`TaskRef`]: a reference would be wider than the domain here.
@@ -373,11 +513,19 @@ pub trait ImmutableTask: Send + Sync {
     /// Whether the task finished successfully. Terminal - it will not be executed again.
     fn is_completed(&self) -> bool;
 
+    /// Whether the task was ended without being run to a result. Terminal - it will not be
+    /// executed again.
+    ///
+    /// True both for a branch its own executor called pointless and for a task put out because
+    /// something it depended on became unreachable; which of the two it was is not part of this
+    /// view, and [`Self::get_resolution_reason`] carries the reason that was recorded.
+    fn is_skipped(&self) -> bool;
+
     /// Whether the last attempt failed.
     ///
     /// Not terminal on its own: the task is retried while [`Self::attempts`] is below
     /// [`Self::max_attempts`] and its maximum lifetime has not passed, and becomes terminal once
-    /// either of the two runs out.
+    /// either of the two runs out - or at once, where the executor declared the refusal final.
     fn is_failed(&self) -> bool;
 
     /// Number of attempts the task has spent, including the one in progress.
@@ -389,14 +537,26 @@ pub trait ImmutableTask: Send + Sync {
     fn attempts(&self) -> u32;
 
     /// Attempt budget the task was defined with, bounding refusals of the executor alone: once
-    /// [`Self::attempts`] reaches it, a failed task is terminal and its job iteration ends as
-    /// failed.
+    /// [`Self::attempts`] reaches it, a failed task is terminal. It is not the only way to get
+    /// there - the maximum lifetime and a refusal the executor declared final end a task with the
+    /// budget untouched.
     ///
     /// It does not bound takeovers. A task left `Started` past its deadline is taken over whatever
     /// this budget says, so a spent budget is no guarantee against a second run of the same work;
     /// what stops the takeovers is the task's maximum lifetime, set with
     /// [`TaskDefinition::with_max_lifetime`].
     fn max_attempts(&self) -> u32;
+}
+
+/// How a dependency of a task has settled, judged by what that task declared it tolerates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DependencyVerdict {
+    /// Settled the way this task accepts: it no longer holds the task back.
+    Unblocked,
+    /// Not settled, or settled in a way that may still change - the task waits for it.
+    Blocked,
+    /// Will never settle the way this task accepts, and the cause this task hands down.
+    Skipped(SkipCause),
 }
 
 /// What a worker may do with a task right now, as the task itself sees it.
@@ -411,7 +571,8 @@ pub(crate) enum TaskAvailability {
     Pickable,
     /// The task has outlived its maximum lifetime, so it is to be failed rather than taken over.
     ExpiredPastLifetime,
-    /// Nothing to do with it: running within its deadline, blocked, completed, or terminally failed.
+    /// Nothing to do with it: running within its deadline, blocked, completed, skipped, or
+    /// terminally failed.
     Unavailable,
 }
 
@@ -442,8 +603,36 @@ pub(crate) struct Task {
     max_attempts: u32,
     input: Vec<u8>,
     output: Vec<u8>,
-    error_msg: String,
+    resolution_reason: String,
+    retry: TaskRetry,
+    tolerance: DependencyTolerance,
     depends_on: Vec<Uuid>,
+}
+
+/// What a task that already has a history is rebuilt from.
+///
+/// A parameter struct rather than a positional list: the list has outgrown what a call site can be
+/// read at.
+pub(crate) struct RestoredTask {
+    pub(crate) id: Uuid,
+    pub(crate) code: TaskCode,
+    pub(crate) status: TaskStatus,
+    pub(crate) processing_by_worker: Option<Uuid>,
+    pub(crate) created_by_worker: Uuid,
+    pub(crate) timeout: Duration,
+    pub(crate) max_lifetime: Duration,
+    pub(crate) started_at: Option<DateTime<Utc>>,
+    pub(crate) completed_at: Option<DateTime<Utc>>,
+    pub(crate) deadline_at: Option<DateTime<Utc>>,
+    pub(crate) lifetime_deadline_at: Option<DateTime<Utc>>,
+    pub(crate) attempt: u32,
+    pub(crate) max_attempts: u32,
+    pub(crate) input: Vec<u8>,
+    pub(crate) output: Vec<u8>,
+    pub(crate) resolution_reason: String,
+    pub(crate) retry: TaskRetry,
+    pub(crate) tolerance: DependencyTolerance,
+    pub(crate) depends_on: Vec<Uuid>,
 }
 
 impl Task {
@@ -486,54 +675,39 @@ impl Task {
             max_attempts: task_def.max_attempts(),
             input: task_def.input().to_vec(),
             output: Vec::new(),
-            error_msg: String::new(),
+            resolution_reason: String::new(),
+            retry: TaskRetry::default(),
+            tolerance: task_def.tolerance(),
             depends_on,
         }
     }
 
-    // TODO(med): carry the fields in a parameter struct; the list has outgrown what a positional
-    // call site can be read at.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) const fn restore(
-        id: Uuid,
-        code: TaskCode,
-        status: TaskStatus,
-        processing_by_worker: Option<Uuid>,
-        created_by_worker: Uuid,
-        timeout: Duration,
-        max_lifetime: Duration,
-        started_at: Option<DateTime<Utc>>,
-        completed_at: Option<DateTime<Utc>>,
-        deadline_at: Option<DateTime<Utc>>,
-        lifetime_deadline_at: Option<DateTime<Utc>>,
-        attempt: u32,
-        max_attempts: u32,
-        input: Vec<u8>,
-        output: Vec<u8>,
-        error_msg: String,
-        depends_on: Vec<Uuid>,
-    ) -> Self {
+    /// Rebuilds a task that already has a history, into a fresh copy of its job.
+    ///
+    /// `created_by_task` is deliberately absent: a restored task belongs to no open execution - see
+    /// the field's own comment.
+    pub(crate) fn restore(fields: RestoredTask) -> Self {
         Self {
-            id,
-            code,
-            status,
-            processing_by_worker,
-            created_by_worker,
-            // A restored task has no parent to be rolled back by: whatever created it is long past
-            // its own execution, and the task is in storage rather than in a worker's copy alone.
+            id: fields.id,
+            code: fields.code,
+            status: fields.status,
+            processing_by_worker: fields.processing_by_worker,
+            created_by_worker: fields.created_by_worker,
             created_by_task: None,
-            timeout,
-            max_lifetime,
-            started_at,
-            completed_at,
-            deadline_at,
-            lifetime_deadline_at,
-            attempt,
-            max_attempts,
-            input,
-            output,
-            error_msg,
-            depends_on,
+            timeout: fields.timeout,
+            max_lifetime: fields.max_lifetime,
+            started_at: fields.started_at,
+            completed_at: fields.completed_at,
+            deadline_at: fields.deadline_at,
+            lifetime_deadline_at: fields.lifetime_deadline_at,
+            attempt: fields.attempt,
+            max_attempts: fields.max_attempts,
+            input: fields.input,
+            output: fields.output,
+            resolution_reason: fields.resolution_reason,
+            retry: fields.retry,
+            tolerance: fields.tolerance,
+            depends_on: fields.depends_on,
         }
     }
 
@@ -602,8 +776,27 @@ impl Task {
         &self.output
     }
 
-    pub(crate) fn error_msg(&self) -> &str {
-        &self.error_msg
+    pub(crate) fn resolution_reason(&self) -> &str {
+        &self.resolution_reason
+    }
+
+    pub(crate) const fn retry(&self) -> TaskRetry {
+        self.retry
+    }
+
+    pub(crate) const fn skip_cause(&self) -> Option<SkipCause> {
+        match self.status {
+            TaskStatus::Skipped(cause) => Some(cause),
+            TaskStatus::Todo
+            | TaskStatus::Blocked
+            | TaskStatus::Started
+            | TaskStatus::Completed
+            | TaskStatus::Failed => None,
+        }
+    }
+
+    pub(crate) const fn tolerance(&self) -> DependencyTolerance {
+        self.tolerance
     }
 
     pub(crate) fn depends_on(&self) -> &[Uuid] {
@@ -635,8 +828,22 @@ impl Task {
         matches!(self.status, TaskStatus::Started)
     }
 
+    pub(crate) const fn is_skipped(&self) -> bool {
+        matches!(self.status, TaskStatus::Skipped(_))
+    }
+
+    /// What the task ended as, or `None` while it can still be executed.
+    pub(crate) const fn resolution(&self) -> Option<TaskResolution> {
+        match self.status {
+            TaskStatus::Completed => Some(TaskResolution::Completed),
+            TaskStatus::Failed => Some(TaskResolution::Failed),
+            TaskStatus::Skipped(_) => Some(TaskResolution::Skipped),
+            TaskStatus::Todo | TaskStatus::Blocked | TaskStatus::Started => None,
+        }
+    }
+
     pub(crate) const fn is_resolved(&self) -> bool {
-        self.is_completed() || self.is_failed()
+        self.resolution().is_some()
     }
 
     /// Whether the task failed and ran out of either limit - its attempt budget or its maximum
@@ -645,8 +852,17 @@ impl Task {
     ///
     /// The lifetime is the second reason because a task failed *for* outliving it keeps attempts
     /// to spare: without it that task would be pickable again and the iteration would never end.
-    pub(crate) fn is_terminally_failed(&self) -> bool {
-        self.is_failed() && (self.attempt >= self.max_attempts || self.is_lifetime_expired_at(Utc::now()))
+    /// The third is the executor's own verdict: a refusal it declared final leaves both limits
+    /// untouched and is terminal all the same.
+    ///
+    /// The moment comes from the caller so that a verdict reached over several tasks is reached at
+    /// one reading of the clock: a lifetime running out between two readings would leave a task
+    /// unreachable for one of them and still coming for the other.
+    pub(crate) fn is_terminally_failed_at(&self, now: DateTime<Utc>) -> bool {
+        self.is_failed()
+            && (matches!(self.retry, TaskRetry::Never)
+                || self.attempt >= self.max_attempts
+                || self.is_lifetime_expired_at(now))
     }
 
     /// What a worker may do with this task right now.
@@ -657,22 +873,21 @@ impl Task {
     /// that start is a takeover.
     ///
     /// The two limits can only disagree on state written before the deadline was capped by the
-    /// lifetime, since [`Self::start`] leaves the deadline at or below it.
-    pub(crate) fn check_availability(&self) -> TaskAvailability {
+    /// lifetime, since [`Self::start`] leaves the deadline at or below it. Both of them, and the
+    /// terminality of a failure, are judged by the one moment the caller passes in: taken apart, a
+    /// task could be found takeable by the first predicate and past its lifetime by the second.
+    pub(crate) fn check_availability_at(&self, now: DateTime<Utc>) -> TaskAvailability {
         match self.status {
             TaskStatus::Todo => TaskAvailability::Pickable,
-            TaskStatus::Blocked | TaskStatus::Completed => TaskAvailability::Unavailable,
+            TaskStatus::Blocked | TaskStatus::Completed | TaskStatus::Skipped(_) => TaskAvailability::Unavailable,
             TaskStatus::Failed => {
-                if self.is_terminally_failed() {
+                if self.is_terminally_failed_at(now) {
                     TaskAvailability::Unavailable
                 } else {
                     TaskAvailability::Pickable
                 }
             }
             TaskStatus::Started => {
-                // Both deadlines are judged by one reading: taken apart, a task could be found
-                // takeable by the first predicate and past its lifetime by the second.
-                let now = Utc::now();
                 if self.is_lifetime_expired_at(now) {
                     TaskAvailability::ExpiredPastLifetime
                 } else if self.is_expired_at(now) {
@@ -684,14 +899,50 @@ impl Task {
         }
     }
 
+    /// How `dependency` has settled for this task, by what this task declared it tolerates.
+    ///
+    /// A dependency that failed with attempts and lifetime to spare is `Pending`: it is coming
+    /// back, and a task released on it would take its degraded path against data still on its way.
+    ///
+    /// The cause handed down is derived rather than copied: a task the cascade put out decided
+    /// nothing, so wearing its dependency's [`SkipCause::ExecutorDecision`] would let it answer for
+    /// a failure it never looked at. Only a failure travels unchanged, because that is the one the
+    /// iteration's verdict has to speak about.
+    ///
+    /// The moment comes from the caller so that a verdict reached over several dependencies is
+    /// reached at one reading of the clock.
+    pub(crate) fn judge_dependency(&self, dependency: &Self, now: DateTime<Utc>) -> DependencyVerdict {
+        if dependency.is_completed() {
+            return DependencyVerdict::Unblocked;
+        }
+        if dependency.is_terminally_failed_at(now) {
+            return if self.tolerance.allows_failed {
+                DependencyVerdict::Unblocked
+            } else {
+                DependencyVerdict::Skipped(SkipCause::FailedDependency)
+            };
+        }
+        if let Some(cause) = dependency.skip_cause() {
+            return if self.tolerance.allows_skipped {
+                DependencyVerdict::Unblocked
+            } else if cause.carries_failure() {
+                DependencyVerdict::Skipped(SkipCause::FailedDependency)
+            } else {
+                DependencyVerdict::Skipped(SkipCause::SkippedDependency)
+            };
+        }
+
+        DependencyVerdict::Blocked
+    }
+
     pub(crate) const fn unblock(&mut self) {
         if matches!(self.status, TaskStatus::Blocked) {
             self.status = TaskStatus::Todo;
         }
     }
 
-    pub(crate) fn can_be_picked_up(&self) -> bool {
-        matches!(self.check_availability(), TaskAvailability::Pickable)
+    pub(crate) fn can_be_picked_up_at(&self, now: DateTime<Utc>) -> bool {
+        matches!(self.check_availability_at(now), TaskAvailability::Pickable)
     }
 
     /// Hands the task to `worker_id`, placing the deadline of that ownership and, on the first
@@ -704,7 +955,8 @@ impl Task {
     /// the range of dates. The task is left as it was in every error case: both moments are computed
     /// before anything is assigned.
     pub(crate) fn start(&mut self, worker_id: Uuid) -> Result<(), JobError> {
-        if !self.can_be_picked_up() {
+        let now = Utc::now();
+        if !self.can_be_picked_up_at(now) {
             if self.processing_by_worker != Some(worker_id) {
                 return Err(JobError::TaskWorkerMismatch);
             }
@@ -718,7 +970,6 @@ impl Task {
         // behind a dependency does not eat into it. Both additions are checked: a definition placing
         // a moment outside the range of dates passes validation - a duration is counted in a wider
         // range than a date is - and the plain `+` panics on it.
-        let now = Utc::now();
         let (Some(lifetime_deadline_at), Some(timeout_deadline_at)) = (
             self.lifetime_deadline_at.or_else(|| now.checked_add_signed(self.max_lifetime)),
             now.checked_add_signed(self.timeout),
@@ -783,7 +1034,45 @@ impl Task {
         Ok(())
     }
 
-    pub(crate) fn fail(&mut self, error_msg: &str) -> Result<(), JobError> {
+    /// Ends the task without running it to a result, recording why.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::Other`] if the task is neither running nor blocked, or if a running task
+    /// has outlived its maximum lifetime - the bound is absolute, so a decision returned past it is
+    /// refused exactly as a result is. Past the lifetime the task belongs to whoever took it over:
+    /// that worker fails it, and an executor still running would otherwise overwrite the verdict
+    /// already written for it.
+    pub(crate) fn skip(&mut self, reason: &str, cause: SkipCause) -> Result<(), JobError> {
+        let now = Utc::now();
+        if !matches!(self.status, TaskStatus::Started | TaskStatus::Blocked) {
+            return Err(JobError::Other(format!(
+                "cannot skip task (id: {}; code: {}) with status {:?}",
+                self.id, self.code, self.status
+            )));
+        }
+        if self.is_started() && self.is_lifetime_expired_at(now) {
+            return Err(JobError::Other(format!(
+                "cannot skip task (id: {}; code: {}): it outlived its maximum lifetime of {} ms",
+                self.id,
+                self.code,
+                self.max_lifetime.num_milliseconds()
+            )));
+        }
+
+        self.resolution_reason = reason.to_string();
+        self.status = TaskStatus::Skipped(cause);
+        self.completed_at = Some(now);
+
+        Ok(())
+    }
+
+    /// Records a refusal of the executor, and whether it is one worth repeating.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::Other`] if the task is not running.
+    pub(crate) fn fail(&mut self, error_msg: &str, retry: TaskRetry) -> Result<(), JobError> {
         if !matches!(self.status, TaskStatus::Started) {
             return Err(JobError::Other(format!(
                 "cannot fail task (id: {}; code: {}) with status {:?}",
@@ -791,7 +1080,8 @@ impl Task {
             )));
         }
 
-        self.error_msg = error_msg.to_string();
+        self.resolution_reason = error_msg.to_string();
+        self.retry = retry;
         self.status = TaskStatus::Failed;
         self.completed_at = Some(Utc::now());
 
@@ -817,8 +1107,8 @@ impl ImmutableTask for Task {
         self.output()
     }
 
-    fn get_error(&self) -> &str {
-        self.error_msg()
+    fn get_resolution_reason(&self) -> &str {
+        self.resolution_reason()
     }
 
     fn depends_on(&self) -> &[Uuid] {
@@ -835,6 +1125,10 @@ impl ImmutableTask for Task {
 
     fn is_failed(&self) -> bool {
         self.is_failed()
+    }
+
+    fn is_skipped(&self) -> bool {
+        self.is_skipped()
     }
 
     fn attempts(&self) -> u32 {
@@ -870,6 +1164,28 @@ mod tests {
             .with_input(vec![1, 2])
             .with_input(vec![3]);
         assert_eq!(def.input(), &[3]);
+    }
+
+    /// The tolerance is a single declaration rather than an accumulating one: a second call must
+    /// replace the flags of the first, not add to them.
+    #[test]
+    fn with_dependency_tolerance_replaces_the_declaration() {
+        let def = TaskDefinition::new("t", std::time::Duration::from_secs(1))
+            .with_dependency_tolerance(DependencyTolerance {
+                allows_failed: true,
+                allows_skipped: false,
+            })
+            .with_dependency_tolerance(DependencyTolerance {
+                allows_failed: false,
+                allows_skipped: true,
+            });
+        assert_eq!(
+            def.tolerance(),
+            DependencyTolerance {
+                allows_failed: false,
+                allows_skipped: true,
+            }
+        );
     }
 
     #[test]
@@ -993,29 +1309,184 @@ mod tests {
         assert_eq!(*free.status(), TaskStatus::Todo);
     }
 
+    /// The point of the terminal refusal: a deterministic failure stops the task without spending
+    /// the budget the retries of a flaky one need.
+    #[test]
+    fn a_refusal_declared_terminal_ends_the_task_with_its_budget_untouched() {
+        let def = TaskDefinition::new("t", std::time::Duration::from_secs(5));
+        let mut task = Task::new(Uuid::from_u128(2), Uuid::from_u128(1), None, &def, Vec::new());
+        task.start(Uuid::from_u128(3)).unwrap();
+
+        task.fail("decode input", TaskRetry::Never).unwrap();
+
+        assert!(task.is_terminally_failed_at(Utc::now()));
+        assert_eq!(task.check_availability_at(Utc::now()), TaskAvailability::Unavailable);
+        assert_eq!(
+            task.attempt(),
+            1,
+            "a terminal refusal must not spend the rest of the budget"
+        );
+    }
+
+    /// The ordinary refusal keeps its behaviour: the task is picked up again while the budget lasts.
+    #[test]
+    fn a_refusal_declared_retryable_leaves_the_task_pickable() {
+        let def = TaskDefinition::new("t", std::time::Duration::from_secs(5));
+        let mut task = Task::new(Uuid::from_u128(2), Uuid::from_u128(1), None, &def, Vec::new());
+        task.start(Uuid::from_u128(3)).unwrap();
+
+        task.fail("flaky store", TaskRetry::WhileBudgetLasts).unwrap();
+
+        assert!(!task.is_terminally_failed_at(Utc::now()));
+        assert_eq!(task.check_availability_at(Utc::now()), TaskAvailability::Pickable);
+    }
+
+    /// The executor's own decision about the task it is running.
+    #[test]
+    fn a_started_task_is_skipped_by_its_executor() {
+        let def = TaskDefinition::new("t", std::time::Duration::from_secs(5));
+        let mut task = Task::new(Uuid::from_u128(2), Uuid::from_u128(1), None, &def, Vec::new());
+        task.start(Uuid::from_u128(3)).unwrap();
+
+        task.skip("no rules matched", SkipCause::ExecutorDecision).unwrap();
+
+        assert!(task.is_skipped());
+        assert!(task.is_resolved());
+        assert_eq!(task.skip_cause(), Some(SkipCause::ExecutorDecision));
+        assert_eq!(task.check_availability_at(Utc::now()), TaskAvailability::Unavailable);
+    }
+
+    /// The label a consumer writes its dashboards and alerts against, read both by the metrics
+    /// attribute (`OtelMetrics`) and by `Display`. Stated literally rather than derived from the
+    /// variant, so renaming one fails here instead of silently in the consumer.
+    #[test]
+    fn a_task_resolution_is_measured_under_its_own_label() {
+        assert_eq!(TaskResolution::Completed.as_str(), "completed");
+        assert_eq!(TaskResolution::Failed.as_str(), "failed");
+        assert_eq!(TaskResolution::Skipped.as_str(), "skipped");
+    }
+
+    /// The string the caller gives is what a dependent reads off the task through
+    /// `ImmutableTask::get_resolution_reason`, so it is recorded as it was given whatever ended the
+    /// branch - a decision of the executor or a cascade putting the branch out. What the cascade
+    /// words its own reason with is asserted in `the_cascade_carries_a_failure_as_the_cause`.
+    #[test]
+    fn a_skip_records_the_reason_it_was_given() {
+        let def = TaskDefinition::new("t", std::time::Duration::from_secs(5));
+        let mut decided = Task::new(Uuid::from_u128(2), Uuid::from_u128(1), None, &def, Vec::new());
+        decided.start(Uuid::from_u128(3)).unwrap();
+
+        decided.skip("no rules matched", SkipCause::ExecutorDecision).unwrap();
+
+        assert_eq!(decided.resolution_reason(), "no rules matched");
+
+        let mut put_out = Task::new(
+            Uuid::from_u128(4),
+            Uuid::from_u128(1),
+            None,
+            &def,
+            vec![Uuid::from_u128(5)],
+        );
+
+        put_out.skip("put out with the branch", SkipCause::FailedDependency).unwrap();
+
+        assert_eq!(put_out.resolution_reason(), "put out with the branch");
+    }
+
+    /// The cascade's own move: a task that never started is skipped from `Blocked`.
+    #[test]
+    fn a_blocked_task_is_skipped_by_the_cascade() {
+        let def = TaskDefinition::new("t", std::time::Duration::from_secs(5));
+        let mut task = Task::new(
+            Uuid::from_u128(2),
+            Uuid::from_u128(1),
+            None,
+            &def,
+            vec![Uuid::from_u128(3)],
+        );
+
+        task.skip("dependency failed", SkipCause::FailedDependency).unwrap();
+
+        assert_eq!(task.skip_cause(), Some(SkipCause::FailedDependency));
+    }
+
+    /// The states a skip must refuse: three of them are terminal already, and `Todo` never waits
+    /// for anything the cascade could take away.
+    #[test]
+    fn a_skip_is_refused_from_every_other_state() {
+        for status in [
+            TaskStatus::Todo,
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Skipped(SkipCause::ExecutorDecision),
+        ] {
+            let mut task = Task::restore(RestoredTask {
+                status: status.clone(),
+                ..restored_task_fields()
+            });
+
+            let error = task
+                .skip("late", SkipCause::ExecutorDecision)
+                .expect_err("a skip from this state must be refused");
+
+            assert!(error.to_string().contains("cannot skip task"), "{status}: {error}");
+        }
+    }
+
+    /// The absolute bound holds for a skip exactly as it does for a completion: a decision returned
+    /// past the lifetime is refused, so it cannot overwrite the verdict another worker already
+    /// wrote.
+    #[test]
+    fn a_task_cannot_be_skipped_past_its_lifetime_deadline() {
+        for (lifetime_left, is_accepted) in [(Duration::seconds(10), true), (-Duration::seconds(1), false)] {
+            let mut task = expired_started_task(1, lifetime_left);
+
+            let outcome = task.skip("branch is pointless", SkipCause::ExecutorDecision);
+
+            assert_eq!(outcome.is_ok(), is_accepted, "a lifetime deadline {lifetime_left} away");
+            assert_eq!(task.is_skipped(), is_accepted);
+        }
+    }
+
     /// A task in the state a lost worker leaves behind: started, past its deadline, with the
     /// lifetime deadline `lifetime_left` away.
     fn expired_started_task(attempt: u32, lifetime_left: Duration) -> Task {
         let now = Utc::now();
-        Task::restore(
-            Uuid::from_u128(2),
-            TaskCode::new("t"),
-            TaskStatus::Started,
-            Some(Uuid::from_u128(1)),
-            Uuid::from_u128(1),
-            Duration::seconds(5),
-            Duration::seconds(25),
-            Some(now - Duration::seconds(10)),
-            None,
-            Some(now - Duration::seconds(1)),
-            Some(now + lifetime_left),
+        Task::restore(RestoredTask {
+            status: TaskStatus::Started,
+            processing_by_worker: Some(Uuid::from_u128(1)),
+            started_at: Some(now - Duration::seconds(10)),
+            deadline_at: Some(now - Duration::seconds(1)),
+            lifetime_deadline_at: Some(now + lifetime_left),
             attempt,
-            DEFAULT_MAX_ATTEMPTS,
-            Vec::new(),
-            Vec::new(),
-            String::new(),
-            Vec::new(),
-        )
+            ..restored_task_fields()
+        })
+    }
+
+    /// The fields every restored fixture below starts from: a task nobody has run yet, whose
+    /// bounds are the ones the tests place their moments against.
+    fn restored_task_fields() -> RestoredTask {
+        RestoredTask {
+            id: Uuid::from_u128(2),
+            code: TaskCode::new("t"),
+            status: TaskStatus::Todo,
+            processing_by_worker: None,
+            created_by_worker: Uuid::from_u128(1),
+            timeout: Duration::seconds(5),
+            max_lifetime: Duration::seconds(25),
+            started_at: None,
+            completed_at: None,
+            deadline_at: None,
+            lifetime_deadline_at: None,
+            attempt: 0,
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            input: Vec::new(),
+            output: Vec::new(),
+            resolution_reason: String::new(),
+            retry: TaskRetry::WhileBudgetLasts,
+            tolerance: DependencyTolerance::default(),
+            depends_on: Vec::new(),
+        }
     }
 
     #[test]
@@ -1052,25 +1523,16 @@ mod tests {
     /// rule a takeover follows, on the path that does spend an attempt.
     #[test]
     fn start_after_a_failure_spends_an_attempt_and_keeps_the_lifetime_deadline() {
-        let mut task = Task::restore(
-            Uuid::from_u128(2),
-            TaskCode::new("t"),
-            TaskStatus::Failed,
-            Some(Uuid::from_u128(1)),
-            Uuid::from_u128(1),
-            Duration::seconds(5),
-            Duration::seconds(25),
-            Some(Utc::now() - Duration::seconds(10)),
-            Some(Utc::now() - Duration::seconds(9)),
-            Some(Utc::now() - Duration::seconds(5)),
-            Some(Utc::now() + Duration::seconds(15)),
-            1,
-            DEFAULT_MAX_ATTEMPTS,
-            Vec::new(),
-            Vec::new(),
-            String::new(),
-            Vec::new(),
-        );
+        let mut task = Task::restore(RestoredTask {
+            status: TaskStatus::Failed,
+            processing_by_worker: Some(Uuid::from_u128(1)),
+            started_at: Some(Utc::now() - Duration::seconds(10)),
+            completed_at: Some(Utc::now() - Duration::seconds(9)),
+            deadline_at: Some(Utc::now() - Duration::seconds(5)),
+            lifetime_deadline_at: Some(Utc::now() + Duration::seconds(15)),
+            attempt: 1,
+            ..restored_task_fields()
+        });
         let lifetime_deadline = task.lifetime_deadline_at();
 
         task.start(Uuid::from_u128(4)).unwrap();
@@ -1089,25 +1551,7 @@ mod tests {
     /// come back through the shared mapping in `storage::state`.
     #[test]
     fn a_restored_task_belongs_to_no_open_execution() {
-        let task = Task::restore(
-            Uuid::from_u128(2),
-            TaskCode::new("t"),
-            TaskStatus::Todo,
-            None,
-            Uuid::from_u128(1),
-            Duration::seconds(5),
-            Duration::seconds(25),
-            None,
-            None,
-            None,
-            None,
-            0,
-            DEFAULT_MAX_ATTEMPTS,
-            Vec::new(),
-            Vec::new(),
-            String::new(),
-            Vec::new(),
-        );
+        let task = Task::restore(restored_task_fields());
 
         assert_eq!(task.created_by_task(), None);
     }
@@ -1117,11 +1561,11 @@ mod tests {
     #[test]
     fn an_expired_task_is_failed_instead_of_taken_over_once_its_lifetime_has_passed() {
         assert_eq!(
-            expired_started_task(1, Duration::seconds(20)).check_availability(),
+            expired_started_task(1, Duration::seconds(20)).check_availability_at(Utc::now()),
             TaskAvailability::Pickable
         );
         assert_eq!(
-            expired_started_task(1, -Duration::seconds(1)).check_availability(),
+            expired_started_task(1, -Duration::seconds(1)).check_availability_at(Utc::now()),
             TaskAvailability::ExpiredPastLifetime
         );
     }
@@ -1151,27 +1595,20 @@ mod tests {
     #[test]
     fn a_task_past_its_lifetime_is_failed_even_while_its_deadline_holds() {
         let now = Utc::now();
-        let task = Task::restore(
-            Uuid::from_u128(2),
-            TaskCode::new("t"),
-            TaskStatus::Started,
-            Some(Uuid::from_u128(1)),
-            Uuid::from_u128(1),
-            Duration::seconds(5),
-            Duration::seconds(25),
-            Some(now - Duration::seconds(30)),
-            None,
-            Some(now + Duration::seconds(5)),
-            Some(now - Duration::seconds(1)),
-            1,
-            DEFAULT_MAX_ATTEMPTS,
-            Vec::new(),
-            Vec::new(),
-            String::new(),
-            Vec::new(),
-        );
+        let task = Task::restore(RestoredTask {
+            status: TaskStatus::Started,
+            processing_by_worker: Some(Uuid::from_u128(1)),
+            started_at: Some(now - Duration::seconds(30)),
+            deadline_at: Some(now + Duration::seconds(5)),
+            lifetime_deadline_at: Some(now - Duration::seconds(1)),
+            attempt: 1,
+            ..restored_task_fields()
+        });
 
-        assert_eq!(task.check_availability(), TaskAvailability::ExpiredPastLifetime);
+        assert_eq!(
+            task.check_availability_at(Utc::now()),
+            TaskAvailability::ExpiredPastLifetime
+        );
     }
 
     /// A takeover close to the lifetime deadline must not hand the task a deadline reaching past it:
@@ -1209,25 +1646,10 @@ mod tests {
     /// error rather than with the panic the plain addition would raise.
     #[test]
     fn a_start_whose_lifetime_falls_outside_the_range_of_dates_is_refused() {
-        let mut task = Task::restore(
-            Uuid::from_u128(2),
-            TaskCode::new("t"),
-            TaskStatus::Todo,
-            None,
-            Uuid::from_u128(1),
-            Duration::seconds(5),
-            Duration::MAX,
-            None,
-            None,
-            None,
-            None,
-            0,
-            DEFAULT_MAX_ATTEMPTS,
-            Vec::new(),
-            Vec::new(),
-            String::new(),
-            Vec::new(),
-        );
+        let mut task = Task::restore(RestoredTask {
+            max_lifetime: Duration::MAX,
+            ..restored_task_fields()
+        });
 
         let error = task.start(Uuid::from_u128(4)).unwrap_err();
 
@@ -1235,6 +1657,124 @@ mod tests {
         assert_eq!(*task.status(), TaskStatus::Todo, "a refused start must change nothing");
         assert_eq!(task.attempt(), 0);
         assert_eq!(task.deadline_at(), None);
+    }
+
+    /// Dependency in the state named, built where a legal call sequence cannot place it - a task at
+    /// its attempt cap, a task the cascade put out.
+    fn dependency_in(status: TaskStatus, attempt: u32) -> Task {
+        Task::restore(RestoredTask {
+            status,
+            attempt,
+            ..restored_task_fields()
+        })
+    }
+
+    /// Task tolerating what `tolerance` names, waiting for the dependency above.
+    fn dependent_tolerating(tolerance: DependencyTolerance) -> Task {
+        Task::restore(RestoredTask {
+            id: Uuid::from_u128(3),
+            status: TaskStatus::Blocked,
+            tolerance,
+            depends_on: vec![Uuid::from_u128(2)],
+            ..restored_task_fields()
+        })
+    }
+
+    /// The whole rule in one table: every state a dependency can be in, against both flags of the
+    /// tolerance the dependent declared. The verdicts come from the contract of `judge_dependency`,
+    /// not from the graph rules that read it. Each state carries the flag that decides it in both
+    /// values, against the opposite value of the other flag, so a rule reading the wrong flag fails
+    /// here.
+    ///
+    /// The pair worth naming is a dependency `Skipped(FailedDependency)` under `allows_skipped`: it
+    /// is `Unblocked`, so the dependent starts on a branch a failure put out, and the iteration ends
+    /// as failed all the same, because the cause the dependency carries is a failure.
+    #[test]
+    fn a_dependency_is_judged_by_its_state_and_the_tolerance_of_its_dependent() {
+        let spent_budget = DEFAULT_MAX_ATTEMPTS;
+        for (status, attempt, allows_failed, allows_skipped, expected) in [
+            (TaskStatus::Completed, 1, false, false, DependencyVerdict::Unblocked),
+            (TaskStatus::Completed, 1, true, true, DependencyVerdict::Unblocked),
+            // A refusal with attempts to spare is coming back, so it is waited for either way.
+            (TaskStatus::Failed, 1, false, false, DependencyVerdict::Blocked),
+            (TaskStatus::Failed, 1, true, true, DependencyVerdict::Blocked),
+            // A refusal that spent the budget is what `allows_failed` speaks about.
+            (
+                TaskStatus::Failed,
+                spent_budget,
+                false,
+                true,
+                DependencyVerdict::Skipped(SkipCause::FailedDependency),
+            ),
+            (
+                TaskStatus::Failed,
+                spent_budget,
+                true,
+                false,
+                DependencyVerdict::Unblocked,
+            ),
+            // A skip is what `allows_skipped` speaks about, and the cause handed down is the
+            // strongest one the dependency carries.
+            (
+                TaskStatus::Skipped(SkipCause::ExecutorDecision),
+                1,
+                true,
+                false,
+                DependencyVerdict::Skipped(SkipCause::SkippedDependency),
+            ),
+            (
+                TaskStatus::Skipped(SkipCause::ExecutorDecision),
+                1,
+                false,
+                true,
+                DependencyVerdict::Unblocked,
+            ),
+            (
+                TaskStatus::Skipped(SkipCause::SkippedDependency),
+                1,
+                true,
+                false,
+                DependencyVerdict::Skipped(SkipCause::SkippedDependency),
+            ),
+            (
+                TaskStatus::Skipped(SkipCause::SkippedDependency),
+                1,
+                false,
+                true,
+                DependencyVerdict::Unblocked,
+            ),
+            (
+                TaskStatus::Skipped(SkipCause::FailedDependency),
+                1,
+                true,
+                false,
+                DependencyVerdict::Skipped(SkipCause::FailedDependency),
+            ),
+            (
+                TaskStatus::Skipped(SkipCause::FailedDependency),
+                1,
+                false,
+                true,
+                DependencyVerdict::Unblocked,
+            ),
+            // Nothing has settled yet, so there is nothing to tolerate.
+            (TaskStatus::Todo, 0, true, true, DependencyVerdict::Blocked),
+            (TaskStatus::Blocked, 0, true, true, DependencyVerdict::Blocked),
+            (TaskStatus::Started, 1, true, true, DependencyVerdict::Blocked),
+        ] {
+            let dependency = dependency_in(status.clone(), attempt);
+            let dependent = dependent_tolerating(DependencyTolerance {
+                allows_failed,
+                allows_skipped,
+            });
+
+            assert_eq!(
+                dependent.judge_dependency(&dependency, Utc::now()),
+                expected,
+                "a dependency {status} judged by a dependent allowing failed: {allows_failed}, skipped: \
+                 {allows_skipped}"
+            );
+        }
     }
 
     /// The other half of the absolute bound: work finished past the lifetime is refused, so an

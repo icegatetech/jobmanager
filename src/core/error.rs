@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::{JobStatus, infra::retrier::RetryError, storage::StorageError};
+use crate::{JobCode, JobStatus, infra::retrier::RetryError, storage::StorageError};
 
 /// Error type an executor returns.
 ///
@@ -76,6 +76,12 @@ pub(crate) enum JobError {
 
     #[error("invalid job status transition from {from} to {to}")]
     InvalidStatusTransition { from: JobStatus, to: JobStatus },
+
+    #[error("job '{job_code}' iteration cannot progress: blocked tasks with unmet dependencies ({tasks})")]
+    IterationDeadlock { job_code: JobCode, tasks: String },
+
+    #[error("job '{job_code}' iteration is already settled")]
+    IterationAlreadySettled { job_code: JobCode },
 
     #[error("{0}")]
     Other(String),

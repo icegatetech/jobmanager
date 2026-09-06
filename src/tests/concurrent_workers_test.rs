@@ -152,7 +152,7 @@ async fn run_concurrent_workers_test(use_cached_storage: bool) -> Result<(), Box
         .await?;
     assert_eq!(*job.status(), JobStatus::Completed);
     assert_eq!(job.iter_num(), max_iterations, "job iteration mismatch");
-    assert!(job.all_tasks_completed(), "tasks not complete at all");
+    assert!(job.all_tasks_resolved(), "tasks not resolved at all");
     assert_eq!(
         job.tasks_as_iter().count(),
         secondary_task_count + 1,

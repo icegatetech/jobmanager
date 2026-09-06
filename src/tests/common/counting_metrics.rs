@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::{JobCode, JobStatus, MetricsSink, TaskCode, TaskStatus};
+use crate::{IterationVerdict, JobCode, MetricsSink, TaskCode, TaskResolution};
 
 /// `MetricsSink` that counts what it was told, split by the final status where the measurement
 /// carries one.
@@ -14,9 +14,11 @@ pub struct CountingMetrics {
     failed_iterations: AtomicU64,
     completed_tasks: AtomicU64,
     failed_tasks: AtomicU64,
+    skipped_tasks: AtomicU64,
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
     save_conflict_retries: AtomicU64,
+    save_conflict_retries_by_phase: parking_lot::Mutex<std::collections::HashMap<&'static str, u64>>,
     stolen_tasks: AtomicU64,
     storage_operations: parking_lot::Mutex<std::collections::HashMap<(String, String), u64>>,
 }
@@ -42,6 +44,13 @@ impl CountingMetrics {
         self.failed_tasks.load(Ordering::SeqCst)
     }
 
+    /// Tasks a worker processed and stored as `Skipped`, which is the executor's own decision about
+    /// its branch. A task the cascade put out is not reported here: no worker processed it, so
+    /// nothing measures it.
+    pub fn skipped_tasks(&self) -> u64 {
+        self.skipped_tasks.load(Ordering::SeqCst)
+    }
+
     /// Reads served from the read cache.
     pub fn cache_hits(&self) -> u64 {
         self.cache_hits.load(Ordering::SeqCst)
@@ -55,6 +64,12 @@ impl CountingMetrics {
     /// Saves retried after an optimistic concurrency conflict.
     pub fn save_conflict_retries(&self) -> u64 {
         self.save_conflict_retries.load(Ordering::SeqCst)
+    }
+
+    /// Saves retried after a conflict, counted under the phase the retry was labelled with - which
+    /// is what tells a conflict on a completion from one on a refusal.
+    pub fn save_conflict_retries_of_phase(&self, phase: &str) -> u64 {
+        self.save_conflict_retries_by_phase.lock().get(phase).copied().unwrap_or(0)
     }
 
     /// Tasks lost to another worker's conditional write.
@@ -97,11 +112,10 @@ impl CountingMetrics {
 }
 
 impl MetricsSink for CountingMetrics {
-    fn record_job_iteration_complete(&self, _code: &JobCode, status: &JobStatus, _duration: Duration) {
-        let counter = match *status {
-            JobStatus::Completed => &self.completed_iterations,
-            JobStatus::Failed => &self.failed_iterations,
-            JobStatus::Started | JobStatus::Running => return,
+    fn record_job_iteration_complete(&self, _code: &JobCode, verdict: IterationVerdict, _duration: Duration) {
+        let counter = match verdict {
+            IterationVerdict::Completed => &self.completed_iterations,
+            IterationVerdict::Failed => &self.failed_iterations,
         };
         counter.fetch_add(1, Ordering::SeqCst);
     }
@@ -110,13 +124,13 @@ impl MetricsSink for CountingMetrics {
         &self,
         _job_code: &JobCode,
         _task_code: &TaskCode,
-        status: &TaskStatus,
+        resolution: TaskResolution,
         _duration: Duration,
     ) {
-        let counter = match *status {
-            TaskStatus::Completed => &self.completed_tasks,
-            TaskStatus::Failed => &self.failed_tasks,
-            TaskStatus::Todo | TaskStatus::Blocked | TaskStatus::Started => return,
+        let counter = match resolution {
+            TaskResolution::Completed => &self.completed_tasks,
+            TaskResolution::Failed => &self.failed_tasks,
+            TaskResolution::Skipped => &self.skipped_tasks,
         };
         counter.fetch_add(1, Ordering::SeqCst);
     }
@@ -141,7 +155,8 @@ impl MetricsSink for CountingMetrics {
         self.stolen_tasks.fetch_add(1, Ordering::SeqCst);
     }
 
-    fn record_save_conflict_retry(&self, _job_code: &JobCode, _phase: &'static str) {
+    fn record_save_conflict_retry(&self, _job_code: &JobCode, phase: &'static str) {
         self.save_conflict_retries.fetch_add(1, Ordering::SeqCst);
+        *self.save_conflict_retries_by_phase.lock().entry(phase).or_insert(0) += 1;
     }
 }

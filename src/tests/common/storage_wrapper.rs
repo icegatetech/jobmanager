@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    Job, JobCode, TaskCode, TaskPickup, TaskStatus,
+    Job, JobCode, Task, TaskCode, TaskDefinition, TaskPickup, TaskStatus,
     storage::{JobMeta, Storage, StorageError, StorageResult},
 };
 
@@ -417,7 +417,7 @@ impl SiblingCompletingStorage {
         if let Err(e) = stored.start_task(&sibling_id, self.rival_worker_id) {
             return Err(self.refuse_interference(format!("a pickable sibling must start: {e}")));
         }
-        if let Err(e) = stored.complete_task(&sibling_id, b"shifted by the rival".to_vec()) {
+        if let Err(e) = stored.complete_task(&sibling_id, b"shifted by the rival".to_vec(), self.rival_worker_id) {
             return Err(self.refuse_interference(format!("a started sibling must complete: {e}")));
         }
         self.inner.save_job(&mut stored, cancel_token).await?;
@@ -453,6 +453,287 @@ impl Storage for SiblingCompletingStorage {
     async fn save_job(&self, job: &mut Job, cancel_token: &CancellationToken) -> StorageResult<()> {
         if self.has_processed_task(job) && self.is_interference_pending.swap(false, Ordering::SeqCst) {
             self.complete_sibling(job.code(), cancel_token).await?;
+        }
+        self.inner.save_job(job, cancel_token).await
+    }
+
+    async fn list_job_outdated_iterations(
+        &self,
+        job_code: &JobCode,
+        retention_boundary: u64,
+        cancel_token: &CancellationToken,
+    ) -> StorageResult<Vec<u64>> {
+        self.inner
+            .list_job_outdated_iterations(job_code, retention_boundary, cancel_token)
+            .await
+    }
+
+    async fn delete_job_iterations(
+        &self,
+        job_code: &JobCode,
+        iter_nums: &[u64],
+        cancel_token: &CancellationToken,
+    ) -> StorageResult<()> {
+        self.inner.delete_job_iterations(job_code, iter_nums, cancel_token).await
+    }
+}
+
+/// Storage double that lets a rival worker settle the iteration, exactly once, right before the
+/// save carrying the caller's own result of a task with `processed_task_code`.
+///
+/// The rival takes over through the production API, so what it writes is what a worker polling an
+/// iteration whose task has outlived its maximum lifetime writes: the task failed and the iteration
+/// closed. The caller's save then meets a stored iteration that is already settled - the state that
+/// takes no result at all, as opposed to the one `ContendingStorage` produces, where the merge goes
+/// through and is retried.
+pub struct IterationSettlingStorage {
+    inner: Arc<dyn Storage>,
+    rival_store: Option<Arc<dyn Storage>>,
+    rival_worker_id: Uuid,
+    processed_task_code: TaskCode,
+    is_interference_pending: AtomicBool,
+    interference_failure: OnceLock<String>,
+    interferences: AtomicU64,
+}
+
+impl IterationSettlingStorage {
+    pub fn new(inner: Arc<dyn Storage>, rival_worker_id: Uuid, processed_task_code: TaskCode) -> Self {
+        Self {
+            inner,
+            rival_store: None,
+            rival_worker_id,
+            processed_task_code,
+            is_interference_pending: AtomicBool::new(true),
+            interference_failure: OnceLock::new(),
+            interferences: AtomicU64::new(0),
+        }
+    }
+
+    /// Sends the rival's read and write through `rival_store` instead of the wrapped one.
+    ///
+    /// A test that measures what its caller is billed for gives the rival a store of its own, so the
+    /// requests of the double do not land in the caller's count.
+    pub fn with_rival_store(mut self, rival_store: Arc<dyn Storage>) -> Self {
+        self.rival_store = Some(rival_store);
+        self
+    }
+
+    /// Store the rival acts through: the one named by [`Self::with_rival_store`], or the wrapped one
+    /// when no separate store was given.
+    fn rival_store(&self) -> &Arc<dyn Storage> {
+        self.rival_store.as_ref().unwrap_or(&self.inner)
+    }
+
+    /// How many times the rival really settled the iteration ahead of its caller, so a test can
+    /// prove its fixture reached the race it asserts on.
+    pub fn interferences(&self) -> u64 {
+        self.interferences.load(Ordering::SeqCst)
+    }
+
+    /// Why the interference could not happen, if it could not. A test asserts on this before
+    /// anything else: a fixture that broke otherwise shows up only as a wait that ran out.
+    pub fn interference_failure(&self) -> Option<&str> {
+        self.interference_failure.get().map(String::as_str)
+    }
+
+    fn refuse_interference(&self, reason: String) -> StorageError {
+        let _ = self.interference_failure.set(reason.clone());
+        StorageError::Other(reason)
+    }
+
+    /// Whether this save carries a resolved task of the awaited code, which is what marks it as the
+    /// save of a result rather than of a pickup.
+    fn has_resolved_task(&self, job: &Job) -> bool {
+        job.tasks_as_iter()
+            .any(|task| task.code() == &self.processed_task_code && task.is_resolved())
+    }
+
+    /// Polls the stored iteration as a worker would and stores what that pass leaves, which moves
+    /// the version the caller read.
+    async fn settle_iteration(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<()> {
+        let rival_store = self.rival_store();
+        let mut stored = rival_store.get_job(job_code, cancel_token).await?;
+        match stored.pick_task_to_execute(&self.rival_worker_id) {
+            Ok(TaskPickup::IterationSettled) => {}
+            Ok(pickup) => {
+                return Err(self.refuse_interference(format!(
+                    "the fixture must leave the rival an iteration to settle, got {pickup:?}"
+                )));
+            }
+            Err(e) => {
+                return Err(
+                    self.refuse_interference(format!("the rival must be able to poll the stored iteration: {e}"))
+                );
+            }
+        }
+        rival_store.save_job(&mut stored, cancel_token).await?;
+
+        self.interferences.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Storage for IterationSettlingStorage {
+    async fn get_job(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<Job> {
+        self.inner.get_job(job_code, cancel_token).await
+    }
+
+    async fn get_job_by_meta(&self, job_meta: &JobMeta, cancel_token: &CancellationToken) -> StorageResult<Job> {
+        self.inner.get_job_by_meta(job_meta, cancel_token).await
+    }
+
+    async fn find_job_meta(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<JobMeta> {
+        self.inner.find_job_meta(job_code, cancel_token).await
+    }
+
+    async fn get_changed_job(
+        &self,
+        job_meta: &JobMeta,
+        cancel_token: &CancellationToken,
+    ) -> StorageResult<Option<Job>> {
+        self.inner.get_changed_job(job_meta, cancel_token).await
+    }
+
+    async fn save_job(&self, job: &mut Job, cancel_token: &CancellationToken) -> StorageResult<()> {
+        if self.has_resolved_task(job) && self.is_interference_pending.swap(false, Ordering::SeqCst) {
+            self.settle_iteration(job.code(), cancel_token).await?;
+        }
+        self.inner.save_job(job, cancel_token).await
+    }
+
+    async fn list_job_outdated_iterations(
+        &self,
+        job_code: &JobCode,
+        retention_boundary: u64,
+        cancel_token: &CancellationToken,
+    ) -> StorageResult<Vec<u64>> {
+        self.inner
+            .list_job_outdated_iterations(job_code, retention_boundary, cancel_token)
+            .await
+    }
+
+    async fn delete_job_iterations(
+        &self,
+        job_code: &JobCode,
+        iter_nums: &[u64],
+        cancel_token: &CancellationToken,
+    ) -> StorageResult<()> {
+        self.inner.delete_job_iterations(job_code, iter_nums, cancel_token).await
+    }
+}
+
+/// Storage double that plants a task nothing can unblock into the stored iteration, exactly once,
+/// right before the save carrying the caller's own result of a task with `processed_task_code`.
+///
+/// The planted task waits for a dependency the iteration does not hold, which is the state a merge
+/// answers with `JobError::IterationDeadlock`: the result is carried over and the iteration is left
+/// open. The state is assembled through `Job::restore` because no production call reaches it -
+/// `Job::add_task` refuses a dependency the iteration does not hold.
+pub struct DeadlockPlantingStorage {
+    inner: Arc<dyn Storage>,
+    planting_worker_id: Uuid,
+    planted_task_code: TaskCode,
+    processed_task_code: TaskCode,
+    is_interference_pending: AtomicBool,
+    interferences: AtomicU64,
+}
+
+impl DeadlockPlantingStorage {
+    /// Timeout the planted task carries. It never runs, so any legal value does.
+    const PLANTED_TASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    pub fn new(inner: Arc<dyn Storage>, planted_task_code: TaskCode, processed_task_code: TaskCode) -> Self {
+        Self {
+            inner,
+            planting_worker_id: Uuid::new_v4(),
+            planted_task_code,
+            processed_task_code,
+            is_interference_pending: AtomicBool::new(true),
+            interferences: AtomicU64::new(0),
+        }
+    }
+
+    /// How many times the double really planted the task ahead of its caller, so a test can prove
+    /// its fixture reached the merge it asserts on.
+    pub fn interferences(&self) -> u64 {
+        self.interferences.load(Ordering::SeqCst)
+    }
+
+    /// Code the planted task carries, for a test to find it in the stored iteration.
+    pub fn planted_task_code(&self) -> &TaskCode {
+        &self.planted_task_code
+    }
+
+    /// Whether this save carries a resolved task of the awaited code, which is what marks it as the
+    /// save of a result rather than of a pickup.
+    fn has_resolved_task(&self, job: &Job) -> bool {
+        job.tasks_as_iter()
+            .any(|task| task.code() == &self.processed_task_code && task.is_resolved())
+    }
+
+    /// Stores the iteration with one more task, blocked behind a dependency the iteration does not
+    /// hold, which moves the version the caller read.
+    async fn plant_blocked_task(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<()> {
+        let stored = self.inner.get_job(job_code, cancel_token).await?;
+        let mut tasks: Vec<Task> = stored.tasks_as_iter().cloned().collect();
+        tasks.push(Task::new(
+            Uuid::new_v4(),
+            self.planting_worker_id,
+            None,
+            &TaskDefinition::new(self.planted_task_code.clone(), Self::PLANTED_TASK_TIMEOUT),
+            vec![Uuid::new_v4()],
+        ));
+
+        let mut planted = Job::restore(
+            *stored.id(),
+            stored.code().clone(),
+            stored.version().to_string(),
+            stored.iter_num(),
+            stored.status().clone(),
+            tasks,
+            stored.updated_by_worker_id(),
+            stored.started_at(),
+            stored.running_at(),
+            stored.completed_at(),
+            stored.next_start_at(),
+            stored.metadata().clone(),
+            stored.max_iterations(),
+            stored.iteration_interval(),
+            stored.task_limits(),
+        );
+        self.inner.save_job(&mut planted, cancel_token).await?;
+
+        self.interferences.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Storage for DeadlockPlantingStorage {
+    async fn get_job(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<Job> {
+        self.inner.get_job(job_code, cancel_token).await
+    }
+
+    async fn get_job_by_meta(&self, job_meta: &JobMeta, cancel_token: &CancellationToken) -> StorageResult<Job> {
+        self.inner.get_job_by_meta(job_meta, cancel_token).await
+    }
+
+    async fn find_job_meta(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<JobMeta> {
+        self.inner.find_job_meta(job_code, cancel_token).await
+    }
+
+    async fn get_changed_job(
+        &self,
+        job_meta: &JobMeta,
+        cancel_token: &CancellationToken,
+    ) -> StorageResult<Option<Job>> {
+        self.inner.get_changed_job(job_meta, cancel_token).await
+    }
+
+    async fn save_job(&self, job: &mut Job, cancel_token: &CancellationToken) -> StorageResult<()> {
+        if self.has_resolved_task(job) && self.is_interference_pending.swap(false, Ordering::SeqCst) {
+            self.plant_blocked_task(job.code(), cancel_token).await?;
         }
         self.inner.save_job(job, cancel_token).await
     }

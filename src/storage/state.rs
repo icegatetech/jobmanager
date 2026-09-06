@@ -2,7 +2,24 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{Job, JobCode, JobStatus, Task, TaskCode, TaskLimits, TaskStatus};
+use crate::{
+    DependencyTolerance, Job, JobCode, JobStatus, RestoredTask, Task, TaskCode, TaskLimits, TaskRetry, TaskStatus,
+};
+
+/// A refusal nobody declared terminal is the ordinary one, so the common case costs no bytes.
+// By reference because that is the shape `skip_serializing_if` calls a predicate with; passing this
+// one by value would not be a predicate serde can use.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_repeatable_refusal(retry: &TaskRetry) -> bool {
+    matches!(retry, TaskRetry::WhileBudgetLasts)
+}
+
+/// A task that declared nothing follows the ordinary rule, so the common case costs no bytes.
+// By reference for the same reason as [`is_repeatable_refusal`].
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_undeclared_tolerance(tolerance: &DependencyTolerance) -> bool {
+    !tolerance.is_declared()
+}
 
 /// One task as every backend persists it.
 ///
@@ -35,7 +52,11 @@ pub(crate) struct StoredTask {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     output: Vec<u8>,
     #[serde(skip_serializing_if = "String::is_empty", default)]
-    error: String,
+    resolution_reason: String,
+    #[serde(default, skip_serializing_if = "is_repeatable_refusal")]
+    retry: TaskRetry,
+    #[serde(default, skip_serializing_if = "is_undeclared_tolerance")]
+    tolerance: DependencyTolerance,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     depends_on: Vec<Uuid>,
 }
@@ -58,31 +79,36 @@ impl StoredTask {
             max_attempts: task.max_attempts(),
             input: task.input().to_vec(),
             output: task.output().to_vec(),
-            error: task.error_msg().to_string(),
+            resolution_reason: task.resolution_reason().to_string(),
+            retry: task.retry(),
+            tolerance: task.tolerance(),
             depends_on: task.depends_on().to_vec(),
         }
     }
 
+    /// Rebuilds the task this state describes.
     fn into_task(self) -> Task {
-        Task::restore(
-            self.id,
-            TaskCode::new(self.code),
-            self.status,
-            self.processing_by,
-            self.created_by_worker,
-            Duration::milliseconds(self.timeout_ms),
-            Duration::milliseconds(self.max_lifetime_ms),
-            self.started_at,
-            self.completed_at,
-            self.deadline_at,
-            self.lifetime_deadline_at,
-            self.attempt,
-            self.max_attempts,
-            self.input,
-            self.output,
-            self.error,
-            self.depends_on,
-        )
+        Task::restore(RestoredTask {
+            id: self.id,
+            code: TaskCode::new(self.code),
+            status: self.status,
+            processing_by_worker: self.processing_by,
+            created_by_worker: self.created_by_worker,
+            timeout: Duration::milliseconds(self.timeout_ms),
+            max_lifetime: Duration::milliseconds(self.max_lifetime_ms),
+            started_at: self.started_at,
+            completed_at: self.completed_at,
+            deadline_at: self.deadline_at,
+            lifetime_deadline_at: self.lifetime_deadline_at,
+            attempt: self.attempt,
+            max_attempts: self.max_attempts,
+            input: self.input,
+            output: self.output,
+            resolution_reason: self.resolution_reason,
+            retry: self.retry,
+            tolerance: self.tolerance,
+            depends_on: self.depends_on,
+        })
     }
 }
 
@@ -145,13 +171,15 @@ impl StoredJob {
         task_limits: TaskLimits,
         version: &str,
     ) -> Job {
+        let tasks = self.tasks.into_iter().map(StoredTask::into_task).collect::<Vec<Task>>();
+
         Job::restore(
             self.id,
             JobCode::new(self.code),
             version.to_string(),
             self.iter_num,
             self.status,
-            self.tasks.into_iter().map(StoredTask::into_task).collect(),
+            tasks,
             self.updated_by,
             self.started_at,
             self.running_at,
@@ -185,6 +213,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::core::task::SkipCause;
     use crate::{DEFAULT_MAX_ATTEMPTS, TaskDefinition};
 
     const TIMEOUT: Duration = Duration::seconds(5);
@@ -193,10 +222,11 @@ mod tests {
     /// a backend that lost it would save the job as a new object instead of a conditional update.
     const FIXTURE_VERSION: &str = "version";
 
-    /// State whose only task carries `task_bounds` - the timeout and the maximum lifetime - as
-    /// written, so that a state missing either can be handed to the parser exactly as the tests
-    /// below need it.
-    fn stored_job_json(task_bounds: &str) -> String {
+    /// State whose only task carries `task_status` and `task_bounds` - the timeout and the maximum
+    /// lifetime - as written, so that a state missing either, or holding a status whose other
+    /// fields were not written with it, can be handed to the parser exactly as the tests below need
+    /// it.
+    fn stored_job_json(task_status: &str, task_bounds: &str) -> String {
         format!(
             r#"{{
                 "id": "00000000-0000-0000-0000-000000000001",
@@ -206,7 +236,7 @@ mod tests {
                 "tasks": [{{
                     "id": "00000000-0000-0000-0000-000000000002",
                     "code": "task",
-                    "status": "todo",
+                    "status": "{task_status}",
                     "created_by_worker": "00000000-0000-0000-0000-000000000003",
                     "attempt": 0,
                     "max_attempts": 5{task_bounds}
@@ -220,13 +250,19 @@ mod tests {
     /// The state a save writes, whose lifetime is deliberately not a multiple of the timeout: a
     /// value recomputed from anything rather than read out of the object would not match it.
     fn stored_job_json_with_bounds() -> String {
-        stored_job_json(r#", "timeout_ms": 5000, "max_lifetime_ms": 7000"#)
+        stored_job_json("todo", r#", "timeout_ms": 5000, "max_lifetime_ms": 7000"#)
     }
 
     fn restore_job_from(json: &str) -> Job {
         serde_json::from_str::<StoredJob>(json)
             .expect("the stored state must parse")
             .into_job(None, None, TaskLimits::default(), FIXTURE_VERSION)
+    }
+
+    /// What a backend keeping the domain state itself hands back, for the tests whose subject is
+    /// what survives the save.
+    fn persisted_copy_of(job: &Job) -> Job {
+        copy_persisted_state(job)
     }
 
     #[test]
@@ -243,7 +279,7 @@ mod tests {
     /// invented here, which would be a limit nobody declared.
     #[test]
     fn state_without_a_maximum_lifetime_is_refused() {
-        let error = serde_json::from_str::<StoredJob>(&stored_job_json(r#", "timeout_ms": 5000"#))
+        let error = serde_json::from_str::<StoredJob>(&stored_job_json("todo", r#", "timeout_ms": 5000"#))
             .expect_err("state without the lifetime must not parse");
 
         assert!(error.to_string().contains("max_lifetime_ms"), "got: {error}");
@@ -254,7 +290,7 @@ mod tests {
     /// pass it is picked on until its lifetime runs out.
     #[test]
     fn state_without_a_timeout_is_refused() {
-        let error = serde_json::from_str::<StoredJob>(&stored_job_json(r#", "max_lifetime_ms": 7000"#))
+        let error = serde_json::from_str::<StoredJob>(&stored_job_json("todo", r#", "max_lifetime_ms": 7000"#))
             .expect_err("state without the timeout must not parse");
 
         assert!(error.to_string().contains("timeout_ms"), "got: {error}");
@@ -266,7 +302,7 @@ mod tests {
     fn a_persisted_copy_drops_the_execution_that_created_a_task() {
         let (job, child_id) = job_with_a_task_created_by_its_execution();
 
-        let stored = copy_persisted_state(&job);
+        let stored = persisted_copy_of(&job);
 
         assert_eq!(
             stored
@@ -306,7 +342,7 @@ mod tests {
     fn a_persisted_copy_keeps_the_state_a_worker_decides_by() {
         let job = job_with_started_task();
 
-        let stored = copy_persisted_state(&job);
+        let stored = persisted_copy_of(&job);
 
         let task = job.tasks_as_iter().next().expect("the description declares one task");
         let stored_task = stored.find_task(task.id()).expect("the task must survive the save");
@@ -329,12 +365,79 @@ mod tests {
         job
     }
 
+    /// A refusal declared terminal must stay terminal across a save: a worker that read the state
+    /// back and retried it would spend the budget the declaration exists to save.
+    #[test]
+    fn a_persisted_copy_keeps_a_terminal_refusal() {
+        let mut job = job_with_started_task();
+        let task_id = *job.tasks_as_iter().next().expect("the state declares one task").id();
+        job.fail_task(&task_id, "decode input", TaskRetry::Never, Uuid::from_u128(3))
+            .expect("a started task must fail");
+
+        let stored = persisted_copy_of(&job);
+
+        assert!(
+            stored
+                .find_task(&task_id)
+                .expect("the task must survive the save")
+                .is_terminally_failed_at(Utc::now())
+        );
+    }
+
+    /// The cause is what the verdict of the iteration reads, so a save that lost it would turn a
+    /// failure into a success after a restart.
+    #[test]
+    fn a_persisted_copy_keeps_why_a_task_was_skipped() {
+        let mut job = job_with_started_task();
+        let task_id = *job.tasks_as_iter().next().expect("the state declares one task").id();
+        job.skip_task_by_executor(&task_id, "branch is pointless", Uuid::from_u128(3))
+            .expect("a started task may be skipped");
+
+        let stored = persisted_copy_of(&job);
+
+        let task = stored.find_task(&task_id).expect("the task must survive the save");
+        assert!(task.is_skipped());
+        assert_eq!(task.skip_cause(), Some(SkipCause::ExecutorDecision));
+    }
+
+    /// A runtime task lives in the object alone - it has no description to be re-read from - so a
+    /// save that lost what it tolerates would block it after a restart on a dependency it declared
+    /// it survives.
+    #[test]
+    fn a_persisted_copy_keeps_what_a_task_tolerates() {
+        let mut job = job_with_started_task();
+        let parent_id = *job.tasks_as_iter().next().expect("the state declares one task").id();
+        let tolerance = DependencyTolerance {
+            allows_failed: true,
+            allows_skipped: false,
+        };
+        let tolerant_id = job
+            .add_task(
+                &TaskDefinition::new(TaskCode::new("tolerant"), TIMEOUT.to_std().expect("a positive timeout"))
+                    .with_dependencies(vec![crate::TaskRef::created(parent_id)])
+                    .with_dependency_tolerance(tolerance),
+                Uuid::from_u128(3),
+                None,
+            )
+            .expect("a tolerant task with a dependency is legal");
+
+        let stored = persisted_copy_of(&job);
+
+        assert_eq!(
+            stored
+                .find_task(&tolerant_id)
+                .expect("the task must survive the save")
+                .tolerance(),
+            tolerance
+        );
+    }
+
     /// Metadata is stored only when there is any, so the empty map has to survive as an empty map
     /// rather than come back as something a worker sees differently.
     #[test]
     fn a_persisted_copy_keeps_an_empty_metadata_map() {
         let job = restore_job_from(&stored_job_json_with_bounds());
 
-        assert_eq!(*copy_persisted_state(&job).metadata(), HashMap::new());
+        assert_eq!(*persisted_copy_of(&job).metadata(), HashMap::new());
     }
 }

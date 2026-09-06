@@ -47,7 +47,7 @@ async fn a_cached_running_iteration_is_checked_by_a_conditional_read_alone() -> 
     // Written past the cache, as another worker's write would be, so the first read below really is
     // the cold one - a save through the cache would have filled it.
     let mut job = Job::new(&job_definition(&job_code)?, HashMap::new(), worker_id)?;
-    job.work(&worker_id)?;
+    job.start_work(&worker_id)?;
     counting.save_job(&mut job, &cancel_token).await?;
 
     // Warm-up: the first read discovers the iteration and fetches it.
@@ -222,7 +222,7 @@ async fn a_save_landing_between_a_read_and_its_write_survives_it() -> Result<(),
     let worker_id = Uuid::from_u128(1);
 
     let mut job = Job::new(&job_definition(&job_code)?, HashMap::new(), worker_id)?;
-    job.work(&worker_id)?;
+    job.start_work(&worker_id)?;
     cached.save_job(&mut job, &cancel_token).await?;
     // Written past the cache, as another worker's write would be, so the read below comes back
     // carrying a state - which is the read whose result the cache writes.
@@ -265,7 +265,7 @@ async fn two_readers_of_one_job_reach_storage_at_the_same_time() -> Result<(), B
     let worker_id = Uuid::from_u128(1);
 
     let mut job = Job::new(&job_definition(&job_code)?, HashMap::new(), worker_id)?;
-    job.work(&worker_id)?;
+    job.start_work(&worker_id)?;
     cached.save_job(&mut job, &cancel_token).await?;
 
     let readers: Vec<_> = (0..2)
@@ -302,7 +302,7 @@ async fn an_iteration_that_vanished_falls_back_to_a_cold_read() -> Result<(), Bo
     let worker_id = Uuid::from_u128(1);
 
     let mut job = Job::new(&job_def, HashMap::new(), worker_id)?;
-    job.work(&worker_id)?;
+    job.start_work(&worker_id)?;
     counting.save_job(&mut job, &cancel_token).await?;
     read_job_within_bound(&cached, &job_code, &cancel_token).await?;
 
@@ -312,8 +312,8 @@ async fn an_iteration_that_vanished_falls_back_to_a_cold_read() -> Result<(), Bo
         return Err("the fixture must leave the worker a task to finish".into());
     };
     job.start_task(&task_id, worker_id)?;
-    job.complete_task(&task_id, Vec::new())?;
-    job.try_to_complete(&worker_id)?;
+    job.complete_task(&task_id, Vec::new(), worker_id)?;
+    job.try_settle_iteration(&worker_id)?;
     counting.save_job(&mut job, &cancel_token).await?;
     job.next_iteration(&job_def, worker_id)?;
     counting.save_job(&mut job, &cancel_token).await?;
@@ -350,7 +350,7 @@ async fn a_failed_conditional_read_is_not_answered_by_a_cold_read() -> Result<()
     // Saved through the cache, which fills the entry without reading anything: the read below is
     // then the check of an iteration the cache already holds - the one path a conditional read is on.
     let mut job = Job::new(&job_definition(&job_code)?, HashMap::new(), worker_id)?;
-    job.work(&worker_id)?;
+    job.start_work(&worker_id)?;
     cached.save_job(&mut job, &cancel_token).await?;
 
     let read = tokio::time::timeout(CACHED_READ_TIMEOUT, cached.get_job(&job_code, &cancel_token))
@@ -389,7 +389,7 @@ async fn a_changed_read_replaces_the_state_the_cache_held() -> Result<(), Box<dy
     let worker_id = Uuid::from_u128(1);
 
     let mut job = Job::new(&job_definition(&job_code)?, HashMap::new(), worker_id)?;
-    job.work(&worker_id)?;
+    job.start_work(&worker_id)?;
     cached.save_job(&mut job, &cancel_token).await?;
     // Written past the cache, as another pool's worker would write it: the cache is now a version
     // behind the store.

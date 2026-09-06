@@ -6,6 +6,7 @@
 // parallel mechanism for a job this one already does.
 pub mod common;
 
+mod branch_outcome_persistence_test;
 mod builder_test;
 mod cache_invalidation_test;
 mod concurrent_workers_test;
@@ -23,6 +24,7 @@ mod poll_scheduling_test;
 mod request_quota_test;
 mod shutdown_test;
 mod simple_job_test;
+mod skipped_branch_test;
 mod task_attempt_limit_test;
 mod task_deadline_cancel_test;
 mod task_dependencies_test;
@@ -32,5 +34,6 @@ mod task_lifetime_test;
 mod task_outcome_test;
 mod task_rollback_test;
 mod task_single_execution_test;
+mod terminal_failure_test;
 mod two_jobs_test;
 mod wait_for_iteration_completion_test;

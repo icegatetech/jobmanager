@@ -137,6 +137,21 @@ iteration. The mechanics are documented on the types themselves; what follows is
 - Job settings (`max_iterations`, `iteration_interval`, `TaskLimits`, `iteration_retention`) are
   re-read from the `JobDefinition` on every load, so they are changed in code, never by editing a
   stored object.
+- **Never write a result into an iteration another worker has already closed.** A verdict is
+  reached once, over the state that carried it; a result arriving afterwards has nowhere to go,
+  because the next iteration replans from scratch. Such a save is dropped rather than merged, and
+  the worker that closed the iteration is the one that answers for it. The bound this rests on is
+  the task's maximum lifetime: it is the only way a task this worker still owns can be resolved by
+  somebody else, so the result being dropped is one the lifetime had already refused.
+- **Never let a failure that put out a branch pass as a success.** A task given up on because
+  something it needed failed carries that failure into the verdict, however far down the graph it
+  sits. A verdict read off the tasks that refused themselves closes an iteration that lost a whole
+  branch as completed, and the lost work surfaces in no error and no log — only as a task missing
+  from the state that was stored.
+- **Never let a task that never ran answer for the failure it waited on.** A failure is handled by
+  a direct dependent that declared it survives one and then settled itself, by finishing or by its
+  own decision to give its branch up. One given up on along with the branch never started and never
+  looked at what it waited on, so what it declared answers for nothing.
 
 ## Before a change
 

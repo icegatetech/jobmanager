@@ -43,3 +43,5 @@ clean:
 	cargo clean
 
 ci: check fmt clippy test audit
+
+ci-fast: check fmt clippy audit

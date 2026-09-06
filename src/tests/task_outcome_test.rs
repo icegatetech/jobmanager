@@ -13,7 +13,7 @@ use super::common::manager_env::ManagerEnv;
 use crate::storage::in_memory::InMemoryStorage;
 use crate::{
     Error, Job, JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStatus, JobsManagerConfig, Storage, TaskCode,
-    TaskDefinition, TaskExecutor, TaskLimits, TaskOutcome, TaskStatus, task_fn,
+    TaskDefinition, TaskExecutor, TaskLimits, TaskOutcome, TaskRetry, TaskStatus, task_fn,
 };
 
 /// How long a test waits for the single iteration to finish.
@@ -142,7 +142,8 @@ async fn deferred_outcome_keeps_the_reason_an_executor_failed_its_task_with() ->
         task_definition().with_max_attempts(1),
         task_fn(|ctx| async move {
             let task_id = *ctx.id();
-            ctx.job().fail_task(&task_id, "rejected by executor")?;
+            ctx.job()
+                .fail_task(&task_id, "rejected by executor", TaskRetry::WhileBudgetLasts)?;
             Ok(TaskOutcome::Deferred)
         }),
     )
@@ -151,7 +152,7 @@ async fn deferred_outcome_keeps_the_reason_an_executor_failed_its_task_with() ->
     assert_eq!(*job.status(), JobStatus::Failed);
     let task = job.get_tasks_by_code(&TaskCode::new(TASK_CODE)).remove(0);
     assert!(task.is_failed());
-    assert_eq!(task.get_error(), "rejected by executor");
+    assert_eq!(task.get_resolution_reason(), "rejected by executor");
     Ok(())
 }
 
@@ -171,9 +172,9 @@ async fn deferred_outcome_without_resolution_fails_the_task() -> Result<(), Box<
     let task = job.get_tasks_by_code(&TaskCode::new(TASK_CODE)).remove(0);
     assert!(!task.is_completed());
     assert!(
-        task.get_error().contains("Deferred"),
+        task.get_resolution_reason().contains("Deferred"),
         "the failure must name the broken contract, got: {}",
-        task.get_error()
+        task.get_resolution_reason()
     );
     Ok(())
 }
@@ -230,7 +231,7 @@ async fn cancelled_outcome_after_the_deadline_persists_nothing() -> Result<(), B
         1,
         "the first start spends the only attempt; a takeover after it spends none"
     );
-    assert!(task.error_msg().is_empty(), "got: {}", task.error_msg());
+    assert!(task.resolution_reason().is_empty(), "got: {}", task.resolution_reason());
     Ok(())
 }
 
@@ -253,9 +254,9 @@ async fn returned_error_fails_the_task_with_its_own_message() -> Result<(), Box<
     let task = job.get_tasks_by_code(&TaskCode::new(TASK_CODE)).remove(0);
     assert!(!task.is_completed());
     assert!(
-        task.get_error().contains("invalid digit found in string"),
+        task.get_resolution_reason().contains("invalid digit found in string"),
         "got: {}",
-        task.get_error()
+        task.get_resolution_reason()
     );
     Ok(())
 }
@@ -293,9 +294,10 @@ async fn a_panicking_executor_fails_its_task_and_leaves_the_worker_running() -> 
     let task = job.get_tasks_by_code(&TaskCode::new(TASK_CODE)).remove(0);
     assert!(!task.is_completed());
     assert!(
-        task.get_error().contains("executor panicked") && task.get_error().contains("executor exploded"),
+        task.get_resolution_reason().contains("executor panicked")
+            && task.get_resolution_reason().contains("executor exploded"),
         "the failure must name both the cause and the panic's own message, got: {}",
-        task.get_error()
+        task.get_resolution_reason()
     );
     Ok(())
 }
@@ -315,7 +317,11 @@ async fn a_panic_with_an_unreadable_payload_is_recorded_as_unknown() -> Result<(
 
     let task = job.get_tasks_by_code(&TaskCode::new(TASK_CODE)).remove(0);
     assert!(!task.is_completed());
-    assert!(task.get_error().contains("unknown panic"), "got: {}", task.get_error());
+    assert!(
+        task.get_resolution_reason().contains("unknown panic"),
+        "got: {}",
+        task.get_resolution_reason()
+    );
     Ok(())
 }
 
@@ -379,7 +385,8 @@ async fn an_error_after_the_executor_failed_its_task_keeps_the_reason_it_gave() 
             let runs = Arc::clone(&runs_in_executor);
             async move {
                 runs.fetch_add(1, Ordering::SeqCst);
-                ctx.job().fail_task(ctx.id(), "rejected by executor")?;
+                ctx.job()
+                    .fail_task(ctx.id(), "rejected by executor", TaskRetry::WhileBudgetLasts)?;
                 Err(Error::Other("failed after refusing the task".to_string()).into())
             }
         }),
@@ -390,6 +397,6 @@ async fn an_error_after_the_executor_failed_its_task_keeps_the_reason_it_gave() 
     assert_eq!(*job.status(), JobStatus::Failed);
     let task = job.get_tasks_by_code(&TaskCode::new(TASK_CODE)).remove(0);
     assert!(task.is_failed());
-    assert_eq!(task.get_error(), "rejected by executor");
+    assert_eq!(task.get_resolution_reason(), "rejected by executor");
     Ok(())
 }

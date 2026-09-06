@@ -70,13 +70,14 @@ pub use uuid::Uuid;
 // took over their construction and `Storage` itself is not public (see `storage/mod.rs`).
 pub use crate::core::error::{Error, Result, TaskError};
 pub(crate) use crate::core::error::{InternalError, JobError};
-pub use crate::core::job::{DEFAULT_ITERATION_RETENTION, JobCode, JobStatus, TaskLimits};
-pub(crate) use crate::core::job::{IterationStep, Job, JobDefinition, JobDefinitionId, TaskPickup};
+pub use crate::core::job::{DEFAULT_ITERATION_RETENTION, IterationVerdict, JobCode, TaskLimits};
+pub(crate) use crate::core::job::{IterationStep, Job, JobDefinition, JobDefinitionId, JobStatus, TaskPickup};
 pub(crate) use crate::core::registry::JobRegistry;
-pub(crate) use crate::core::task::Task;
 pub use crate::core::task::{
-    DEFAULT_LIFETIME_MULTIPLIER, DEFAULT_MAX_ATTEMPTS, ImmutableTask, TaskCode, TaskDefinition, TaskRef, TaskStatus,
+    DEFAULT_LIFETIME_MULTIPLIER, DEFAULT_MAX_ATTEMPTS, DependencyTolerance, ImmutableTask, TaskCode, TaskDefinition,
+    TaskRef, TaskResolution, TaskRetry,
 };
+pub(crate) use crate::core::task::{RestoredTask, Task, TaskStatus};
 pub use crate::execution::builder::{JobBuilder, JobsManagerBuilder};
 pub use crate::execution::executor::{TaskExecutor, TaskOutcome, TaskResult, task_fn};
 pub(crate) use crate::execution::job_cleaner::JobCleaner;
@@ -112,7 +113,7 @@ pub mod prelude {
     pub use std::time::Duration;
 
     pub use crate::{
-        Error, JobCode, JobHandle, JobsManager, JobsManagerHandle, Result, TaskCode, TaskContext, TaskDefinition,
-        TaskError, TaskExecutor, TaskOutcome, TaskResult, task_fn,
+        DependencyTolerance, Error, JobCode, JobHandle, JobsManager, JobsManagerHandle, Result, TaskCode, TaskContext,
+        TaskDefinition, TaskError, TaskExecutor, TaskOutcome, TaskResult, TaskRetry, task_fn,
     };
 }
