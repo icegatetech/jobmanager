@@ -94,7 +94,7 @@ crate-wide precisely so that promise stays honest.
   the value is validated and `Self` when it is not.
 - Group a struct's declaration with its `impl`.
 - A component's configuration struct lives in the module of the component it configures, next to
-  it — `WorkerConfig` in `worker.rs`, `S3StorageConfig` in `s3.rs`. A config declared in the module
+  it — `WorkerConfig` in `worker.rs`, `S3Config` in `s3.rs`. A config declared in the module
   that merely *holds* the component drifts away from the type whose behavior it describes.
 - Domain structures, VO, and POCO must always be in a consistent state.
 - Never place logic inside a DTO. DTOs are only data carriers.
@@ -173,6 +173,20 @@ crate-wide precisely so that promise stays honest.
   library, so every added dependency lands in every consumer's tree; prefer the standard library
   or an existing dependency first.
 - `cargo audit` runs in CI (`make audit`) — a dependency with a live advisory does not land.
+
+## Features and conditional compilation
+
+- `#[cfg(feature = ...)]` says the item is dead in a selection without that feature. `src/lib.rs`
+refuses a selection with no backend by `compile_error!`, so `any(<every backend feature>)` is true
+wherever the crate compiles: it drops nothing and adds one list to edit per added backend. An item
+every backend needs carries no `#[cfg]`; the list of backend features is written once, on that
+`compile_error!`.
+  - **An `any(...)` names the features whose backends use the item** — `normalize_etag`, for example,
+    which `GcsBackend` never calls. Its doc comment says which backend leaves it out and why.
+  - **A backend module carries its `#[cfg]` on the `mod` line** in `storage/mod.rs`; the items inside
+    carry none. A `use` carries the `#[cfg]` of the code that names the imported item, none where
+    that code is unconditional.
+  - **`not(feature = ...)` is for tests** asserting what a selection without the feature does not carry.
 
 ## Version control
 

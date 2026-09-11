@@ -10,15 +10,20 @@ mod branch_outcome_persistence_test;
 mod builder_test;
 mod cache_invalidation_test;
 mod concurrent_workers_test;
-mod conditional_read_s3_test;
+mod conditional_read_test;
+mod container_creation_test;
 mod deadline_expiry_test;
 mod dynamic_task_test;
 mod escaped_job_handle_test;
 mod in_memory_storage_test;
-mod job_cleanup_s3_test;
+mod job_cleanup_provider_test;
+#[cfg(feature = "storage-s3")]
+mod job_cleanup_s3_batch_test;
 mod job_cleanup_test;
 mod job_handle_read_test;
 mod job_iterations_test;
+#[cfg(feature = "storage-azure")]
+mod list_boundary_azure_test;
 mod metrics_sink_test;
 mod poll_scheduling_test;
 mod request_quota_test;

@@ -4,12 +4,12 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::common::counting_metrics::CountingMetrics;
-use super::common::s3_container::S3TestContainer;
+use super::common::provider_harness::ProviderHarness;
 use super::common::storage_wrapper::CountingStorage;
 use crate::storage::in_memory::InMemoryStorage;
 use crate::{
-    CachedStorage, Job, JobCode, JobDefinition, JobDefinitionId, JobStateCodecKind, JobsManager, MetricsSink,
-    NoopMetrics, S3StorageConfig, Storage, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, task_fn,
+    CachedStorage, Job, JobCode, JobDefinition, JobDefinitionId, JobsManager, MetricsSink, NoopMetrics, Storage,
+    TaskCode, TaskDefinition, TaskLimits, TaskOutcome, task_fn,
 };
 
 /// Bound on the waits of the pools below: a job that never finishes must fail the test rather than
@@ -159,13 +159,10 @@ async fn a_cache_hit_returns_the_job_the_worker_saved() -> Result<(), Box<dyn st
 ///
 /// Both pools run against one object store under prefixes of their own, because the object store is
 /// what makes the cache observable at all - an in-memory backend is never wrapped by it.
-#[tokio::test]
-async fn only_a_pool_keeping_the_read_cache_reports_cache_reads() -> Result<(), Box<dyn std::error::Error>> {
-    super::common::init_tracing();
-
-    let store = S3TestContainer::start().await?;
-
-    let cached_reads = run_job_on_object_store(&store, "cache-on", true).await?;
+async fn run_only_a_pool_keeping_the_read_cache_reports_cache_reads(
+    harness: &dyn ProviderHarness,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cached_reads = run_job_on_object_store(harness, "cache-on", true).await?;
     assert!(
         cached_reads.cache_hits() + cached_reads.cache_misses() > 0,
         "a cached pool must read through the cache, got {} hits and {} misses",
@@ -173,35 +170,27 @@ async fn only_a_pool_keeping_the_read_cache_reports_cache_reads() -> Result<(), 
         cached_reads.cache_misses()
     );
 
-    let uncached_reads = run_job_on_object_store(&store, "cache-off", false).await?;
+    let uncached_reads = run_job_on_object_store(harness, "cache-off", false).await?;
     assert_eq!(uncached_reads.cache_hits(), 0);
     assert_eq!(uncached_reads.cache_misses(), 0);
     Ok(())
 }
 
-/// Runs one job to completion on `store` under `bucket_prefix`, and returns what its pool measured.
+/// Runs one job to completion on `store` under `state_prefix`, and returns what its pool measured.
 ///
 /// The job carries two tasks because a worker runs at most one task of a job per pass: the pass
 /// that creates the job writes it without reading it, so a single-task job would finish before the
 /// cache is ever consulted.
 async fn run_job_on_object_store(
-    store: &S3TestContainer,
-    bucket_prefix: &str,
+    harness: &dyn ProviderHarness,
+    state_prefix: &str,
     cache_storage: bool,
 ) -> Result<Arc<CountingMetrics>, Box<dyn std::error::Error>> {
     let sink = Arc::new(CountingMetrics::default());
     let job_code = JobCode::new("cache_switch_job");
 
-    let mut builder = JobsManager::builder()
-        .s3(S3StorageConfig::new(
-            store.endpoint(),
-            store.username(),
-            store.password(),
-            "test-jobs",
-            "us-east-1",
-        )
-        .with_bucket_prefix(bucket_prefix)
-        .with_job_state_codec(JobStateCodecKind::Json))
+    let mut builder = harness
+        .attach_storage(JobsManager::builder(), state_prefix)
         .metrics(Arc::clone(&sink) as Arc<dyn MetricsSink>)
         .poll_interval(Duration::from_millis(50))
         .job(job_code.clone(), |j| {
@@ -222,4 +211,41 @@ async fn run_job_on_object_store(
     handle.shutdown().await?;
 
     Ok(sink)
+}
+
+#[cfg(feature = "storage-s3")]
+mod on_s3 {
+    use super::run_only_a_pool_keeping_the_read_cache_reports_cache_reads;
+    use crate::tests::common::provider_harness::S3ProviderHarness;
+
+    #[tokio::test]
+    async fn only_a_pool_keeping_the_read_cache_reports_cache_reads_on_s3() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_only_a_pool_keeping_the_read_cache_reports_cache_reads(&S3ProviderHarness::start().await?).await
+    }
+}
+
+#[cfg(feature = "storage-azure")]
+mod on_azure {
+    use super::run_only_a_pool_keeping_the_read_cache_reports_cache_reads;
+    use crate::tests::common::provider_harness::AzureProviderHarness;
+
+    #[tokio::test]
+    async fn only_a_pool_keeping_the_read_cache_reports_cache_reads_on_azure() -> Result<(), Box<dyn std::error::Error>>
+    {
+        crate::tests::common::init_tracing();
+        run_only_a_pool_keeping_the_read_cache_reports_cache_reads(&AzureProviderHarness::start().await?).await
+    }
+}
+
+#[cfg(feature = "storage-gcs")]
+mod on_gcs {
+    use super::run_only_a_pool_keeping_the_read_cache_reports_cache_reads;
+    use crate::tests::common::provider_harness::GcsProviderHarness;
+
+    #[tokio::test]
+    async fn only_a_pool_keeping_the_read_cache_reports_cache_reads_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_only_a_pool_keeping_the_read_cache_reports_cache_reads(&GcsProviderHarness::start().await?).await
+    }
 }

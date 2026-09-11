@@ -1,6 +1,6 @@
 //! Translation of what an S3 backend reports into [`StorageError`].
 //!
-//! Kept apart from [`S3Storage`](super::s3::S3Storage), which owns talking to the store in terms of
+//! Kept apart from [`S3Backend`](super::s3::S3Backend), which owns talking to the store in terms of
 //! jobs and iterations: deciding what a failure *means* - above all whether repeating the request
 //! can clear it - is a property of the error, not of the conversation that produced it.
 //!
@@ -9,10 +9,12 @@
 
 use std::fmt::Write as _;
 
-use aws_sdk_s3::{error::SdkError, types::Error as ObjectDeleteError};
+use aws_sdk_s3::{error::SdkError, primitives::ByteStreamError, types::Error as ObjectDeleteError};
 use tracing::warn;
 
 use crate::StorageError;
+use crate::storage::backend::{ProviderError, RequestStatus};
+use crate::storage::http_error::{HttpOutcome, classify_http_status};
 
 /// Failure entries a description names one by one before summarising the rest.
 ///
@@ -20,6 +22,79 @@ use crate::StorageError;
 /// its description lands both in a log line and in the error the caller finally gives up with -
 /// naming a thousand keys would put tens of kilobytes into each, on every attempt.
 const MAX_DESCRIBED_DELETE_FAILURES: usize = 10;
+
+/// What one S3 request failed with.
+///
+/// The three shapes are one type because
+/// [`send_request`](crate::storage::backend::send_request) bounds one request with
+/// one error, and each of these ends the same request: the SDK reports a request it could not get an
+/// answer to as [`SdkError`], an answer whose body stopped arriving as [`ByteStreamError`], and an
+/// answer that came back whole without carrying what the operation asked for is a failure this
+/// backend names itself. Reading that body belongs to the request rather than to whatever follows
+/// it, because the SDK's operation timeout ends once the answer's headers have landed: a body read
+/// outside this type answers to neither the configured timeout nor the token. What does reach it
+/// there is the SDK's stalled-stream protection, which answers a stream that stopped rather than the
+/// bound this crate was given.
+pub(crate) enum S3Failure<E> {
+    /// The service refused the request, or the request never reached one. Boxed because an
+    /// [`SdkError`] runs to hundreds of bytes, and unboxed every successful request would carry
+    /// that width in its own `Result`; the allocation is paid only by a request already lost.
+    Refused(Box<SdkError<E>>),
+    /// The service answered, and the body of that answer did not arrive whole.
+    Unread(ByteStreamError),
+    /// The service answered whole, and the answer did not carry what the operation asked for - a
+    /// write that named no version, a multi-object delete reporting per-key failures inside its
+    /// `200`. Carries the whole storage error because whether such an answer is worth repeating is
+    /// decided per operation: a throttled key is, a write without a version is not.
+    Unusable(StorageError),
+}
+
+impl<E> S3Failure<E> {
+    /// The failure a request the SDK could not get an answer to amounts to.
+    pub(crate) fn from_refusal(error: SdkError<E>) -> Self {
+        Self::Refused(Box::new(error))
+    }
+}
+
+impl<E: std::fmt::Debug> ProviderError for S3Failure<E> {
+    /// A body that stopped arriving is not retryable: the request was answered, and repeating it
+    /// spends an attempt the caller's budget owes to failures a repetition can clear.
+    fn into_storage_error(self) -> StorageError {
+        match self {
+            Self::Refused(error) => map_s3_error(&error),
+            Self::Unread(error) => StorageError::Backend(format!("Failed to read job body: {error}")),
+            Self::Unusable(error) => error,
+        }
+    }
+
+    fn recorded_status(&self) -> RequestStatus {
+        match self {
+            // `SdkError` is non-exhaustive, and the variants left out are exactly those that never
+            // reached a status - a timeout, a dispatch failure, a kind this SDK version added.
+            Self::Refused(error) => match error.as_ref() {
+                SdkError::ServiceError(service_err) => RequestStatus::Answered(service_err.raw().status().as_u16()),
+                _ => RequestStatus::Failed,
+            },
+            // The status was `200`; labelling either of these with it would say the answer was the
+            // one the operation asked for.
+            Self::Unread(_) | Self::Unusable(_) => RequestStatus::Failed,
+        }
+    }
+
+    /// See [`is_not_modified`].
+    fn is_not_modified(&self) -> bool {
+        match self {
+            Self::Refused(error) => is_not_modified(error),
+            Self::Unread(_) | Self::Unusable(_) => false,
+        }
+    }
+
+    /// Never: `DeleteObject` answers `204` for a key that is already gone, so cleanup on this
+    /// provider has no refusal to accept.
+    fn is_object_gone(&self) -> bool {
+        false
+    }
+}
 
 /// Storage error a failed S3 request amounts to.
 ///
@@ -31,15 +106,13 @@ pub(crate) fn map_s3_error<E: std::fmt::Debug>(err: &SdkError<E>) -> StorageErro
     match err {
         SdkError::ServiceError(service_err) => {
             let status = service_err.raw().status().as_u16();
-            let details = err.to_string();
-            match status {
-                401 | 403 => StorageError::Auth(details),
-                404 => StorageError::NotFound(details),
-                408 => StorageError::Timeout,
-                412 => StorageError::ConcurrentModification(details),
-                429 => StorageError::RateLimited,
-                500 | 502 | 503 | 504 => StorageError::ServiceUnavailable,
-                _ => StorageError::S3(format!("S3 SDK error: {err:?}")),
+            match classify_http_status(status, format!("S3 SDK error: {err}")) {
+                HttpOutcome::Failed(error) => error,
+                // Arriving here means a caller that issued a conditional request does not read its
+                // answer - see `is_not_modified`.
+                HttpOutcome::NotModified => {
+                    StorageError::Other(format!("conditional read answer reached error mapping: {err}"))
+                }
             }
         }
         SdkError::TimeoutError(_) => StorageError::Timeout,
@@ -47,16 +120,21 @@ pub(crate) fn map_s3_error<E: std::fmt::Debug>(err: &SdkError<E>) -> StorageErro
             // Network/connection errors are transient and should be retried.
             StorageError::ServiceUnavailable
         }
-        _ => StorageError::S3(format!("S3 SDK error: {err:?}")),
+        // SdkError is non-exhaustive; unknown SDK failure kinds are not retried.
+        _ => StorageError::Backend(format!("S3 SDK error: {err:?}")),
     }
 }
 
 /// Whether a failed `GetObject` is the store answering "not modified" to a conditional read.
 ///
-/// Kept apart from [`map_s3_error`] on purpose: `304` is not a failure to translate but the answer
-/// the conditional read asks for, so it is recognised before the mapping and never reaches it.
-pub(crate) fn is_not_modified<E: std::fmt::Debug>(err: &SdkError<E>) -> bool {
-    matches!(err, SdkError::ServiceError(service_err) if service_err.raw().status().as_u16() == 304)
+/// Recognised before [`map_s3_error`] rather than inside it, for the reason
+/// [`HttpOutcome::NotModified`] carries.
+fn is_not_modified<E: std::fmt::Debug>(err: &SdkError<E>) -> bool {
+    matches!(err, SdkError::ServiceError(service_err)
+    if matches!(
+        classify_http_status(service_err.raw().status().as_u16(), String::new()),
+        HttpOutcome::NotModified
+    ))
 }
 
 /// Storage error the per-object failures of one multi-object delete amount to, or `None` when the
@@ -64,7 +142,7 @@ pub(crate) fn is_not_modified<E: std::fmt::Debug>(err: &SdkError<E>) -> bool {
 ///
 /// A batch is repeated whole rather than key by key - `DELETE` is idempotent, so a key that already
 /// went costs nothing to send again - which is why a single transient failure makes the whole batch
-/// retryable. Without one the batch maps to [`StorageError::S3`], which
+/// retryable. Without one the batch maps to [`StorageError::Backend`], which
 /// [`StorageError::is_retryable`] rejects, so a permanent failure is attempted exactly once and the
 /// caller's attempt budget is left for failures that repeating can actually clear.
 pub(crate) fn classify_delete_failures(failures: &[ObjectDeleteError]) -> Option<StorageError> {
@@ -81,7 +159,7 @@ pub(crate) fn classify_delete_failures(failures: &[ObjectDeleteError]) -> Option
         return Some(transient_error);
     }
 
-    Some(StorageError::S3(format!(
+    Some(StorageError::Backend(format!(
         "Failed to delete job state objects: {details}"
     )))
 }
@@ -173,8 +251,8 @@ mod tests {
         )]);
 
         assert!(
-            matches!(error, StorageError::S3(_)),
-            "a rejected key must map to the plain S3 error, got: {error:?}"
+            matches!(error, StorageError::Backend(_)),
+            "a rejected key must map to the backend error, got: {error:?}"
         );
         assert!(!error.is_retryable(), "a rejected key must be attempted exactly once");
     }

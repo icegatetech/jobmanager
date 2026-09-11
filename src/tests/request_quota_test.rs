@@ -6,17 +6,18 @@ use uuid::Uuid;
 
 use super::common::counting_metrics::CountingMetrics;
 use super::common::manager_env::ManagerEnv;
-use super::common::meta_of;
-use super::common::s3_container::S3TestContainer;
+use super::common::provider_harness::{ProviderHarness, ProviderStorageRequest};
 use super::common::storage_wrapper::{ContendedSave, ContendingStorage, IterationSettlingStorage};
 use super::common::waiting::{
     CONDITION_TIMEOUT, OBSERVATION_WINDOW, measure_settled_requests, wait_until, wait_until_job_is_processed,
 };
+use super::common::{meta_of, persist_completed_iterations};
 use crate::core::task::SkipCause;
+use crate::storage::paths::JobPaths;
 use crate::{
-    CachedStorage, DependencyTolerance, Job, JobCleanerConfig, JobCode, JobDefinition, JobDefinitionId, JobRegistry,
-    JobStatus, JobsManagerConfig, MetricsSink, NoopMetrics, S3Storage, S3StorageConfig, Storage, TaskCode,
-    TaskDefinition, TaskExecutor, TaskLimits, TaskOutcome, TaskRef, TaskStatus, task_fn,
+    CachedStorage, DependencyTolerance, Job, JobCleaner, JobCleanerConfig, JobCode, JobDefinition, JobDefinitionId,
+    JobDefinitionRegistry, JobRegistry, JobStateCodecKind, JobStatus, JobsManagerConfig, MetricsSink, NoopMetrics,
+    Storage, TaskCode, TaskDefinition, TaskExecutor, TaskLimits, TaskOutcome, TaskRef, TaskStatus, task_fn,
 };
 
 /// Interval the pools below poll at: short enough that an observation window holds many passes, so
@@ -42,35 +43,24 @@ fn build_job_definition(job_code: &JobCode, executor: Arc<dyn TaskExecutor>) -> 
     )
 }
 
-fn build_s3_config(container: &S3TestContainer, bucket_prefix: &str) -> S3StorageConfig {
-    S3StorageConfig::new(
-        container.endpoint(),
-        container.username(),
-        container.password(),
-        "poll-request-quota",
-        "us-east-1",
-    )
-    .with_bucket_prefix(bucket_prefix)
-}
-
 /// The real store the pool is billed through, with every request it makes recorded by `metrics`.
 ///
 /// Kept apart from [`start_pool_on`] so a scenario can put a double between this store and the
 /// read cache without the double's own requests landing in the count.
 async fn build_measured_store(
-    container: &S3TestContainer,
-    bucket_prefix: &str,
+    harness: &dyn ProviderHarness,
+    state_prefix: &str,
     job_registry: &Arc<JobRegistry>,
     metrics: &Arc<CountingMetrics>,
 ) -> Result<Arc<dyn Storage>, Box<dyn std::error::Error>> {
-    let storage = S3Storage::new(
-        build_s3_config(container, bucket_prefix),
-        Arc::clone(job_registry) as Arc<dyn crate::JobDefinitionRegistry>,
-        Arc::clone(metrics) as Arc<dyn MetricsSink>,
-    )
-    .await?;
-
-    Ok(Arc::new(storage) as Arc<dyn Storage>)
+    harness
+        .build_storage(&ProviderStorageRequest::new(
+            state_prefix,
+            JobStateCodecKind::Json,
+            Arc::clone(job_registry) as Arc<dyn JobDefinitionRegistry>,
+            Arc::clone(metrics) as Arc<dyn MetricsSink>,
+        ))
+        .await
 }
 
 /// The pool under test: `store` behind the read cache.
@@ -101,31 +91,33 @@ fn start_pool_on(
 /// A pool reaching the measured store directly, which is what every scenario but the contended one
 /// wants.
 async fn start_pool(
-    container: &S3TestContainer,
-    bucket_prefix: &str,
+    harness: &dyn ProviderHarness,
+    state_prefix: &str,
     worker_count: usize,
     job_def: JobDefinition,
     metrics: &Arc<CountingMetrics>,
 ) -> Result<ManagerEnv, Box<dyn std::error::Error>> {
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
-    let store = build_measured_store(container, bucket_prefix, &job_registry, metrics).await?;
+    let store = build_measured_store(harness, state_prefix, &job_registry, metrics).await?;
 
     start_pool_on(store, worker_count, job_registry, job_def)
 }
 
 /// Reader of the store belonging to the test itself, so proving what the pool did costs nothing the
-/// pool is measured by.
+/// pool is measured by: a second backend over the same container, whose requests nobody counts.
 async fn build_state_probe(
-    container: &S3TestContainer,
-    bucket_prefix: &str,
+    harness: &dyn ProviderHarness,
+    state_prefix: &str,
     job_def: &JobDefinition,
-) -> Result<S3Storage, Box<dyn std::error::Error>> {
-    Ok(S3Storage::new(
-        build_s3_config(container, bucket_prefix),
-        Arc::new(JobRegistry::new(vec![job_def.clone()])?),
-        Arc::new(NoopMetrics),
-    )
-    .await?)
+) -> Result<Arc<dyn Storage>, Box<dyn std::error::Error>> {
+    harness
+        .build_storage(&ProviderStorageRequest::new(
+            state_prefix,
+            JobStateCodecKind::Json,
+            Arc::new(JobRegistry::new(vec![job_def.clone()])?) as Arc<dyn JobDefinitionRegistry>,
+            Arc::new(NoopMetrics),
+        ))
+        .await
 }
 
 /// Run quota of [`Storage::get_changed_job`] itself, below the pool that calls it: an iteration
@@ -134,16 +126,14 @@ async fn build_state_probe(
 ///
 /// Checked by reading without the `If-None-Match` the state was taken under: the store then answers
 /// with the object and the pair the number is counted under stops being reached.
-#[tokio::test]
-async fn a_conditional_read_of_an_unmoved_iteration_costs_one_get_and_no_listing()
--> Result<(), Box<dyn std::error::Error>> {
-    super::common::init_tracing();
-    let container = S3TestContainer::start().await?;
+async fn run_a_conditional_read_of_an_unmoved_iteration_costs_one_get_and_no_listing(
+    harness: &dyn ProviderHarness,
+) -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(CountingMetrics::default());
     let job_code = JobCode::new("measured_read_job");
     let job_def = build_job_definition(&job_code, task_fn(|_ctx| async { Ok(TaskOutcome::empty()) }))?;
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
-    let store = build_measured_store(&container, "measured-read", &job_registry, &metrics).await?;
+    let store = build_measured_store(harness, "measured-read", &job_registry, &metrics).await?;
     let mut job = Job::new(&job_def, HashMap::new(), Uuid::from_u128(1))?;
     store.save_job(&mut job, &CancellationToken::new()).await?;
 
@@ -181,11 +171,9 @@ async fn a_conditional_read_of_an_unmoved_iteration_costs_one_get_and_no_listing
 ///
 /// Checked by reading without the `If-None-Match` the state was taken under: the answers stop being
 /// `304` and land in the very class this bounds, which then grows across the window.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn polling_a_running_iteration_costs_no_request_besides_a_conditional_read()
--> Result<(), Box<dyn std::error::Error>> {
-    super::common::init_tracing();
-    let container = S3TestContainer::start().await?;
+async fn run_polling_a_running_iteration_costs_no_request_besides_a_conditional_read(
+    harness: &dyn ProviderHarness,
+) -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(CountingMetrics::default());
     let is_task_started = Arc::new(AtomicBool::new(false));
     let is_task_released = Arc::new(AtomicBool::new(false));
@@ -208,7 +196,7 @@ async fn polling_a_running_iteration_costs_no_request_besides_a_conditional_read
             }
         }),
     )?;
-    let _env = start_pool(&container, "running", 2, job_def, &metrics).await?;
+    let _env = start_pool(harness, "running", 2, job_def, &metrics).await?;
 
     wait_until(|| is_task_started.load(Ordering::SeqCst), "the iteration is running").await?;
     // Every request but the conditional read is what the scenario bounds, so that is what has to
@@ -248,18 +236,17 @@ const LONG_ITERATION_INTERVAL: Duration = Duration::from_mins(5);
 /// Checked by letting a pass reach the job whatever its next iteration is due at - both the wait
 /// between passes and the poll gate, because either one alone still holds the pass back. The total
 /// then more than doubles across the window.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_job_waiting_for_its_next_iteration_costs_nothing_on_the_store() -> Result<(), Box<dyn std::error::Error>> {
-    super::common::init_tracing();
-    let container = S3TestContainer::start().await?;
+async fn run_a_job_waiting_for_its_next_iteration_costs_nothing_on_the_store(
+    harness: &dyn ProviderHarness,
+) -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(CountingMetrics::default());
     let job_code = JobCode::new("waiting_iteration_job");
     let job_def = build_job_definition(&job_code, task_fn(|_ctx| async { Ok(TaskOutcome::empty()) }))?
         .with_iteration_interval(LONG_ITERATION_INTERVAL)?;
-    let probe = build_state_probe(&container, "waiting", &job_def).await?;
-    let _env = start_pool(&container, "waiting", 2, job_def, &metrics).await?;
+    let probe = build_state_probe(harness, "waiting", &job_def).await?;
+    let _env = start_pool(harness, "waiting", 2, job_def, &metrics).await?;
 
-    wait_until_job_is_processed(&probe, &job_code, &CancellationToken::new()).await?;
+    wait_until_job_is_processed(probe.as_ref(), &job_code, &CancellationToken::new()).await?;
     let requests_before = measure_settled_requests(
         || metrics.storage_operations_total(),
         "the passes already in flight have issued their requests",
@@ -288,16 +275,15 @@ async fn a_job_waiting_for_its_next_iteration_costs_nothing_on_the_store() -> Re
 ///
 /// Checked by letting a pass run before the moment it was scheduled for: the finished iteration is
 /// discovered a second time and the listings go from two to three.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn running_a_single_task_job_once_costs_five_requests() -> Result<(), Box<dyn std::error::Error>> {
-    super::common::init_tracing();
-    let container = S3TestContainer::start().await?;
+async fn run_running_a_single_task_job_once_costs_five_requests(
+    harness: &dyn ProviderHarness,
+) -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(CountingMetrics::default());
     let job_code = JobCode::new("single_run_job");
     let job_def =
         build_job_definition(&job_code, task_fn(|_ctx| async { Ok(TaskOutcome::empty()) }))?.with_max_iterations(1)?;
-    let probe = build_state_probe(&container, "single-run", &job_def).await?;
-    let env = start_pool(&container, "single-run", 1, job_def, &metrics).await?;
+    let probe = build_state_probe(harness, "single-run", &job_def).await?;
+    let env = start_pool(harness, "single-run", 1, job_def, &metrics).await?;
 
     env.wait_for_all_jobs_completion(CONDITION_TIMEOUT).await?;
     let requests = measure_settled_requests(
@@ -339,10 +325,9 @@ async fn running_a_single_task_job_once_costs_five_requests() -> Result<(), Box<
 /// Checked by moving the verdict back into a pass of its own - dropping `try_settle_iteration` from
 /// `Worker::execute_task`: the refusal is then saved under a running iteration and the verdict
 /// costs a fourth write.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_run_ending_in_a_terminal_failure_costs_five_requests() -> Result<(), Box<dyn std::error::Error>> {
-    super::common::init_tracing();
-    let container = S3TestContainer::start().await?;
+async fn run_a_run_ending_in_a_terminal_failure_costs_five_requests(
+    harness: &dyn ProviderHarness,
+) -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(CountingMetrics::default());
     let job_code = JobCode::new("terminal_failure_run_job");
     let job_def = build_job_definition(
@@ -350,8 +335,8 @@ async fn a_run_ending_in_a_terminal_failure_costs_five_requests() -> Result<(), 
         task_fn(|_ctx| async { Ok(TaskOutcome::TerminallyFailed("decode input".to_string())) }),
     )?
     .with_max_iterations(1)?;
-    let probe = build_state_probe(&container, "terminal-failure-run", &job_def).await?;
-    let env = start_pool(&container, "terminal-failure-run", 1, job_def, &metrics).await?;
+    let probe = build_state_probe(harness, "terminal-failure-run", &job_def).await?;
+    let env = start_pool(harness, "terminal-failure-run", 1, job_def, &metrics).await?;
 
     env.wait_for_all_jobs_completion(CONDITION_TIMEOUT).await?;
     let requests = measure_settled_requests(
@@ -391,10 +376,9 @@ async fn a_run_ending_in_a_terminal_failure_costs_five_requests() -> Result<(), 
 ///
 /// Checked by dropping the cascade from `Job::try_settle_iteration`: the dependent then either runs -
 /// two writes more - or leaves the iteration open for the deadlock the settling reports.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_run_whose_branch_is_skipped_costs_five_requests() -> Result<(), Box<dyn std::error::Error>> {
-    super::common::init_tracing();
-    let container = S3TestContainer::start().await?;
+async fn run_a_run_whose_branch_is_skipped_costs_five_requests(
+    harness: &dyn ProviderHarness,
+) -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(CountingMetrics::default());
     let job_code = JobCode::new("skipped_branch_run_job");
     let definition_id = JobDefinitionId::new();
@@ -419,8 +403,8 @@ async fn a_run_whose_branch_is_skipped_costs_five_requests() -> Result<(), Box<d
         TaskLimits::default(),
     )?
     .with_max_iterations(1)?;
-    let probe = build_state_probe(&container, "skipped-branch-run", &job_def).await?;
-    let env = start_pool(&container, "skipped-branch-run", 1, job_def, &metrics).await?;
+    let probe = build_state_probe(harness, "skipped-branch-run", &job_def).await?;
+    let env = start_pool(harness, "skipped-branch-run", 1, job_def, &metrics).await?;
 
     env.wait_for_all_jobs_completion(CONDITION_TIMEOUT).await?;
     let requests = measure_settled_requests(
@@ -473,10 +457,9 @@ async fn a_run_whose_branch_is_skipped_costs_five_requests() -> Result<(), Box<d
 /// its conditional read - goes with it, leaving five requests. Dropping the tolerance from the
 /// dependent's definition moves the same three requests, which is what proves the fixture reaches
 /// the tolerant path at all.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_run_with_a_tolerant_dependent_costs_eight_requests() -> Result<(), Box<dyn std::error::Error>> {
-    super::common::init_tracing();
-    let container = S3TestContainer::start().await?;
+async fn run_a_run_with_a_tolerant_dependent_costs_eight_requests(
+    harness: &dyn ProviderHarness,
+) -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(CountingMetrics::default());
     let job_code = JobCode::new("tolerant_dependent_run_job");
     let definition_id = JobDefinitionId::new();
@@ -503,8 +486,8 @@ async fn a_run_with_a_tolerant_dependent_costs_eight_requests() -> Result<(), Bo
         TaskLimits::default(),
     )?
     .with_max_iterations(1)?;
-    let probe = build_state_probe(&container, "tolerant-dependent-run", &job_def).await?;
-    let env = start_pool(&container, "tolerant-dependent-run", 1, job_def, &metrics).await?;
+    let probe = build_state_probe(harness, "tolerant-dependent-run", &job_def).await?;
+    let env = start_pool(harness, "tolerant-dependent-run", 1, job_def, &metrics).await?;
 
     env.wait_for_all_jobs_completion(CONDITION_TIMEOUT).await?;
     let requests = measure_settled_requests(
@@ -558,20 +541,19 @@ async fn a_run_with_a_tolerant_dependent_costs_eight_requests() -> Result<(), Bo
 ///
 /// Checked by letting a pass run before the moment it was scheduled for: the finished iteration is
 /// discovered a second time and the listings go from three to four.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_run_losing_one_race_costs_eight_requests() -> Result<(), Box<dyn std::error::Error>> {
-    super::common::init_tracing();
-    let container = S3TestContainer::start().await?;
+async fn run_a_run_losing_one_race_costs_eight_requests(
+    harness: &dyn ProviderHarness,
+) -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(CountingMetrics::default());
     let job_code = JobCode::new("contended_run_job");
     let job_def =
         build_job_definition(&job_code, task_fn(|_ctx| async { Ok(TaskOutcome::empty()) }))?.with_max_iterations(1)?;
-    let probe = build_state_probe(&container, "contended", &job_def).await?;
-    let rival_store = build_state_probe(&container, "contended", &job_def).await?;
+    let probe = build_state_probe(harness, "contended", &job_def).await?;
+    let rival_store = build_state_probe(harness, "contended", &job_def).await?;
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
     let contending = Arc::new(
-        ContendingStorage::new(build_measured_store(&container, "contended", &job_registry, &metrics).await?)
-            .with_rival_store(Arc::new(rival_store) as Arc<dyn Storage>),
+        ContendingStorage::new(build_measured_store(harness, "contended", &job_registry, &metrics).await?)
+            .with_rival_store(rival_store),
     );
     let env = start_pool_on(Arc::clone(&contending) as Arc<dyn Storage>, 1, job_registry, job_def)?;
 
@@ -628,11 +610,9 @@ async fn a_run_losing_one_race_costs_eight_requests() -> Result<(), Box<dyn std:
 /// Checked by answering `JobError::IterationAlreadySettled` with `MergeDecision::Retry` instead of
 /// `SaveOutcome::JobStolen` in the conflict handler of `Worker::execute_task`: the save is then made
 /// a second time and writes an eighth request.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_run_whose_result_lands_in_a_settled_iteration_costs_seven_requests() -> Result<(), Box<dyn std::error::Error>>
-{
-    super::common::init_tracing();
-    let container = S3TestContainer::start().await?;
+async fn run_a_run_whose_result_lands_in_a_settled_iteration_costs_seven_requests(
+    harness: &dyn ProviderHarness,
+) -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(CountingMetrics::default());
     let job_code = JobCode::new("settled_iteration_run_job");
     let task_def = TaskDefinition::new(TaskCode::from(OUTLIVING_TASK_CODE), OUTLIVING_TASK_TIMEOUT)
@@ -652,16 +632,16 @@ async fn a_run_whose_result_lands_in_a_settled_iteration_costs_seven_requests() 
         TaskLimits::default(),
     )?
     .with_max_iterations(1)?;
-    let probe = build_state_probe(&container, "settled-iteration", &job_def).await?;
-    let rival_store = build_state_probe(&container, "settled-iteration", &job_def).await?;
+    let probe = build_state_probe(harness, "settled-iteration", &job_def).await?;
+    let rival_store = build_state_probe(harness, "settled-iteration", &job_def).await?;
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
     let settling = Arc::new(
         IterationSettlingStorage::new(
-            build_measured_store(&container, "settled-iteration", &job_registry, &metrics).await?,
+            build_measured_store(harness, "settled-iteration", &job_registry, &metrics).await?,
             Uuid::new_v4(),
             TaskCode::from(OUTLIVING_TASK_CODE),
         )
-        .with_rival_store(Arc::new(rival_store) as Arc<dyn Storage>),
+        .with_rival_store(rival_store),
     );
     let env = start_pool_on(Arc::clone(&settling) as Arc<dyn Storage>, 1, job_registry, job_def)?;
 
@@ -719,10 +699,9 @@ async fn a_run_whose_result_lands_in_a_settled_iteration_costs_seven_requests() 
 /// Checked by dropping the `try_settle_iteration` call from the end of
 /// `Job::merge_with_processed_task`: the retry then stores an open iteration, and the pass that
 /// closes it afterwards costs a ninth request of its own.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_run_whose_skipped_branch_loses_one_race_costs_eight_requests() -> Result<(), Box<dyn std::error::Error>> {
-    super::common::init_tracing();
-    let container = S3TestContainer::start().await?;
+async fn run_a_run_whose_skipped_branch_loses_one_race_costs_eight_requests(
+    harness: &dyn ProviderHarness,
+) -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(CountingMetrics::default());
     let job_code = JobCode::new("contended_skip_run_job");
     let definition_id = JobDefinitionId::new();
@@ -745,16 +724,16 @@ async fn a_run_whose_skipped_branch_loses_one_race_costs_eight_requests() -> Res
         TaskLimits::default(),
     )?
     .with_max_iterations(1)?;
-    let probe = build_state_probe(&container, "contended-skip", &job_def).await?;
-    let rival_store = build_state_probe(&container, "contended-skip", &job_def).await?;
+    let probe = build_state_probe(harness, "contended-skip", &job_def).await?;
+    let rival_store = build_state_probe(harness, "contended-skip", &job_def).await?;
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
     let contending = Arc::new(
-        ContendingStorage::new(build_measured_store(&container, "contended-skip", &job_registry, &metrics).await?)
+        ContendingStorage::new(build_measured_store(harness, "contended-skip", &job_registry, &metrics).await?)
             .with_contended_save(ContendedSave::OfTask {
                 code: TaskCode::from("detect"),
                 status: TaskStatus::Skipped(SkipCause::ExecutorDecision),
             })
-            .with_rival_store(Arc::new(rival_store) as Arc<dyn Storage>),
+            .with_rival_store(rival_store),
     );
     let env = start_pool_on(Arc::clone(&contending) as Arc<dyn Storage>, 1, job_registry, job_def)?;
 
@@ -819,11 +798,9 @@ async fn a_run_whose_skipped_branch_loses_one_race_costs_eight_requests() -> Res
 /// Checked by dropping the derivation from `Job::merge_with_picked_task`: the dependency then stays
 /// started in the state the retry writes, so the iteration is closed by a later pass whose own write
 /// and conditional read are billed on top.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_ten_requests()
--> Result<(), Box<dyn std::error::Error>> {
-    super::common::init_tracing();
-    let container = S3TestContainer::start().await?;
+async fn run_a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_ten_requests(
+    harness: &dyn ProviderHarness,
+) -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(CountingMetrics::default());
     let job_code = JobCode::new("contended_pickup_run_job");
     let definition_id = JobDefinitionId::new();
@@ -854,16 +831,16 @@ async fn a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_ten_re
         TaskLimits::default(),
     )?
     .with_max_iterations(1)?;
-    let probe = build_state_probe(&container, "contended-pickup", &job_def).await?;
-    let rival_store = build_state_probe(&container, "contended-pickup", &job_def).await?;
+    let probe = build_state_probe(harness, "contended-pickup", &job_def).await?;
+    let rival_store = build_state_probe(harness, "contended-pickup", &job_def).await?;
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
     let contending = Arc::new(
-        ContendingStorage::new(build_measured_store(&container, "contended-pickup", &job_registry, &metrics).await?)
+        ContendingStorage::new(build_measured_store(harness, "contended-pickup", &job_registry, &metrics).await?)
             .with_contended_save(ContendedSave::OfTask {
                 code: TaskCode::from("prepare"),
                 status: TaskStatus::Started,
             })
-            .with_rival_store(Arc::new(rival_store) as Arc<dyn Storage>),
+            .with_rival_store(rival_store),
     );
     let env = start_pool_on(Arc::clone(&contending) as Arc<dyn Storage>, 1, job_registry, job_def)?;
 
@@ -921,4 +898,416 @@ async fn a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_ten_re
         "and the failure and the cascade the merge derives cost nothing on top of the race"
     );
     Ok(())
+}
+
+/// Iterations the cleanup scenario starts from, and how many of them its retention window keeps.
+/// Seven and five leave exactly two outdated, which is the smallest tail a batching provider can be
+/// told apart from a per-key one by.
+const TRIMMED_TAIL_ITERATIONS: u64 = 7;
+const TRIMMED_TAIL_RETENTION: u64 = 5;
+
+/// Prefix the cleanup scenario keeps its state under, shared by the store it writes the tail with,
+/// the store it measures, and the reader that says which iterations survived.
+const TRIMMED_TAIL_STATE_PREFIX: &str = "trimmed-tail";
+
+/// Run quota of trimming a tail, which is the one scenario the two backends do not pay the same for
+/// and therefore the one that states the difference as a number: the listing that finds the current
+/// iteration, the listing of the tail, and then the deletes - one request carrying both iterations
+/// on S3, one request per iteration on Azure.
+///
+/// `expected_deletes` and `expected_requests` are what the wrappers below differ in, and the totals
+/// are asserted whole, so a request under any other pair - a `429`, a `500`, a retried listing -
+/// cannot hide behind the named ones.
+///
+/// The tail is written through a store of the test's own, so what the counters hold is the cleanup
+/// pass alone. The pass itself is start-up reconciliation, run to completion rather than cancelled:
+/// every sender of the report channel is dropped before the cleaner starts, so the cleaner returns
+/// once it has reconciled the one registered job and there is no second pass to race the counters.
+///
+/// Checked by breaking each number once. Three: making `S3Backend::delete_job_iterations` chunk by
+/// one key turns its single multi-object delete into two, and its number becomes the Azure one.
+/// Four: dropping the `next_marker` check from `AzureBackend::list_job_outdated_iterations` sends
+/// the pager for a page after the last one, which it answers without a request - a third listing in
+/// the count that nobody was billed for.
+async fn run_trimming_a_tail_of_two_iterations(
+    harness: &dyn ProviderHarness,
+    expected_deletes: u64,
+    expected_requests: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let metrics = Arc::new(CountingMetrics::default());
+    let job_code = JobCode::new("trimmed_tail_job");
+    let job_def = build_job_definition(&job_code, task_fn(|_ctx| async { Ok(TaskOutcome::empty()) }))?
+        .with_iteration_retention(TRIMMED_TAIL_RETENTION)?;
+    let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
+    let tail_writer = build_state_probe(harness, TRIMMED_TAIL_STATE_PREFIX, &job_def).await?;
+    persist_completed_iterations(tail_writer.as_ref(), &job_code, 1..=TRIMMED_TAIL_ITERATIONS).await?;
+
+    let store = build_measured_store(harness, TRIMMED_TAIL_STATE_PREFIX, &job_registry, &metrics).await?;
+    let cleaner = JobCleaner::new(job_registry, store, &JobCleanerConfig::default());
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    drop(sender);
+    cleaner.start(receiver, CancellationToken::new()).await?;
+
+    // Which iterations survived rather than how many: a pass deleting the two newest keeps the same
+    // count and the same request numbers, and what it would have thrown away is the state the job
+    // runs on. The names are read back as iteration numbers so the assertion is about iterations,
+    // which is what the retention boundary is stated in.
+    let state_object_keys = JobPaths::new(
+        TRIMMED_TAIL_STATE_PREFIX.to_string(),
+        JobStateCodecKind::Json.build().as_ref(),
+    );
+    let kept_keys = harness.read_state_keys(TRIMMED_TAIL_STATE_PREFIX).await?;
+    let mut kept_iter_nums = kept_keys
+        .iter()
+        .map(|key| state_object_keys.parse_iter_num(key))
+        .collect::<Result<Vec<u64>, _>>()?;
+    kept_iter_nums.sort_unstable();
+    assert_eq!(
+        kept_iter_nums,
+        ((TRIMMED_TAIL_ITERATIONS - TRIMMED_TAIL_RETENTION + 1)..=TRIMMED_TAIL_ITERATIONS).collect::<Vec<u64>>(),
+        "the pass must keep the newest iterations the retention window covers, found {kept_keys:?}"
+    );
+    assert_eq!(
+        metrics.storage_operations("LIST", "OK"),
+        2,
+        "finding the current iteration and listing the tail are the only two listings a pass makes"
+    );
+    assert_eq!(
+        metrics.storage_operations("DELETE", "OK"),
+        expected_deletes,
+        "and the deletes are what the two providers pay differently for"
+    );
+    assert_eq!(
+        metrics.storage_operations_total(),
+        expected_requests,
+        "and nothing else is billed: no read, no refused request, no retry"
+    );
+    Ok(())
+}
+
+/// The quotas as the S3 backend pays them. Each wrapper names its number, and what the number
+/// holds - and the break that was used to check it - is written once on the body it runs.
+#[cfg(feature = "storage-s3")]
+mod on_s3 {
+    use super::{
+        run_a_conditional_read_of_an_unmoved_iteration_costs_one_get_and_no_listing,
+        run_a_job_waiting_for_its_next_iteration_costs_nothing_on_the_store,
+        run_a_run_ending_in_a_terminal_failure_costs_five_requests, run_a_run_losing_one_race_costs_eight_requests,
+        run_a_run_whose_branch_is_skipped_costs_five_requests,
+        run_a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_ten_requests,
+        run_a_run_whose_result_lands_in_a_settled_iteration_costs_seven_requests,
+        run_a_run_whose_skipped_branch_loses_one_race_costs_eight_requests,
+        run_a_run_with_a_tolerant_dependent_costs_eight_requests,
+        run_polling_a_running_iteration_costs_no_request_besides_a_conditional_read,
+        run_running_a_single_task_job_once_costs_five_requests, run_trimming_a_tail_of_two_iterations,
+    };
+    use crate::tests::common::provider_harness::S3ProviderHarness;
+
+    #[tokio::test]
+    async fn a_conditional_read_of_an_unmoved_iteration_costs_one_get_and_no_listing_on_s3()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_conditional_read_of_an_unmoved_iteration_costs_one_get_and_no_listing(&S3ProviderHarness::start().await?)
+            .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn polling_a_running_iteration_costs_no_request_besides_a_conditional_read_on_s3()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_polling_a_running_iteration_costs_no_request_besides_a_conditional_read(&S3ProviderHarness::start().await?)
+            .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_waiting_for_its_next_iteration_costs_nothing_on_the_store_on_s3()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_job_waiting_for_its_next_iteration_costs_nothing_on_the_store(&S3ProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn running_a_single_task_job_once_costs_five_requests_on_s3() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_running_a_single_task_job_once_costs_five_requests(&S3ProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_ending_in_a_terminal_failure_costs_five_requests_on_s3() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_run_ending_in_a_terminal_failure_costs_five_requests(&S3ProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_whose_branch_is_skipped_costs_five_requests_on_s3() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_run_whose_branch_is_skipped_costs_five_requests(&S3ProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_with_a_tolerant_dependent_costs_eight_requests_on_s3() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_run_with_a_tolerant_dependent_costs_eight_requests(&S3ProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_losing_one_race_costs_eight_requests_on_s3() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_run_losing_one_race_costs_eight_requests(&S3ProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_whose_result_lands_in_a_settled_iteration_costs_seven_requests_on_s3()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_run_whose_result_lands_in_a_settled_iteration_costs_seven_requests(&S3ProviderHarness::start().await?)
+            .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_whose_skipped_branch_loses_one_race_costs_eight_requests_on_s3()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_run_whose_skipped_branch_loses_one_race_costs_eight_requests(&S3ProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_ten_requests_on_s3()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_ten_requests(
+            &S3ProviderHarness::start().await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn trimming_a_tail_of_two_iterations_costs_three_requests_on_s3() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_trimming_a_tail_of_two_iterations(&S3ProviderHarness::start().await?, 1, 3).await
+    }
+}
+
+/// The same quotas as the Azure backend pays them. Every scenario a pool repeats costs the same on
+/// both backends - a read, a write and a listing page are one request each, recorded under the same
+/// operation and status - and a number that differs in one of those is a defect of the backend
+/// rather than a second price list.
+///
+/// Trimming a tail is the exception and the reason the two names carry different numbers:
+/// `azure_storage_blob` exposes no client for the provider's batch delete, so a sweep costs a
+/// request per iteration where S3 pays one for all of them.
+#[cfg(feature = "storage-azure")]
+mod on_azure {
+    use super::{
+        run_a_conditional_read_of_an_unmoved_iteration_costs_one_get_and_no_listing,
+        run_a_job_waiting_for_its_next_iteration_costs_nothing_on_the_store,
+        run_a_run_ending_in_a_terminal_failure_costs_five_requests, run_a_run_losing_one_race_costs_eight_requests,
+        run_a_run_whose_branch_is_skipped_costs_five_requests,
+        run_a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_ten_requests,
+        run_a_run_whose_result_lands_in_a_settled_iteration_costs_seven_requests,
+        run_a_run_whose_skipped_branch_loses_one_race_costs_eight_requests,
+        run_a_run_with_a_tolerant_dependent_costs_eight_requests,
+        run_polling_a_running_iteration_costs_no_request_besides_a_conditional_read,
+        run_running_a_single_task_job_once_costs_five_requests, run_trimming_a_tail_of_two_iterations,
+    };
+    use crate::tests::common::provider_harness::AzureProviderHarness;
+
+    #[tokio::test]
+    async fn a_conditional_read_of_an_unmoved_iteration_costs_one_get_and_no_listing_on_azure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_conditional_read_of_an_unmoved_iteration_costs_one_get_and_no_listing(
+            &AzureProviderHarness::start().await?,
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn polling_a_running_iteration_costs_no_request_besides_a_conditional_read_on_azure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_polling_a_running_iteration_costs_no_request_besides_a_conditional_read(
+            &AzureProviderHarness::start().await?,
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_waiting_for_its_next_iteration_costs_nothing_on_the_store_on_azure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_job_waiting_for_its_next_iteration_costs_nothing_on_the_store(&AzureProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn running_a_single_task_job_once_costs_five_requests_on_azure() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_running_a_single_task_job_once_costs_five_requests(&AzureProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_ending_in_a_terminal_failure_costs_five_requests_on_azure() -> Result<(), Box<dyn std::error::Error>>
+    {
+        crate::tests::common::init_tracing();
+        run_a_run_ending_in_a_terminal_failure_costs_five_requests(&AzureProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_whose_branch_is_skipped_costs_five_requests_on_azure() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_run_whose_branch_is_skipped_costs_five_requests(&AzureProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_with_a_tolerant_dependent_costs_eight_requests_on_azure() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_run_with_a_tolerant_dependent_costs_eight_requests(&AzureProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_losing_one_race_costs_eight_requests_on_azure() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_run_losing_one_race_costs_eight_requests(&AzureProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_whose_result_lands_in_a_settled_iteration_costs_seven_requests_on_azure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_run_whose_result_lands_in_a_settled_iteration_costs_seven_requests(&AzureProviderHarness::start().await?)
+            .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_whose_skipped_branch_loses_one_race_costs_eight_requests_on_azure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_run_whose_skipped_branch_loses_one_race_costs_eight_requests(&AzureProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_ten_requests_on_azure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_ten_requests(
+            &AzureProviderHarness::start().await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn trimming_a_tail_of_two_iterations_costs_four_requests_on_azure() -> Result<(), Box<dyn std::error::Error>>
+    {
+        crate::tests::common::init_tracing();
+        run_trimming_a_tail_of_two_iterations(&AzureProviderHarness::start().await?, 2, 4).await
+    }
+}
+
+/// The same quotas as the Google Cloud Storage backend pays them. Every scenario a pool repeats
+/// costs the same on all three backends - a read, a write and a listing page are one request each,
+/// recorded under the same operation and status - and a number that differs in one of those is a
+/// defect of the backend rather than a third price list.
+///
+/// Trimming a tail is the exception and the reason this name carries the Azure number rather than
+/// the S3 one: the JSON API has a batch endpoint, and reaching it means a `multipart/mixed` body of
+/// sub-requests that `gcs_client` does not build, so a sweep costs a request per iteration.
+#[cfg(feature = "storage-gcs")]
+mod on_gcs {
+    use super::{
+        run_a_conditional_read_of_an_unmoved_iteration_costs_one_get_and_no_listing,
+        run_a_job_waiting_for_its_next_iteration_costs_nothing_on_the_store,
+        run_a_run_ending_in_a_terminal_failure_costs_five_requests, run_a_run_losing_one_race_costs_eight_requests,
+        run_a_run_whose_branch_is_skipped_costs_five_requests,
+        run_a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_ten_requests,
+        run_a_run_whose_result_lands_in_a_settled_iteration_costs_seven_requests,
+        run_a_run_whose_skipped_branch_loses_one_race_costs_eight_requests,
+        run_a_run_with_a_tolerant_dependent_costs_eight_requests,
+        run_polling_a_running_iteration_costs_no_request_besides_a_conditional_read,
+        run_running_a_single_task_job_once_costs_five_requests, run_trimming_a_tail_of_two_iterations,
+    };
+    use crate::tests::common::provider_harness::GcsProviderHarness;
+
+    #[tokio::test]
+    async fn a_conditional_read_of_an_unmoved_iteration_costs_one_get_and_no_listing_on_gcs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_conditional_read_of_an_unmoved_iteration_costs_one_get_and_no_listing(&GcsProviderHarness::start().await?)
+            .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn polling_a_running_iteration_costs_no_request_besides_a_conditional_read_on_gcs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_polling_a_running_iteration_costs_no_request_besides_a_conditional_read(&GcsProviderHarness::start().await?)
+            .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_waiting_for_its_next_iteration_costs_nothing_on_the_store_on_gcs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_job_waiting_for_its_next_iteration_costs_nothing_on_the_store(&GcsProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn running_a_single_task_job_once_costs_five_requests_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_running_a_single_task_job_once_costs_five_requests(&GcsProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_ending_in_a_terminal_failure_costs_five_requests_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_run_ending_in_a_terminal_failure_costs_five_requests(&GcsProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_whose_branch_is_skipped_costs_five_requests_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_run_whose_branch_is_skipped_costs_five_requests(&GcsProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_with_a_tolerant_dependent_costs_eight_requests_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_run_with_a_tolerant_dependent_costs_eight_requests(&GcsProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_losing_one_race_costs_eight_requests_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_run_losing_one_race_costs_eight_requests(&GcsProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_whose_result_lands_in_a_settled_iteration_costs_seven_requests_on_gcs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_run_whose_result_lands_in_a_settled_iteration_costs_seven_requests(&GcsProviderHarness::start().await?)
+            .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_whose_skipped_branch_loses_one_race_costs_eight_requests_on_gcs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_run_whose_skipped_branch_loses_one_race_costs_eight_requests(&GcsProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_ten_requests_on_gcs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_ten_requests(
+            &GcsProviderHarness::start().await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn trimming_a_tail_of_two_iterations_costs_four_requests_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_trimming_a_tail_of_two_iterations(&GcsProviderHarness::start().await?, 2, 4).await
+    }
 }

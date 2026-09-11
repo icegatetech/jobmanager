@@ -9,11 +9,11 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
-use super::common::s3_container::S3TestContainer;
+use super::common::provider_harness::{ProviderHarness, ProviderStorageRequest};
 use crate::storage::in_memory::InMemoryStorage;
 use crate::{
-    JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStateCodecKind, JobStatus, JobsManagerConfig, NoopMetrics,
-    S3Storage, S3StorageConfig, Storage, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, TaskRetry, task_fn,
+    JobCode, JobDefinition, JobDefinitionId, JobDefinitionRegistry, JobRegistry, JobStateCodecKind, JobStatus,
+    JobsManagerConfig, NoopMetrics, Storage, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, TaskRetry, task_fn,
 };
 
 /// Bound on every wait here, so a job that never finishes fails the test instead of hanging it.
@@ -21,10 +21,9 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A refusal the executor declared terminal is not retried: the task ends on its first attempt and
 /// the iteration fails, instead of the executor being called five times over.
-#[tokio::test]
-async fn a_terminal_refusal_is_not_retried() -> Result<(), Box<dyn std::error::Error>> {
-    super::common::init_tracing();
-    let store = S3TestContainer::start().await?;
+async fn run_a_terminal_refusal_is_not_retried(
+    harness: &dyn ProviderHarness,
+) -> Result<(), Box<dyn std::error::Error>> {
     let attempts = Arc::new(AtomicI32::new(0));
 
     let executor = {
@@ -51,25 +50,20 @@ async fn a_terminal_refusal_is_not_retried() -> Result<(), Box<dyn std::error::E
     )?
     .with_max_iterations(1)?;
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
-    let storage = S3Storage::new(
-        S3StorageConfig::new(
-            store.endpoint(),
-            store.username(),
-            store.password(),
+    let storage = harness
+        .build_storage(&ProviderStorageRequest::new(
             "terminal-failure",
-            "us-east-1",
-        )
-        .with_job_state_codec(JobStateCodecKind::Json),
-        job_registry.clone(),
-        Arc::new(NoopMetrics),
-    )
-    .await?;
+            JobStateCodecKind::Json,
+            Arc::clone(&job_registry) as Arc<dyn JobDefinitionRegistry>,
+            Arc::new(NoopMetrics),
+        ))
+        .await?;
     let config = JobsManagerConfig {
         worker_count: 1,
         worker_config: super::common::build_worker_config(Duration::from_millis(100), Duration::from_millis(10)),
         ..Default::default()
     };
-    let mut env = ManagerEnv::new(Arc::new(storage), config, Arc::clone(&job_registry), vec![job_def])?;
+    let mut env = ManagerEnv::new(storage, config, Arc::clone(&job_registry), vec![job_def])?;
 
     env.wait_for_all_jobs_completion(WAIT_TIMEOUT).await?;
     env.stop().await;
@@ -146,4 +140,40 @@ async fn a_terminal_refusal_declared_through_the_handle_is_not_retried() -> Resu
     assert_eq!(task.retry(), TaskRetry::Never, "the declaration must survive the save");
     assert_eq!(task.attempt(), 1, "with the rest of the budget unspent");
     Ok(())
+}
+
+#[cfg(feature = "storage-s3")]
+mod on_s3 {
+    use super::run_a_terminal_refusal_is_not_retried;
+    use crate::tests::common::provider_harness::S3ProviderHarness;
+
+    #[tokio::test]
+    async fn a_terminal_refusal_is_not_retried_on_s3() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_terminal_refusal_is_not_retried(&S3ProviderHarness::start().await?).await
+    }
+}
+
+#[cfg(feature = "storage-azure")]
+mod on_azure {
+    use super::run_a_terminal_refusal_is_not_retried;
+    use crate::tests::common::provider_harness::AzureProviderHarness;
+
+    #[tokio::test]
+    async fn a_terminal_refusal_is_not_retried_on_azure() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_terminal_refusal_is_not_retried(&AzureProviderHarness::start().await?).await
+    }
+}
+
+#[cfg(feature = "storage-gcs")]
+mod on_gcs {
+    use super::run_a_terminal_refusal_is_not_retried;
+    use crate::tests::common::provider_harness::GcsProviderHarness;
+
+    #[tokio::test]
+    async fn a_terminal_refusal_is_not_retried_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_terminal_refusal_is_not_retried(&GcsProviderHarness::start().await?).await
+    }
 }

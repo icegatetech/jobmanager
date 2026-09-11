@@ -1,14 +1,33 @@
+#[cfg(feature = "storage-azure")]
+pub(crate) mod azure;
+#[cfg(feature = "storage-azure")]
+pub(crate) mod azure_error;
+#[cfg(feature = "storage-azure")]
+pub(crate) mod azure_signing;
+pub(crate) mod backend;
 pub(crate) mod cached;
+#[cfg(feature = "storage-gcs")]
+pub(crate) mod gcs;
+#[cfg(feature = "storage-gcs")]
+pub(crate) mod gcs_client;
+#[cfg(feature = "storage-gcs")]
+pub(crate) mod gcs_error;
+pub(crate) mod http_error;
 pub(crate) mod in_memory;
+pub(crate) mod object_storage;
+pub(crate) mod paths;
+#[cfg(feature = "storage-s3")]
 pub(crate) mod s3;
+#[cfg(feature = "storage-s3")]
 pub(crate) mod s3_error;
 pub(crate) mod state;
+pub(crate) mod state_codec;
 
 use async_trait::async_trait;
 use thiserror::Error as ThisError;
 use tokio_util::sync::CancellationToken;
 
-use crate::infra::retrier::RetryError;
+use crate::infra::retrier::{RetryError, RetryStep};
 use crate::{Error, Job, JobCode, JobDefinition};
 
 // StorageError - storage-specific errors
@@ -23,8 +42,8 @@ pub(crate) enum StorageError {
     #[error("serialization error: {0}")]
     Serialization(String),
 
-    #[error("s3 error: {0}")]
-    S3(String),
+    #[error("storage backend error: {0}")]
+    Backend(String),
 
     #[error("timeout")]
     Timeout,
@@ -56,6 +75,16 @@ impl StorageError {
     pub const fn is_conflict(&self) -> bool {
         matches!(self, Self::ConcurrentModification(_))
     }
+
+    /// This failure as a retry loop reads it: another attempt while repeating can clear it, and the
+    /// caller's own error when it cannot.
+    pub(crate) const fn into_retry_step<T>(self) -> StorageResult<RetryStep<T, Self>> {
+        if self.is_retryable() {
+            Ok(RetryStep::Retry(self))
+        } else {
+            Err(self)
+        }
+    }
 }
 
 impl RetryError for StorageError {
@@ -83,15 +112,22 @@ pub(crate) struct JobMeta {
 /// What a save keeps and how a load rebuilds it belongs to [`state`] and is the same for every
 /// implementation; a backend owns its codec and its object keys, not the set of persisted fields.
 // TODO(low): opening this trait to consumers means opening `Job` with it - think about how.
+// TODO(med): deal with the retries. Some methods are retriable, others are not - it's not obvious.
 #[async_trait]
 pub(crate) trait Storage: Send + Sync {
     /// Get latest job by code
+    ///
+    /// Does retry internally.
     async fn get_job(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<Job>;
 
     /// Get job by specific metadata
+    ///
+    /// /// Does **not** retry internally: the caller owns the retry policy.
     async fn get_job_by_meta(&self, job_meta: &JobMeta, cancel_token: &CancellationToken) -> StorageResult<Job>;
 
     /// Find job metadata without loading full job
+    ///
+    /// Does **not** retry internally: the caller owns the retry policy.
     async fn find_job_meta(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<JobMeta>;
 
     /// Reads the iteration `job_meta` names, but only if it moved past the version `job_meta`
@@ -101,8 +137,7 @@ pub(crate) trait Storage: Send + Sync {
     /// here, because the caller uses this to check a state it already holds, not to discover a new
     /// one - that is [`Storage::find_job_meta`]'s job.
     ///
-    /// Does **not** retry internally, like the two reads it stands between: the caller owns the
-    /// retry policy.
+    /// Does **not** retry internally.
     ///
     /// # Errors
     ///
@@ -115,6 +150,8 @@ pub(crate) trait Storage: Send + Sync {
     -> StorageResult<Option<Job>>;
 
     /// Save job with optimistic locking. Updates job.version on success. Returns `ConcurrentModification` if version mismatch.
+    ///
+    /// Does retry internally.
     async fn save_job(&self, job: &mut Job, cancel_token: &CancellationToken) -> StorageResult<()>;
 
     /// List the persisted iteration numbers of `job_code` that are not newer than
@@ -124,6 +161,8 @@ pub(crate) trait Storage: Send + Sync {
     /// attribute to an iteration - an unparsable name, or the extension of a different state
     /// codec - are skipped rather than reported, so iterations written under another codec are
     /// never listed and therefore never cleaned up.
+    ///
+    /// Does **not** retry internally.
     ///
     /// Unlike [`Storage::get_job`] and [`Storage::save_job`], this does **not** retry internally:
     /// the caller owns the retry policy, because cleanup must stay strictly bounded and must not
@@ -139,6 +178,8 @@ pub(crate) trait Storage: Send + Sync {
     ) -> StorageResult<Vec<u64>>;
 
     /// Delete the given iterations of `job_code`.
+    ///
+    /// Does **not** retry internally.
     ///
     /// Idempotent: an iteration that is already gone is not an error, and an empty `iter_nums` is
     /// a no-op. Does **not** retry internally, for the same reason as

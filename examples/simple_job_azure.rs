@@ -1,27 +1,20 @@
-// The same job as `simple_job_s3`, with job state serialized as CBOR instead of JSON.
-//
-// Only the codec differs. Switching it on a bucket that already holds state leaves the objects
-// written under the previous codec unreadable as iterations, which is why this example writes under
-// its own prefix.
+// The same minimal job as `simple_job_s3`, with its state kept in an Azure Blob Storage container:
+// the builder call that names the store is the only line the two differ in.
 
 #![allow(missing_docs)]
 
 mod harness;
 
-use jobmanager::JobStateCodecKind;
 use jobmanager::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     harness::init_tracing();
 
-    tracing::info!("Starting simple job example with CBOR-encoded state");
+    tracing::info!("Starting simple job example on azure");
 
     let manager = JobsManager::builder()
-        .s3(harness::build_s3_config_with_codec(
-            "simple-cbor",
-            JobStateCodecKind::Cbor,
-        ))
+        .azure(harness::build_azure_config("simple-json-azure"))
         .job("simple job", |j| {
             j.add_task(
                 TaskDefinition::new("my task code", Duration::from_secs(5)),

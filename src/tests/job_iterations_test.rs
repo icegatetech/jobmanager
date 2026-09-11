@@ -10,22 +10,16 @@ use chrono::{Duration as ChronoDuration, Utc};
 use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
-use super::common::s3_container::S3TestContainer;
+use super::common::provider_harness::{ProviderHarness, ProviderStorageRequest};
 use crate::storage::in_memory::InMemoryStorage;
 use crate::{
-    JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStateCodecKind, JobStatus, JobsManagerConfig, NoopMetrics,
-    S3Storage, S3StorageConfig, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, task_fn,
+    JobCode, JobDefinition, JobDefinitionId, JobDefinitionRegistry, JobRegistry, JobStateCodecKind, JobStatus,
+    JobsManagerConfig, NoopMetrics, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, task_fn,
 };
 
-/// `TestJobIterations` verifies that a job can complete and restart for multiple iterations
-#[tokio::test]
-async fn test_job_iterations() -> Result<(), Box<dyn std::error::Error>> {
-    super::common::init_tracing();
-
-    // 1. Start object storage
-    let store = S3TestContainer::start().await?;
-
-    // 2. Track iterations
+/// A job completes an iteration and starts the next one until its budget is spent, and the stored
+/// state ends at the last iteration rather than at a job created anew.
+async fn run_job_iterations(harness: &dyn ProviderHarness) -> Result<(), Box<dyn std::error::Error>> {
     let expected_iterations = 3u64;
     let iteration_count = Arc::new(AtomicU64::new(0));
 
@@ -55,45 +49,34 @@ async fn test_job_iterations() -> Result<(), Box<dyn std::error::Error>> {
     )?
     .with_max_iterations(expected_iterations)?;
 
-    // 3. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
 
-    // 4. Create storage
-    let storage = S3Storage::new(
-        S3StorageConfig::new(
-            store.endpoint(),
-            store.username(),
-            store.password(),
-            "test-jobs",
-            "us-east-1",
-        )
-        .with_job_state_codec(JobStateCodecKind::Json),
-        job_registry.clone(),
-        Arc::new(NoopMetrics),
-    )
-    .await?;
+    let storage = harness
+        .build_storage(&ProviderStorageRequest::new(
+            "job-iterations",
+            JobStateCodecKind::Json,
+            Arc::clone(&job_registry) as Arc<dyn JobDefinitionRegistry>,
+            Arc::new(NoopMetrics),
+        ))
+        .await?;
 
-    // 5. Start manager
     let config = JobsManagerConfig {
         worker_count: 1,
         worker_config: super::common::build_worker_config(Duration::from_millis(100), Duration::from_millis(10)),
         ..Default::default()
     };
 
-    let mut manager_env = ManagerEnv::new(Arc::new(storage), config, Arc::clone(&job_registry), vec![job_def])?;
+    let mut manager_env = ManagerEnv::new(storage, config, Arc::clone(&job_registry), vec![job_def])?;
 
-    // 6. Wait for all iterations to complete
     manager_env.wait_for_all_jobs_completion(Duration::from_secs(15)).await?;
     manager_env.stop().await;
 
-    // 7. Verify correct number of iterations
     assert_eq!(
         iteration_count.load(Ordering::SeqCst),
         expected_iterations,
         "should have completed all iterations"
     );
 
-    // Verify final job state
     let cancel_token = CancellationToken::new();
     let job = manager_env
         .storage()
@@ -209,4 +192,40 @@ async fn test_job_iterations_honors_next_start_at() -> Result<(), Box<dyn std::e
     assert_eq!(job.iter_num(), expected_iterations);
 
     Ok(())
+}
+
+#[cfg(feature = "storage-s3")]
+mod on_s3 {
+    use super::run_job_iterations;
+    use crate::tests::common::provider_harness::S3ProviderHarness;
+
+    #[tokio::test]
+    async fn a_job_runs_every_iteration_of_its_budget_on_s3() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_job_iterations(&S3ProviderHarness::start().await?).await
+    }
+}
+
+#[cfg(feature = "storage-azure")]
+mod on_azure {
+    use super::run_job_iterations;
+    use crate::tests::common::provider_harness::AzureProviderHarness;
+
+    #[tokio::test]
+    async fn a_job_runs_every_iteration_of_its_budget_on_azure() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_job_iterations(&AzureProviderHarness::start().await?).await
+    }
+}
+
+#[cfg(feature = "storage-gcs")]
+mod on_gcs {
+    use super::run_job_iterations;
+    use crate::tests::common::provider_harness::GcsProviderHarness;
+
+    #[tokio::test]
+    async fn a_job_runs_every_iteration_of_its_budget_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_job_iterations(&GcsProviderHarness::start().await?).await
+    }
 }

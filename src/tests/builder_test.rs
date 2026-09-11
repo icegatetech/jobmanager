@@ -9,8 +9,8 @@ use std::{
 use parking_lot::Mutex;
 
 use super::common::counting_metrics::CountingMetrics;
-use super::common::s3_container::S3TestContainer;
-use crate::{JobCode, JobsManager, MetricsSink, S3StorageConfig, TaskDefinition, TaskLimits, TaskOutcome, task_fn};
+use super::common::provider_harness::ProviderHarness;
+use crate::{JobCode, JobsManager, MetricsSink, TaskDefinition, TaskLimits, TaskOutcome, task_fn};
 
 /// Bound on the wait: a broken chain must fail the test rather than hang the suite.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -363,20 +363,15 @@ async fn a_runtime_task_of_an_unregistered_code_fails_its_iteration() -> Result<
 /// One worker and two tasks are what make the second number mean anything: a worker runs one task
 /// per job per pass, so the iteration cannot finish before a pass has read a job the store already
 /// holds - the read a cache would answer, and the only one it records a decision for.
-#[tokio::test]
-async fn a_pool_built_without_the_cache_holds_no_cached_state() -> Result<(), Box<dyn std::error::Error>> {
-    super::common::init_tracing();
-
-    let container = S3TestContainer::start().await?;
-    let sink = Arc::new(CountingMetrics::default());
-    let manager = JobsManager::builder()
-        .s3(S3StorageConfig::new(
-            container.endpoint(),
-            container.username(),
-            container.password(),
-            "builder-no-cache",
-            "us-east-1",
-        ))
+///
+/// The backend comes from `harness`, because which backend it is is the one part of the claim that
+/// differs between the pools below.
+async fn run_pool_built_without_the_cache(
+    harness: &dyn ProviderHarness,
+    sink: Arc<CountingMetrics>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let manager = harness
+        .attach_storage(JobsManager::builder(), "builder-no-cache")
         .no_cache()
         .metrics(Arc::clone(&sink) as Arc<dyn MetricsSink>)
         .workers(1)
@@ -414,4 +409,57 @@ async fn a_pool_built_without_the_cache_holds_no_cached_state() -> Result<(), Bo
         "a pool built without the cache never decides whether a read is served from one"
     );
     Ok(())
+}
+
+#[cfg(feature = "storage-s3")]
+mod on_s3 {
+    use std::sync::Arc;
+
+    use super::run_pool_built_without_the_cache;
+    use crate::tests::common::counting_metrics::CountingMetrics;
+    use crate::tests::common::provider_harness::S3ProviderHarness;
+
+    #[tokio::test]
+    async fn a_pool_built_without_the_cache_holds_no_cached_state_on_s3() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_pool_built_without_the_cache(&S3ProviderHarness::start().await?, Arc::new(CountingMetrics::default())).await
+    }
+}
+
+#[cfg(feature = "storage-azure")]
+mod on_azure {
+    use std::sync::Arc;
+
+    use super::run_pool_built_without_the_cache;
+    use crate::tests::common::counting_metrics::CountingMetrics;
+    use crate::tests::common::provider_harness::AzureProviderHarness;
+
+    #[tokio::test]
+    async fn a_pool_built_without_the_cache_holds_no_cached_state_on_azure() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_pool_built_without_the_cache(
+            &AzureProviderHarness::start().await?,
+            Arc::new(CountingMetrics::default()),
+        )
+        .await
+    }
+}
+
+#[cfg(feature = "storage-gcs")]
+mod on_gcs {
+    use std::sync::Arc;
+
+    use super::run_pool_built_without_the_cache;
+    use crate::tests::common::counting_metrics::CountingMetrics;
+    use crate::tests::common::provider_harness::GcsProviderHarness;
+
+    #[tokio::test]
+    async fn a_pool_built_without_the_cache_holds_no_cached_state_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_pool_built_without_the_cache(
+            &GcsProviderHarness::start().await?,
+            Arc::new(CountingMetrics::default()),
+        )
+        .await
+    }
 }

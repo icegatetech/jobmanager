@@ -9,36 +9,22 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
-use super::common::s3_container::S3TestContainer;
+use super::common::provider_harness::{ProviderHarness, ProviderStorageRequest};
 use crate::storage::in_memory::InMemoryStorage;
 use crate::{
-    JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStateCodecKind, JobStatus, JobsManagerConfig, NoopMetrics,
-    S3Storage, S3StorageConfig, Storage, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, task_fn,
+    JobCode, JobDefinition, JobDefinitionId, JobDefinitionRegistry, JobRegistry, JobStateCodecKind, JobStatus,
+    JobsManagerConfig, NoopMetrics, Storage, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, task_fn,
 };
 
-/// `TestSimpleJobExecution` verifies basic job execution with one task
-#[tokio::test]
-async fn test_simple_job_execution_json() -> Result<(), Box<dyn std::error::Error>> {
-    super::common::init_tracing();
-
-    run_simple_job_execution(JobStateCodecKind::Json).await
-}
-
-/// `TestSimpleJobExecution` verifies basic job execution with one task
-#[tokio::test]
-async fn test_simple_job_execution_cbor() -> Result<(), Box<dyn std::error::Error>> {
-    super::common::init_tracing();
-
-    run_simple_job_execution(JobStateCodecKind::Cbor).await
-}
-
-async fn run_simple_job_execution(codec: JobStateCodecKind) -> Result<(), Box<dyn std::error::Error>> {
+/// One task runs, receives the input its definition carried, and the finished iteration is the one
+/// the store holds afterwards. Run under both codecs, because the stored format is what the
+/// round-trip is about.
+async fn run_simple_job_execution(
+    harness: &dyn ProviderHarness,
+    codec: JobStateCodecKind,
+) -> Result<(), Box<dyn std::error::Error>> {
     let max_iterations = 1u64;
 
-    // 1. Start object storage
-    let store = S3TestContainer::start().await?;
-
-    // 2. Define job with single task
     let executed = Arc::new(AtomicBool::new(false));
     let task_input_captured = Arc::new(parking_lot::Mutex::new(Vec::new()));
 
@@ -70,38 +56,28 @@ async fn run_simple_job_execution(codec: JobStateCodecKind) -> Result<(), Box<dy
     )?
     .with_max_iterations(max_iterations)?;
 
-    // 3. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
 
-    // 4. Create storage
-    let storage = S3Storage::new(
-        S3StorageConfig::new(
-            store.endpoint(),
-            store.username(),
-            store.password(),
-            "test-jobs",
-            "us-east-1",
-        )
-        .with_job_state_codec(codec),
-        job_registry.clone(),
-        Arc::new(NoopMetrics),
-    )
-    .await?;
+    let storage = harness
+        .build_storage(&ProviderStorageRequest::new(
+            "simple-job",
+            codec,
+            Arc::clone(&job_registry) as Arc<dyn JobDefinitionRegistry>,
+            Arc::new(NoopMetrics),
+        ))
+        .await?;
 
-    // 5. Start manager
     let config = JobsManagerConfig {
         worker_count: 1,
         worker_config: super::common::build_worker_config(Duration::from_millis(100), Duration::from_millis(10)),
         ..Default::default()
     };
 
-    let mut manager_env = ManagerEnv::new(Arc::new(storage), config, Arc::clone(&job_registry), vec![job_def])?;
+    let mut manager_env = ManagerEnv::new(storage, config, Arc::clone(&job_registry), vec![job_def])?;
 
-    // 6. Wait for completion
     manager_env.wait_for_all_jobs_completion(Duration::from_secs(10)).await?;
     manager_env.stop().await;
 
-    // 7. Verify
     assert!(executed.load(Ordering::SeqCst), "task should be executed");
     assert_eq!(
         *task_input_captured.lock(),
@@ -224,4 +200,61 @@ async fn test_multi_task_sequence() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(job.iter_num(), max_iterations);
 
     Ok(())
+}
+
+#[cfg(feature = "storage-s3")]
+mod on_s3 {
+    use super::run_simple_job_execution;
+    use crate::JobStateCodecKind;
+    use crate::tests::common::provider_harness::S3ProviderHarness;
+
+    #[tokio::test]
+    async fn a_single_task_job_runs_and_is_stored_as_json_on_s3() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_simple_job_execution(&S3ProviderHarness::start().await?, JobStateCodecKind::Json).await
+    }
+
+    #[tokio::test]
+    async fn a_single_task_job_runs_and_is_stored_as_cbor_on_s3() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_simple_job_execution(&S3ProviderHarness::start().await?, JobStateCodecKind::Cbor).await
+    }
+}
+
+#[cfg(feature = "storage-azure")]
+mod on_azure {
+    use super::run_simple_job_execution;
+    use crate::JobStateCodecKind;
+    use crate::tests::common::provider_harness::AzureProviderHarness;
+
+    #[tokio::test]
+    async fn a_single_task_job_runs_and_is_stored_as_json_on_azure() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_simple_job_execution(&AzureProviderHarness::start().await?, JobStateCodecKind::Json).await
+    }
+
+    #[tokio::test]
+    async fn a_single_task_job_runs_and_is_stored_as_cbor_on_azure() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_simple_job_execution(&AzureProviderHarness::start().await?, JobStateCodecKind::Cbor).await
+    }
+}
+
+#[cfg(feature = "storage-gcs")]
+mod on_gcs {
+    use super::run_simple_job_execution;
+    use crate::JobStateCodecKind;
+    use crate::tests::common::provider_harness::GcsProviderHarness;
+
+    #[tokio::test]
+    async fn a_single_task_job_runs_and_is_stored_as_json_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_simple_job_execution(&GcsProviderHarness::start().await?, JobStateCodecKind::Json).await
+    }
+
+    #[tokio::test]
+    async fn a_single_task_job_runs_and_is_stored_as_cbor_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_simple_job_execution(&GcsProviderHarness::start().await?, JobStateCodecKind::Cbor).await
+    }
 }

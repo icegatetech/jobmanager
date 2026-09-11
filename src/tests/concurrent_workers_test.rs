@@ -4,49 +4,25 @@ use dashmap::DashMap;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::common::s3_container::S3TestContainer;
+use super::common::provider_harness::{ProviderHarness, ProviderStorageRequest};
 use super::common::{manager_env::ManagerEnv, storage_wrapper::CountingStorage};
 use crate::{
-    CachedStorage, JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStateCodecKind, JobStatus,
-    JobsManagerConfig, NoopMetrics, S3Storage, S3StorageConfig, Storage, TaskCode, TaskDefinition, TaskLimits,
-    TaskOutcome, task_fn,
+    CachedStorage, JobCode, JobDefinition, JobDefinitionId, JobDefinitionRegistry, JobRegistry, JobStateCodecKind,
+    JobStatus, JobsManagerConfig, NoopMetrics, Storage, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, task_fn,
 };
 
 // TODO(med): Add a check for the absence of errors in the logs. It won't be easy to do this, because when subscribing to errors and parallel tests, we catch errors from all tests and it's difficult to account for errors only in a specific test.
 
-/// `TestConcurrentWorkers` verifies that multiple workers can process tasks from the same job
-/// concurrently
-#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
-async fn test_concurrent_workers_s3() -> Result<(), Box<dyn std::error::Error>> {
-    super::common::init_tracing();
-
-    tracing::info!("Running concurrent workers test ({})", "s3");
-    run_concurrent_workers_test(false).await?;
-
-    Ok(())
-}
-
-/// `TestConcurrentWorkers` verifies that multiple workers can process tasks from the same job
-/// concurrently
-#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
-async fn test_concurrent_workers_cached() -> Result<(), Box<dyn std::error::Error>> {
-    super::common::init_tracing();
-
-    tracing::info!("Running concurrent workers test ({})", "cached");
-    run_concurrent_workers_test(true).await?;
-
-    Ok(())
-}
-
-async fn run_concurrent_workers_test(use_cached_storage: bool) -> Result<(), Box<dyn std::error::Error>> {
+/// Verifies that multiple workers can process tasks from the same job concurrently.
+async fn run_concurrent_workers_test(
+    harness: &dyn ProviderHarness,
+    use_cached_storage: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let secondary_task_count = 10;
     let max_iterations = 1u64;
     let workers_cnt = 10;
 
-    // 1. Start object storage
-    let store = S3TestContainer::start().await?;
-
-    // 2. Track execution
+    // Track execution
     let executed_primary_tasks: Arc<DashMap<Uuid, bool>> = Arc::new(DashMap::new());
     let executed_sec_tasks: Arc<DashMap<Uuid, bool>> = Arc::new(DashMap::new());
 
@@ -101,27 +77,18 @@ async fn run_concurrent_workers_test(use_cached_storage: bool) -> Result<(), Box
     )?
     .with_max_iterations(max_iterations)?;
 
-    // 3. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
 
-    // 4. Create storage
-    let s3_storage = Arc::new(
-        S3Storage::new(
-            S3StorageConfig::new(
-                store.endpoint(),
-                store.username(),
-                store.password(),
-                "test-jobs",
-                "us-east-1",
-            )
-            .with_job_state_codec(JobStateCodecKind::Json),
-            job_registry.clone(),
+    let object_storage = harness
+        .build_storage(&ProviderStorageRequest::new(
+            "concurrent-workers",
+            JobStateCodecKind::Json,
+            Arc::clone(&job_registry) as Arc<dyn JobDefinitionRegistry>,
             Arc::new(NoopMetrics),
-        )
-        .await?,
-    );
+        ))
+        .await?;
 
-    let counting_storage = Arc::new(CountingStorage::new(s3_storage.clone() as Arc<dyn Storage>));
+    let counting_storage = Arc::new(CountingStorage::new(Arc::clone(&object_storage)));
     let storage: Arc<dyn Storage> = if use_cached_storage {
         Arc::new(CachedStorage::new(
             counting_storage.clone() as Arc<dyn Storage>,
@@ -131,7 +98,6 @@ async fn run_concurrent_workers_test(use_cached_storage: bool) -> Result<(), Box
         counting_storage.clone()
     };
 
-    // 5. Start manager with multiple workers
     let config = JobsManagerConfig {
         worker_count: workers_cnt,
         worker_config: super::common::build_worker_config(Duration::from_millis(20), Duration::from_millis(10)),
@@ -140,14 +106,11 @@ async fn run_concurrent_workers_test(use_cached_storage: bool) -> Result<(), Box
 
     let mut manager_env = ManagerEnv::new(storage, config, Arc::clone(&job_registry), vec![job_def])?;
 
-    // 6. Wait for completion
     manager_env.wait_for_all_jobs_completion(Duration::from_secs(30)).await?;
     manager_env.stop().await;
 
-    // 7. Verify final job state
     let cancel_token = CancellationToken::new();
-    let job = s3_storage
-        .clone()
+    let job = object_storage
         .get_job(&JobCode::new("test_concurrent_job"), &cancel_token)
         .await?;
     assert_eq!(*job.status(), JobStatus::Completed);
@@ -173,19 +136,65 @@ async fn run_concurrent_workers_test(use_cached_storage: bool) -> Result<(), Box
         "all secondary tasks must be executed"
     );
 
-    // Verify S3 PUT requests
     tracing::info!(
-        "S3 requests - save attempts: {}, save successes: {}, list & get successes: {}",
+        "storage calls - save attempts: {}, save successes: {}, list & get successes: {}",
         counting_storage.put_attempts(),
         counting_storage.put_successes(),
         counting_storage.list_and_get_successes(),
     );
-    // TODO(med): This is a fragile test, because there is a lot of competition and sometimes the test does not pass. We need to think of a separate test specifically for the number of requests.
-    /*assert_eq!(
-        counting_storage.put_successes(),
-        (((secondary_task_count + 1) * 2) + 1) as u64 + timeouts, // 1 PUT for create job, 2 PUT for each task
-        "all tasks must be executed"
-    );*/
-
     Ok(())
+}
+
+#[cfg(feature = "storage-s3")]
+mod on_s3 {
+    use super::run_concurrent_workers_test;
+    use crate::tests::common::provider_harness::S3ProviderHarness;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+    async fn concurrent_workers_share_a_job_on_s3() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_concurrent_workers_test(&S3ProviderHarness::start().await?, false).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+    async fn concurrent_workers_share_a_job_behind_the_cache_on_s3() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_concurrent_workers_test(&S3ProviderHarness::start().await?, true).await
+    }
+}
+
+#[cfg(feature = "storage-azure")]
+mod on_azure {
+    use super::run_concurrent_workers_test;
+    use crate::tests::common::provider_harness::AzureProviderHarness;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+    async fn concurrent_workers_share_a_job_on_azure() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_concurrent_workers_test(&AzureProviderHarness::start().await?, false).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+    async fn concurrent_workers_share_a_job_behind_the_cache_on_azure() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_concurrent_workers_test(&AzureProviderHarness::start().await?, true).await
+    }
+}
+
+#[cfg(feature = "storage-gcs")]
+mod on_gcs {
+    use super::run_concurrent_workers_test;
+    use crate::tests::common::provider_harness::GcsProviderHarness;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+    async fn concurrent_workers_share_a_job_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_concurrent_workers_test(&GcsProviderHarness::start().await?, false).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+    async fn concurrent_workers_share_a_job_behind_the_cache_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_concurrent_workers_test(&GcsProviderHarness::start().await?, true).await
+    }
 }

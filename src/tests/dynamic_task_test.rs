@@ -9,22 +9,15 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
-use super::common::s3_container::S3TestContainer;
+use super::common::provider_harness::{ProviderHarness, ProviderStorageRequest};
 use crate::{
-    JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStateCodecKind, JobStatus, JobsManagerConfig, NoopMetrics,
-    S3Storage, S3StorageConfig, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, task_fn,
+    JobCode, JobDefinition, JobDefinitionId, JobDefinitionRegistry, JobRegistry, JobStateCodecKind, JobStatus,
+    JobsManagerConfig, NoopMetrics, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, task_fn,
 };
 
-/// `TestDynamicTaskCreation` verifies that an executor can create new tasks dynamically, and that
-/// the dependencies it declares between them survive a round-trip through the object store.
-#[tokio::test]
-async fn test_dynamic_task_creation() -> Result<(), Box<dyn std::error::Error>> {
-    super::common::init_tracing();
-
-    // 1. Start object storage
-    let store = S3TestContainer::start().await?;
-
-    // 2. Track task execution
+/// An executor can create new tasks dynamically, and the dependencies it declares between them
+/// survive a round-trip through the object store.
+async fn run_dynamic_task_creation(harness: &dyn ProviderHarness) -> Result<(), Box<dyn std::error::Error>> {
     let dynamic_task_count = 5;
     let init_task_executed = Arc::new(AtomicBool::new(false));
     let dynamic_tasks_executed = Arc::new(AtomicI32::new(0));
@@ -80,38 +73,28 @@ async fn test_dynamic_task_creation() -> Result<(), Box<dyn std::error::Error>> 
     )?
     .with_max_iterations(1)?;
 
-    // 3. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
 
-    // 4. Create storage
-    let storage = S3Storage::new(
-        S3StorageConfig::new(
-            store.endpoint(),
-            store.username(),
-            store.password(),
-            "test-jobs",
-            "us-east-1",
-        )
-        .with_job_state_codec(JobStateCodecKind::Json),
-        job_registry.clone(),
-        Arc::new(NoopMetrics),
-    )
-    .await?;
+    let storage = harness
+        .build_storage(&ProviderStorageRequest::new(
+            "dynamic-task",
+            JobStateCodecKind::Json,
+            Arc::clone(&job_registry) as Arc<dyn JobDefinitionRegistry>,
+            Arc::new(NoopMetrics),
+        ))
+        .await?;
 
-    // 5. Start manager
     let config = JobsManagerConfig {
         worker_count: 1,
         worker_config: super::common::build_worker_config(Duration::from_millis(100), Duration::from_millis(10)),
         ..Default::default()
     };
 
-    let mut manager_env = ManagerEnv::new(Arc::new(storage), config, Arc::clone(&job_registry), vec![job_def])?;
+    let mut manager_env = ManagerEnv::new(storage, config, Arc::clone(&job_registry), vec![job_def])?;
 
-    // 6. Wait for completion
     manager_env.wait_for_all_jobs_completion(Duration::from_secs(15)).await?;
     manager_env.stop().await;
 
-    // 7. Verify all tasks executed
     assert!(
         init_task_executed.load(Ordering::SeqCst),
         "init task should be executed"
@@ -122,7 +105,6 @@ async fn test_dynamic_task_creation() -> Result<(), Box<dyn std::error::Error>> 
         "all dynamic tasks should be executed"
     );
 
-    // Verify final job state
     let cancel_token = CancellationToken::new();
     let job = manager_env
         .storage()
@@ -159,4 +141,40 @@ async fn test_dynamic_task_creation() -> Result<(), Box<dyn std::error::Error>> 
     }
 
     Ok(())
+}
+
+#[cfg(feature = "storage-s3")]
+mod on_s3 {
+    use super::run_dynamic_task_creation;
+    use crate::tests::common::provider_harness::S3ProviderHarness;
+
+    #[tokio::test]
+    async fn tasks_created_at_runtime_keep_their_dependencies_on_s3() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_dynamic_task_creation(&S3ProviderHarness::start().await?).await
+    }
+}
+
+#[cfg(feature = "storage-azure")]
+mod on_azure {
+    use super::run_dynamic_task_creation;
+    use crate::tests::common::provider_harness::AzureProviderHarness;
+
+    #[tokio::test]
+    async fn tasks_created_at_runtime_keep_their_dependencies_on_azure() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_dynamic_task_creation(&AzureProviderHarness::start().await?).await
+    }
+}
+
+#[cfg(feature = "storage-gcs")]
+mod on_gcs {
+    use super::run_dynamic_task_creation;
+    use crate::tests::common::provider_harness::GcsProviderHarness;
+
+    #[tokio::test]
+    async fn tasks_created_at_runtime_keep_their_dependencies_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_dynamic_task_creation(&GcsProviderHarness::start().await?).await
+    }
 }

@@ -3,10 +3,10 @@ use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
-use super::common::s3_container::S3TestContainer;
+use super::common::provider_harness::{ProviderHarness, ProviderStorageRequest};
 use crate::{
-    JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStateCodecKind, JobStatus, JobsManagerConfig, NoopMetrics,
-    S3Storage, S3StorageConfig, Storage, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, task_fn,
+    JobCode, JobDefinition, JobDefinitionId, JobDefinitionRegistry, JobRegistry, JobStateCodecKind, JobStatus,
+    JobsManagerConfig, NoopMetrics, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, task_fn,
 };
 
 const PLAN_TASK_CODE: &str = "plan";
@@ -20,20 +20,6 @@ const PLAN_TASK_MAX_LIFETIME: Duration = Duration::from_secs(20);
 /// Bound on every wait, so a job that never finishes fails the test instead of hanging it.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 
-#[tokio::test]
-async fn task_lifetime_survives_the_round_trip_through_storage_json() -> Result<(), Box<dyn std::error::Error>> {
-    super::common::init_tracing();
-
-    run_task_lifetime_round_trip(JobStateCodecKind::Json).await
-}
-
-#[tokio::test]
-async fn task_lifetime_survives_the_round_trip_through_storage_cbor() -> Result<(), Box<dyn std::error::Error>> {
-    super::common::init_tracing();
-
-    run_task_lifetime_round_trip(JobStateCodecKind::Cbor).await
-}
-
 /// The stored state is what every worker but the first one reads the lifetime from, and losing it
 /// there disables the bound silently: the moment a task's lifetime expires is set only while it is
 /// unset, so a takeover reading `None` would start the count again and the task could be taken over
@@ -42,8 +28,10 @@ async fn task_lifetime_survives_the_round_trip_through_storage_cbor() -> Result<
 /// The other half of the round trip is the task a running execution created: parentage lives no
 /// longer than that execution, so a task read back from storage must carry none - a stored parent
 /// would let a later failure of that task roll back work the iteration already owns.
-async fn run_task_lifetime_round_trip(codec: JobStateCodecKind) -> Result<(), Box<dyn std::error::Error>> {
-    let store = S3TestContainer::start().await?;
+async fn run_task_lifetime_round_trip(
+    harness: &dyn ProviderHarness,
+    codec: JobStateCodecKind,
+) -> Result<(), Box<dyn std::error::Error>> {
     let job_code = JobCode::new("lifetime_persistence_job");
 
     let plan_executor = task_fn(|ctx| async move {
@@ -66,21 +54,14 @@ async fn run_task_lifetime_round_trip(codec: JobStateCodecKind) -> Result<(), Bo
     .with_max_iterations(1)?;
 
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
-    let storage = Arc::new(
-        S3Storage::new(
-            S3StorageConfig::new(
-                store.endpoint(),
-                store.username(),
-                store.password(),
-                "test-jobs",
-                "us-east-1",
-            )
-            .with_job_state_codec(codec),
-            job_registry.clone(),
+    let storage = harness
+        .build_storage(&ProviderStorageRequest::new(
+            "lifetime-persistence",
+            codec,
+            Arc::clone(&job_registry) as Arc<dyn JobDefinitionRegistry>,
             Arc::new(NoopMetrics),
-        )
-        .await?,
-    ) as Arc<dyn Storage>;
+        ))
+        .await?;
 
     let config = JobsManagerConfig {
         worker_count: 1,
@@ -121,4 +102,64 @@ async fn run_task_lifetime_round_trip(codec: JobStateCodecKind) -> Result<(), Bo
     );
 
     Ok(())
+}
+
+#[cfg(feature = "storage-s3")]
+mod on_s3 {
+    use super::{JobStateCodecKind, run_task_lifetime_round_trip};
+    use crate::tests::common::provider_harness::S3ProviderHarness;
+
+    #[tokio::test]
+    async fn task_lifetime_survives_the_round_trip_through_storage_json_on_s3() -> Result<(), Box<dyn std::error::Error>>
+    {
+        crate::tests::common::init_tracing();
+        run_task_lifetime_round_trip(&S3ProviderHarness::start().await?, JobStateCodecKind::Json).await
+    }
+
+    #[tokio::test]
+    async fn task_lifetime_survives_the_round_trip_through_storage_cbor_on_s3() -> Result<(), Box<dyn std::error::Error>>
+    {
+        crate::tests::common::init_tracing();
+        run_task_lifetime_round_trip(&S3ProviderHarness::start().await?, JobStateCodecKind::Cbor).await
+    }
+}
+
+#[cfg(feature = "storage-azure")]
+mod on_azure {
+    use super::{JobStateCodecKind, run_task_lifetime_round_trip};
+    use crate::tests::common::provider_harness::AzureProviderHarness;
+
+    #[tokio::test]
+    async fn task_lifetime_survives_the_round_trip_through_storage_json_on_azure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_task_lifetime_round_trip(&AzureProviderHarness::start().await?, JobStateCodecKind::Json).await
+    }
+
+    #[tokio::test]
+    async fn task_lifetime_survives_the_round_trip_through_storage_cbor_on_azure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_task_lifetime_round_trip(&AzureProviderHarness::start().await?, JobStateCodecKind::Cbor).await
+    }
+}
+
+#[cfg(feature = "storage-gcs")]
+mod on_gcs {
+    use super::{JobStateCodecKind, run_task_lifetime_round_trip};
+    use crate::tests::common::provider_harness::GcsProviderHarness;
+
+    #[tokio::test]
+    async fn task_lifetime_survives_the_round_trip_through_storage_json_on_gcs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_task_lifetime_round_trip(&GcsProviderHarness::start().await?, JobStateCodecKind::Json).await
+    }
+
+    #[tokio::test]
+    async fn task_lifetime_survives_the_round_trip_through_storage_cbor_on_gcs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_task_lifetime_round_trip(&GcsProviderHarness::start().await?, JobStateCodecKind::Cbor).await
+    }
 }

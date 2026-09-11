@@ -16,6 +16,25 @@ services:
       RUSTFS_CONSOLE_ADDRESS: "0.0.0.0:9001"
     volumes:
       - ./.tmp/rustfs_data:/data
+  jobmanager.azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:3.36.0
+    container_name: jobmanager.azurite
+    ports:
+      - "10000:10000"
+    # The emulator binds to loopback inside the container unless told otherwise, which the mapped
+    # port cannot reach. `--skipApiVersionCheck` keeps it from refusing the REST version the SDK was
+    # generated for, as `src/tests/common/azure_container.rs` explains at length.
+    command: [ "azurite-blob", "--blobHost", "0.0.0.0", "--skipApiVersionCheck", "--location", "/data" ]
+    volumes:
+      - ./.tmp/azurite_data:/data
+  jobmanager.storage-testbench:
+    image: gcr.io/cloud-devrel-public-resources/storage-testbench:v0.63.0
+    container_name: jobmanager.storage-testbench
+    ports:
+      - "9199:9000"
+    # Built for linux/amd64 only, so on an arm64 host it runs under emulation - slower than the
+    # other two, and still fast enough for an example.
+    platform: linux/amd64
   jobmanager.init:
     image: amazon/aws-cli:2.35.15
     container_name: jobmanager.init

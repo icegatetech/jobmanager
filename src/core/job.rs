@@ -350,9 +350,8 @@ impl JobDefinition {
     /// Newest iteration number of this job that may be deleted while its current iteration is
     /// `iter_num`, or `None` when the retention window still covers the whole history.
     ///
-    /// `iter_num` is the domain iteration number - 1, 2, 3, … - not a storage key. The inverted
-    /// numbering that makes the current iteration findable in one `LIST` belongs to `S3Storage`
-    /// and never reaches this rule.
+    /// `iter_num` is the iteration number the job counts from 1 upwards, which is what
+    /// `Job::iter_num` reports; the boundary comes back in that same numbering.
     pub const fn calculate_retention_boundary(&self, iter_num: u64) -> Option<u64> {
         match iter_num.checked_sub(self.iteration_retention) {
             // Iteration numbers start at 1, so a zero boundary names nothing deletable.

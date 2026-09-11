@@ -6,11 +6,15 @@ use std::{
     time::Duration,
 };
 
-use super::common::s3_container::S3TestContainer;
-use crate::{JobCode, JobStateCodecKind, JobsManager, S3StorageConfig, TaskDefinition, TaskOutcome, task_fn};
+use super::common::provider_harness::ProviderHarness;
+use crate::{JobCode, JobsManager, TaskDefinition, TaskOutcome, task_fn};
 
 /// Bound on every wait here: a broken wait must fail the test rather than hang the suite.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Prefix the two pools of the restart case share, which is what makes the second one a restart of
+/// the first rather than a pool of its own.
+const STATE_PREFIX: &str = "wait-after-restart";
 
 /// The wait returns on the iteration actually finishing, not on a timer: the executor is slower
 /// than any poll interval, so a wait that returned early would find the counter still at zero.
@@ -120,12 +124,12 @@ async fn wait_for_job_completion_returns_for_an_already_finished_job() -> Result
 /// A pool learns which iterations finished from its own workers, and a restarted pool has none of
 /// that history: the iteration it must report is the one already sitting in storage. Without
 /// reporting it on pickup the second wait here runs into its timeout.
-#[tokio::test]
-async fn wait_for_job_completion_returns_for_a_job_finished_by_an_earlier_pool()
--> Result<(), Box<dyn std::error::Error>> {
-    super::common::init_tracing();
-
-    let store = S3TestContainer::start().await?;
+///
+/// Run on every provider: what the case is about is what a persistent backend hands back after the
+/// process that wrote it is gone, which is owed by each of them alike.
+async fn run_wait_for_job_completion_after_a_restart(
+    harness: &dyn ProviderHarness,
+) -> Result<(), Box<dyn std::error::Error>> {
     let job_code = JobCode::new("restarted_job");
     let runs = Arc::new(AtomicUsize::new(0));
 
@@ -133,16 +137,8 @@ async fn wait_for_job_completion_returns_for_a_job_finished_by_an_earlier_pool()
     // looks like to storage.
     let build_manager = || {
         let runs_in_executor = Arc::clone(&runs);
-        JobsManager::builder()
-            .s3(S3StorageConfig::new(
-                store.endpoint(),
-                store.username(),
-                store.password(),
-                "test-jobs",
-                "us-east-1",
-            )
-            .with_bucket_prefix("wait-after-restart")
-            .with_job_state_codec(JobStateCodecKind::Json))
+        harness
+            .attach_storage(JobsManager::builder(), STATE_PREFIX)
             .poll_interval(Duration::from_millis(50))
             .job("restarted_job", move |j| {
                 j.max_iterations(1);
@@ -174,6 +170,45 @@ async fn wait_for_job_completion_returns_for_a_job_finished_by_an_earlier_pool()
         "the second pool must observe the stored iteration, not run a new one"
     );
     Ok(())
+}
+
+#[cfg(feature = "storage-s3")]
+mod on_s3 {
+    use super::run_wait_for_job_completion_after_a_restart;
+    use crate::tests::common::provider_harness::S3ProviderHarness;
+
+    #[tokio::test]
+    async fn wait_for_job_completion_returns_for_a_job_finished_by_an_earlier_pool_on_s3()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_wait_for_job_completion_after_a_restart(&S3ProviderHarness::start().await?).await
+    }
+}
+
+#[cfg(feature = "storage-azure")]
+mod on_azure {
+    use super::run_wait_for_job_completion_after_a_restart;
+    use crate::tests::common::provider_harness::AzureProviderHarness;
+
+    #[tokio::test]
+    async fn wait_for_job_completion_returns_for_a_job_finished_by_an_earlier_pool_on_azure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_wait_for_job_completion_after_a_restart(&AzureProviderHarness::start().await?).await
+    }
+}
+
+#[cfg(feature = "storage-gcs")]
+mod on_gcs {
+    use super::run_wait_for_job_completion_after_a_restart;
+    use crate::tests::common::provider_harness::GcsProviderHarness;
+
+    #[tokio::test]
+    async fn wait_for_job_completion_returns_for_a_job_finished_by_an_earlier_pool_on_gcs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_wait_for_job_completion_after_a_restart(&GcsProviderHarness::start().await?).await
+    }
 }
 
 /// Nothing finishes an iteration once the pool is gone, so the wait must fail rather than outlive

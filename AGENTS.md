@@ -34,13 +34,13 @@ Do not reproduce these in prose — read the source of truth:
 Place a change in the module that owns its responsibility. This is a single-crate library, so the
 module tree *is* the architecture.
 
-| Module           | Responsibility                                                                                                                 |
-|------------------|--------------------------------------------------------------------------------------------------------------------------------|
-| `src/core/`      | Domain: job and task state, status transitions, dependency and attempt rules, merging; the registry and the error types        |
-| `src/execution/` | Orchestration: worker-pool lifecycle, the poll → pick → execute → save loop, and the `JobManager` surface an executor is given |
-| `src/storage/`   | Persistence: the `Storage` trait, the stored representation every backend maps through, and the backends themselves            |
-| `src/infra/`     | Cross-cutting utilities: retry policy, metrics                                                                                 |
-| `src/tests/`     | Integration tests that need `pub(crate)` access — see [docs/tests.md](docs/tests.md)                                           |
+| Module           | Responsibility                                                                                                                                          |
+|------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `src/core/`      | Domain: job and task state, status transitions, dependency and attempt rules, merging; the registry and the error types                                 |
+| `src/execution/` | Orchestration: worker-pool lifecycle, the poll → pick → execute → save loop, and the `JobManager` surface an executor is given                          |
+| `src/storage/`   | Persistence: the `Storage` trait, the stored representation every backend maps through, the modules no backend owns alone, and provider implementations |
+| `src/infra/`     | Cross-cutting utilities: retry policy, metrics                                                                                                          |
+| `src/tests/`     | Integration tests that need `pub(crate)` access — see [docs/tests.md](docs/tests.md)                                                                    |
 
 ### Dependency rules
 
@@ -134,6 +134,13 @@ iteration. The mechanics are documented on the types themselves; what follows is
   scenario is allowed to cost, and the rules those numbers are held to, are in
   [docs/tests.md](docs/tests.md); a number that has to go up is a change to be agreed, never a test
   to be updated.
+- **Never let a call of `Storage` cost more requests than its own contract names** - one listing,
+    one write, one delete per iteration. A quota is a number only while that holds: a backend turning
+    one call into several moves every quota at once and no test name with it, the silent failure this
+    register exists to catch. Both causes are configuration rather than code - the SDK's own retry,
+    and the size above which it splits a transfer into ranges or blocks - so a backend turns both off
+    where it builds its client. A provider whose SDK lets a backend turn neither off has quotas that
+    are ranges: say so before adding it.
 - Job settings (`max_iterations`, `iteration_interval`, `TaskLimits`, `iteration_retention`) are
   re-read from the `JobDefinition` on every load, so they are changed in code, never by editing a
   stored object.
@@ -171,8 +178,6 @@ iteration. The mechanics are documented on the types themselves; what follows is
 
 - Run targeted tests for the affected functionality, and report which test commands were run and
   which required tests were not.
-- Run `make quota` and report the numbers, which its test names carry, not that the tests passed. A
-  number that moved is reported as a number.
 - Re-read every comment the change added and delete the ones that fail the acid test and the budget
   in [RUST.md](docs/RUST.md). This pass is a separate step because a comment that restates the code
   is written far more easily than it is noticed afterwards.
