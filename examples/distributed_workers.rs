@@ -25,7 +25,7 @@ const TASKS_PER_ITERATION: u32 = 20;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    harness::init_tracing();
+    harness::init_tracing()?;
 
     // Identity of this process, used only for logging: the pool does not need to be told who its
     // peers are, which is the whole point.
@@ -34,7 +34,7 @@ async fn main() -> Result<()> {
 
     let manager = JobsManager::builder()
         // Both nodes must share the prefix - a different prefix is a different job.
-        .s3(harness::build_s3_config("distributed-workers"))
+        .s3(harness::build_s3_config("distributed-workers")?)
         .workers(2)
         .poll_interval(Duration::from_millis(300))
         .job("distributed job", move |j| {

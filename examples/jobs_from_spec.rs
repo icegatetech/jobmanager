@@ -43,10 +43,10 @@ const TABLE_JOB_SPECS: &[TableJobSpec] = &[
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    harness::init_tracing();
+    harness::init_tracing()?;
 
     let mut builder = JobsManager::builder()
-        .s3(harness::build_run_scoped_s3_config("jobs-from-spec"))
+        .s3(harness::build_run_scoped_s3_config("jobs-from-spec")?)
         .workers(3);
 
     for spec in TABLE_JOB_SPECS {

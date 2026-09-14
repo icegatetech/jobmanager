@@ -73,7 +73,7 @@ fn sum_input(total: &AtomicU64, ctx: &TaskContext) -> TaskResult {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    harness::init_tracing();
+    harness::init_tracing()?;
 
     let total = Arc::new(AtomicU64::new(0));
     run_one_iteration(Arc::clone(&total)).await?;

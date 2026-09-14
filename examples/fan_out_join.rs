@@ -38,11 +38,11 @@ struct ChunkOutput {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    harness::init_tracing();
+    harness::init_tracing()?;
 
     let job_code = JobCode::new("fan-out-join");
     let manager = JobsManager::builder()
-        .s3(harness::build_run_scoped_s3_config("fan-out-join"))
+        .s3(harness::build_run_scoped_s3_config("fan-out-join")?)
         .workers(4)
         .job(job_code.clone(), |j| {
             // One iteration is enough to show the shape, and it lets the example exit by itself.

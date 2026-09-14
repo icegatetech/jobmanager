@@ -61,9 +61,9 @@ blocks, or fails an iteration.
 
 ## Quick start
 
-The S3 examples run against a local S3-compatible store, and the Azure and Google Cloud Storage ones
-against the emulator of their own provider; [`examples/README.md`](examples/README.md) has the
-commands that bring each up and run one.
+By default the S3 examples run against a local S3-compatible store, and the Azure and Google Cloud
+Storage ones against the emulator of their own provider; [`examples/README.md`](examples/README.md)
+has the commands that bring each up, run one, and point one at a provider's own service instead.
 
 The shape of it:
 

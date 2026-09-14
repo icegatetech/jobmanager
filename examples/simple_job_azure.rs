@@ -9,12 +9,12 @@ use jobmanager::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    harness::init_tracing();
+    harness::init_tracing()?;
 
     tracing::info!("Starting simple job example on azure");
 
     let manager = JobsManager::builder()
-        .azure(harness::build_azure_config("simple-json-azure"))
+        .azure(harness::build_azure_config("simple-json-azure")?)
         .job("simple job", |j| {
             j.add_task(
                 TaskDefinition::new("my task code", Duration::from_secs(5)),

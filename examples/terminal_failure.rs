@@ -25,12 +25,12 @@ const DECODE_TASK_CODE: &str = "decode";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    harness::init_tracing();
+    harness::init_tracing()?;
 
     let executions = Arc::new(AtomicU32::new(0));
     let job_code = JobCode::new("terminal-failure");
     let manager = JobsManager::builder()
-        .s3(harness::build_run_scoped_s3_config("terminal-failure"))
+        .s3(harness::build_run_scoped_s3_config("terminal-failure")?)
         .workers(2)
         .poll_interval(Duration::from_millis(300))
         .job(job_code.clone(), {
