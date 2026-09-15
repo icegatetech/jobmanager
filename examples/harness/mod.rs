@@ -19,6 +19,7 @@ use jobmanager::GcsConfig;
 use jobmanager::{Error, Result};
 #[cfg(feature = "storage-s3")]
 use jobmanager::{JobStateCodecKind, S3Config};
+use tracing_subscriber::EnvFilter;
 #[cfg(feature = "storage-s3")]
 use uuid::Uuid;
 
@@ -38,6 +39,12 @@ const SETTINGS_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/.env"
 /// an error message, or in a doc comment. The rest are spelled at the single place they are read,
 /// where the reader is looking for exactly the string they put in [`SETTINGS_FILE`].
 const REQUEST_TIMEOUT_SETTING: &str = "JM_REQUEST_TIMEOUT_SECS";
+
+/// Filter the examples log through, in the directives `RUST_LOG` takes everywhere else.
+const LOG_FILTER_SETTING: &str = "RUST_LOG";
+
+/// Filter applied when [`LOG_FILTER_SETTING`] carries none.
+const DEFAULT_LOG_FILTER: &str = "info,jobmanager=info";
 
 /// Reads [`SETTINGS_FILE`] into the environment.
 ///
@@ -280,17 +287,23 @@ fn apply_gcs_credentials(config: GcsConfig) -> Result<GcsConfig> {
     }
 }
 
-/// Reads [`SETTINGS_FILE`] and installs the subscriber every example logs through. `RUST_LOG`
-/// overrides the default filter and is a setting of that file like any other, which is why the two
-/// happen together and first: a setting read before this call would see the file as absent.
+/// Reads [`SETTINGS_FILE`] and installs the subscriber every example logs through.
+/// [`LOG_FILTER_SETTING`] overrides [`DEFAULT_LOG_FILTER`] and is a setting of that file like any
+/// other, which is why the two happen together and first: a setting read before this call would see
+/// the file as absent.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Other`] when [`SETTINGS_FILE`] exists and cannot be read.
+/// Returns [`Error::Other`] when [`SETTINGS_FILE`] exists and cannot be read, and when
+/// [`LOG_FILTER_SETTING`] carries directives that do not parse.
 pub fn init_tracing() -> Result<()> {
     load_settings_file()?;
 
-    let filter = read_setting("RUST_LOG", "info,jobmanager=info");
+    let directives = read_setting(LOG_FILTER_SETTING, DEFAULT_LOG_FILTER);
+    // Handing the string to `with_env_filter` would take it through `EnvFilter::new`, which drops a
+    // directive it cannot parse and runs on whatever was left - a filter nobody asked for.
+    let filter = EnvFilter::try_new(&directives)
+        .map_err(|e| Error::Other(format!("{LOG_FILTER_SETTING} is not a filter: {directives}: {e}")))?;
     tracing_subscriber::fmt().with_target(false).with_env_filter(filter).init();
 
     Ok(())
