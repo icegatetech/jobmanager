@@ -1,4 +1,4 @@
-// Two processes, one bucket prefix, no lock service.
+// Two processes, one `state_prefix`, no lock service.
 //
 // Run it twice, in two terminals:
 //

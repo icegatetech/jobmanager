@@ -4,11 +4,11 @@ use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
-use super::common::s3_container::S3TestContainer;
+use super::common::provider_harness::{ProviderHarness, ProviderStorageRequest};
 use crate::core::task::SkipCause;
 use crate::{
-    DependencyTolerance, JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStateCodecKind, JobStatus,
-    JobsManagerConfig, NoopMetrics, S3Storage, S3StorageConfig, Storage, Task, TaskCode, TaskDefinition, TaskLimits,
+    DependencyTolerance, JobCode, JobDefinition, JobDefinitionId, JobDefinitionRegistry, JobRegistry,
+    JobStateCodecKind, JobStatus, JobsManagerConfig, NoopMetrics, Task, TaskCode, TaskDefinition, TaskLimits,
     TaskOutcome, TaskRef, TaskRetry, task_fn,
 };
 
@@ -28,20 +28,6 @@ const PREPARE_TOLERANCE: DependencyTolerance = DependencyTolerance {
     allows_skipped: false,
 };
 
-#[tokio::test]
-async fn branch_outcomes_survive_the_round_trip_through_storage_json() -> Result<(), Box<dyn std::error::Error>> {
-    super::common::init_tracing();
-
-    run_branch_outcome_round_trip(JobStateCodecKind::Json).await
-}
-
-#[tokio::test]
-async fn branch_outcomes_survive_the_round_trip_through_storage_cbor() -> Result<(), Box<dyn std::error::Error>> {
-    super::common::init_tracing();
-
-    run_branch_outcome_round_trip(JobStateCodecKind::Cbor).await
-}
-
 /// What the branch outcomes added to the stored state, none of it written in the ordinary case:
 /// what a refusal declared about repeating it, why a task was skipped - every one of the three
 /// causes, which ride in the task's status - and what a task tolerates. Each is read back by a
@@ -54,8 +40,10 @@ async fn branch_outcomes_survive_the_round_trip_through_storage_cbor() -> Result
 /// without its cause leaves the state unreadable, and mapping every cause to
 /// `SkipCause::ExecutorDecision` in `StoredTask::from_task` stores a decision where the cascade
 /// wrote a failure it inherited.
-async fn run_branch_outcome_round_trip(codec: JobStateCodecKind) -> Result<(), Box<dyn std::error::Error>> {
-    let store = S3TestContainer::start().await?;
+async fn run_branch_outcome_round_trip(
+    harness: &dyn ProviderHarness,
+    codec: JobStateCodecKind,
+) -> Result<(), Box<dyn std::error::Error>> {
     let job_code = JobCode::new("branch_outcome_persistence_job");
     let definition_id = JobDefinitionId::new();
 
@@ -95,21 +83,14 @@ async fn run_branch_outcome_round_trip(codec: JobStateCodecKind) -> Result<(), B
     .with_max_iterations(1)?;
 
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
-    let storage = Arc::new(
-        S3Storage::new(
-            S3StorageConfig::new(
-                store.endpoint(),
-                store.username(),
-                store.password(),
-                "branch-outcomes",
-                "us-east-1",
-            )
-            .with_job_state_codec(codec),
-            job_registry.clone(),
+    let storage = harness
+        .build_storage(&ProviderStorageRequest::new(
+            "branch-outcomes",
+            codec,
+            Arc::clone(&job_registry) as Arc<dyn JobDefinitionRegistry>,
             Arc::new(NoopMetrics),
-        )
-        .await?,
-    ) as Arc<dyn Storage>;
+        ))
+        .await?;
 
     let config = JobsManagerConfig {
         worker_count: 1,
@@ -182,4 +163,64 @@ fn find_task_by_code<'a>(job: &'a crate::Job, code: &str) -> Result<&'a Task, Bo
     job.tasks_as_iter()
         .find(|task| task.code() == &TaskCode::new(code))
         .ok_or_else(|| format!("the stored iteration must hold its '{code}' task").into())
+}
+
+#[cfg(feature = "storage-s3")]
+mod on_s3 {
+    use super::{JobStateCodecKind, run_branch_outcome_round_trip};
+    use crate::tests::common::provider_harness::S3ProviderHarness;
+
+    #[tokio::test]
+    async fn branch_outcomes_survive_the_round_trip_through_storage_json_on_s3()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_branch_outcome_round_trip(&S3ProviderHarness::start().await?, JobStateCodecKind::Json).await
+    }
+
+    #[tokio::test]
+    async fn branch_outcomes_survive_the_round_trip_through_storage_cbor_on_s3()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_branch_outcome_round_trip(&S3ProviderHarness::start().await?, JobStateCodecKind::Cbor).await
+    }
+}
+
+#[cfg(feature = "storage-azure")]
+mod on_azure {
+    use super::{JobStateCodecKind, run_branch_outcome_round_trip};
+    use crate::tests::common::provider_harness::AzureProviderHarness;
+
+    #[tokio::test]
+    async fn branch_outcomes_survive_the_round_trip_through_storage_json_on_azure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_branch_outcome_round_trip(&AzureProviderHarness::start().await?, JobStateCodecKind::Json).await
+    }
+
+    #[tokio::test]
+    async fn branch_outcomes_survive_the_round_trip_through_storage_cbor_on_azure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_branch_outcome_round_trip(&AzureProviderHarness::start().await?, JobStateCodecKind::Cbor).await
+    }
+}
+
+#[cfg(feature = "storage-gcs")]
+mod on_gcs {
+    use super::{JobStateCodecKind, run_branch_outcome_round_trip};
+    use crate::tests::common::provider_harness::GcsProviderHarness;
+
+    #[tokio::test]
+    async fn branch_outcomes_survive_the_round_trip_through_storage_json_on_gcs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_branch_outcome_round_trip(&GcsProviderHarness::start().await?, JobStateCodecKind::Json).await
+    }
+
+    #[tokio::test]
+    async fn branch_outcomes_survive_the_round_trip_through_storage_cbor_on_gcs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_branch_outcome_round_trip(&GcsProviderHarness::start().await?, JobStateCodecKind::Cbor).await
+    }
 }

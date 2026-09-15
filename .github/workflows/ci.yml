@@ -7,6 +7,13 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+# Read-only by default, so a build script of a dependency that reads the checkout's git
+# configuration finds no token able to write to this repository. `security-audit.yml` states its
+# own wider set on the job that needs it. Every checkout below drops the token from that
+# configuration as well, for the same reason: no job here pushes anything.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -22,6 +29,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -52,22 +61,145 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ matrix.rust }}-cargo-build-target-
 
+      # Five feature selections: the default one a consumer gets without asking, every feature at
+      # once, and each backend on its own without the OpenTelemetry sink - the last three being what
+      # keeps `opentelemetry` genuinely optional, which is the whole point of `MetricsSink`. A
+      # selection with no backend at all is refused by the `compile_error!` in `src/lib.rs` and is
+      # not checked here; add a step per backend feature as the next backend lands.
       - name: Check compilation
         run: cargo check --all-targets
-
-      # Both ends of the feature matrix: the crate has to build with the OpenTelemetry sink and
-      # without it, since the whole point of `MetricsSink` is that the dependency is optional.
-      - name: Check compilation without default features
-        run: cargo check --all-targets --no-default-features
 
       - name: Check compilation with all features
         run: cargo check --all-targets --all-features
 
+      - name: Check compilation with the S3 backend only
+        run: cargo check --all-targets --no-default-features --features storage-s3
+
+      - name: Check compilation with the Azure backend only
+        run: cargo check --all-targets --no-default-features --features storage-azure
+
+      - name: Check compilation with the Google Cloud Storage backend only
+        run: cargo check --all-targets --no-default-features --features storage-gcs
+
       # Integration tests start an S3-compatible container (RustFS) via testcontainers;
       # Docker is available on ubuntu-latest. --test-threads=1 keeps containers from
-      # colliding on ports.
+      # colliding on ports. The Azure and Google Cloud Storage backends have a job each, so
+      # this one starts no emulator it does not need.
       - name: Run tests
-        run: cargo test --verbose -- --test-threads=1
+        run: cargo test --verbose --no-default-features --features storage-s3 -- --test-threads=1
+
+  test-azure:
+    name: Test the Azure backend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-azure-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-azure-cargo-build-target-
+
+      # The Azurite emulator is started per test by testcontainers, like RustFS above.
+      - name: Run tests
+        run: cargo test --verbose --no-default-features --features storage-azure -- --test-threads=1
+
+  test-gcs:
+    name: Test the Google Cloud Storage backend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-gcs-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-gcs-cargo-build-target-
+
+      # Google's `storage-testbench` is started per test by testcontainers, like RustFS above.
+      # The image is published for linux/amd64, which is what this runner is, so nothing is
+      # emulated here.
+      - name: Run tests
+        run: cargo test --verbose --no-default-features --features storage-gcs -- --test-threads=1
+
+  # The only job that compiles on the declared minimum: the `test` matrix is `stable` and `beta`, so
+  # without this one `rust-version` is an unchecked claim that breaks in a consumer's build rather
+  # than here.
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # The toolchain is read rather than pinned here: `rust-version` is the one place the minimum
+      # is declared, and a copy of it in this file would be a second one to forget. The runner's
+      # preinstalled cargo is what reads it, before the minimum toolchain is installed below.
+      - name: Read the minimum supported toolchain from Cargo.toml
+        id: msrv
+        run: echo "version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].rust_version')" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-msrv-${{ steps.msrv.outputs.version }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-msrv-${{ steps.msrv.outputs.version }}-cargo-build-target-
+
+      # Every feature, because a backend the selection leaves out is compiled by nothing: the
+      # minimum answers for the whole crate, not for the default feature set. Tests are left to the
+      # jobs above - what a toolchain decides is whether the code compiles, and no emulator changes
+      # that.
+      - name: Check compilation on the minimum supported toolchain
+        run: cargo check --all-targets --all-features
 
   format:
     name: Format
@@ -75,6 +207,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust nightly toolchain
         uses: dtolnay/rust-toolchain@nightly
@@ -95,6 +229,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -126,5 +262,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-clippy-${{ env.CLIPPY_TOOLCHAIN }}-cargo-build-target-
 
+      # Every feature, as in the `Makefile`. The `check` steps above do compile each backend, but
+      # `unwrap_used`, `expect_used`, pedantic and nursery are clippy's lints and no `check` step
+      # sees them.
       - name: Run clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings

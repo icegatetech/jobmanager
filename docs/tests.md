@@ -12,12 +12,19 @@ production function.
 - Integration tests live in **`src/tests/`, not `tests/`** — they assert on `Job`, `Task`, and
   `Storage`, which are `pub(crate)`. Do not "fix" this by relocating them or by widening production
   visibility; the visibility boundary is the contract and the test location follows from it.
-- The harness already exists — use it rather than rolling your own: `S3TestContainer` (starts and
-  tears down the store), `ManagerEnv` (manager lifecycle, bounded wait, aborts workers on drop),
+- The harness already exists — use it rather than rolling your own: `ProviderHarness` (one provider
+  started for a test: the backend under test, and a probe that reads the same container without
+  going through it), `S3TestContainer`, `AzureTestContainer` and `GcsTestContainer` (start and tear
+  down the store a harness hands out), `ManagerEnv` (manager lifecycle, bounded wait, aborts workers
+  on drop),
   `CountingStorage` (counts backend calls), `CountingMetrics` (counts the requests a backend was
   billed for, by operation and status), `InMemoryStorage` (current iteration of every job,
   conditional writes, no persistence), `waiting` (bounded waits and `measure_settled_requests`),
   `init_tracing`.
+- A test that reaches a real store goes through `ProviderHarness`, not through one provider's
+  configuration: the behavior it protects is owed by every backend, and a body written against one
+  of them is the copy the other drifts from. A case that is genuinely about one provider — the size
+  of a batch only it has — says so in its file name and builds that backend itself.
 
 ## Choosing the boundary
 
@@ -150,7 +157,7 @@ Every quota test therefore:
   the sleep is the measurement itself — its baseline is still taken by poll-until-condition.
 - Every wait has a bounded timeout that fails with a diagnostic. A test that can hang forever is
   broken.
-- Tests sharing infrastructure use distinct bucket names or `bucket_prefix` values.
+- Tests sharing infrastructure use distinct bucket names or `state_prefix` values.
 - Harnesses own their containers, managers, and background tasks through RAII guards, and clean up on
   success, error, timeout, and panic.
 - A background panic, a failed join, or a failed shutdown fails the test instead of being ignored.

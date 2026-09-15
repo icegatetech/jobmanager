@@ -37,10 +37,8 @@ impl OtelMetrics {
             .with_unit("s")
             .build();
 
-        // The instrument name still says `s3` because it is what dashboards and alerts already
-        // query; renaming it would break them, unlike renaming the method.
         let storage_latency = meter
-            .f64_histogram("jobmanager_storage_s3_latency")
+            .f64_histogram("jobmanager_storage_latency")
             .with_description("Latency of storage read and write operations")
             .with_unit("s")
             .build();
@@ -111,7 +109,7 @@ impl MetricsSink for OtelMetrics {
         );
     }
 
-    /// Records `jobmanager_storage_s3_latency`.
+    /// Records `jobmanager_storage_latency`.
     fn record_storage_operation(&self, operation: &str, status: &str, duration: Duration) {
         self.storage_latency.record(
             duration.as_secs_f64(),

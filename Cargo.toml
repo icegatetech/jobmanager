@@ -2,14 +2,20 @@
 name = "jobmanager"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.92.0"
+rust-version = "1.94.1"
 authors = ["IceGate Tech"]
 license = "Apache-2.0"
 repository = "https://github.com/icegatetech/jobmanager"
-description = "Distributed job and task manager with S3-backed state"
+description = "Distributed job and task manager coordinating workers through an object store"
 readme = "README.md"
-keywords = ["job", "task", "scheduler", "s3", "distributed"]
+keywords = ["job", "task", "scheduler", "object-store", "distributed"]
 categories = ["asynchronous", "database"]
+
+# Every backend is behind a feature, and the crate docs carry an example per backend the build
+# carries; without this docs.rs builds the default set, so a backend the default set leaves out
+# would reach the rendered documentation with neither its configuration type nor its example.
+[package.metadata.docs.rs]
+all-features = true
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -40,12 +46,14 @@ single_match_else = "allow"
 redundant_pub_crate = "allow"
 
 [features]
-# Off by default: `OtelMetrics` takes a `Meter` the caller owns, so anyone else would carry
-# `opentelemetry` unused - or, on another pre-1.0 minor, carry a second copy of it.
-default = []
-# Records measurements through OpenTelemetry. Without it the crate still measures everything, it
-# just needs a `MetricsSink` of the caller's own to record into.
+# Keep `storage-s3` available when consumers do not select features explicitly. A build selecting
+# no backend at all is refused - see the `compile_error!` in `src/lib.rs`.
+default = ["storage-s3"]
+# Off by default so consumers using another metrics sink do not carry OpenTelemetry.
 metrics-otel = ["dep:opentelemetry"]
+storage-s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
+storage-azure = ["dep:azure_core", "dep:azure_storage_blob"]
+storage-gcs = ["dep:google-cloud-auth", "dep:reqwest", "dep:http"]
 
 # This example doubles as its own test: `cargo test --example testing_your_executor` runs the
 # assertions in its `tests` module, which is what keeps a "how to test" example honest. Declaring one
@@ -54,6 +62,86 @@ metrics-otel = ["dep:opentelemetry"]
 name = "testing_your_executor"
 path = "examples/testing_your_executor.rs"
 test = true
+
+[[example]]
+name = "adaptive_schedule"
+required-features = ["storage-s3"]
+
+[[example]]
+name = "attempt_budget"
+required-features = ["storage-s3"]
+
+[[example]]
+name = "chained_job"
+required-features = ["storage-s3"]
+
+[[example]]
+name = "degraded_dependency"
+required-features = ["storage-s3"]
+
+[[example]]
+name = "distributed_workers"
+required-features = ["storage-s3"]
+
+[[example]]
+name = "fan_out_join"
+required-features = ["storage-s3"]
+
+[[example]]
+name = "graceful_shutdown"
+required-features = ["storage-s3"]
+
+[[example]]
+name = "idempotent_task"
+required-features = ["storage-s3"]
+
+[[example]]
+name = "jobs_from_spec"
+required-features = ["storage-s3"]
+
+[[example]]
+name = "json_model_job"
+required-features = ["storage-s3"]
+
+[[example]]
+name = "observability"
+required-features = ["storage-s3"]
+
+[[example]]
+name = "payload_by_reference"
+required-features = ["storage-s3"]
+
+[[example]]
+name = "simple_job_s3"
+required-features = ["storage-s3"]
+
+[[example]]
+name = "simple_job_azure"
+required-features = ["storage-azure"]
+
+[[example]]
+name = "simple_job_gcs"
+required-features = ["storage-gcs"]
+
+[[example]]
+name = "simple_job_cbor"
+required-features = ["storage-s3"]
+
+[[example]]
+name = "simple_sequence_job"
+required-features = ["storage-s3"]
+
+[[example]]
+name = "skipped_branch"
+required-features = ["storage-s3"]
+
+[[example]]
+name = "struct_executor"
+required-features = ["storage-s3"]
+
+[[example]]
+name = "terminal_failure"
+required-features = ["storage-s3"]
 
 [dependencies]
 # Error handling
@@ -70,8 +158,38 @@ tokio-util = "0.7"
 # hyper 0.14 stack, unused here next to the hyper 1.x default client, and it drags along its own
 # h2 0.3 and rustls 0.21 - the pair that kept turning up in `cargo audit`. The features listed are
 # the rest of the SDK's own defaults.
-aws-sdk-s3 = { version = "1.127", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
-aws-config = { version = "1.8", default-features = false, features = ["credentials-process", "default-https-client", "rt-tokio", "sso"] }
+#
+# The floor is 1.146 rather than the oldest version this code compiles against: every SDK below it
+# carries `lru` 0.16, the unsound `LruCache::pop()` of RUSTSEC-2026-0253. 1.146 is also what sets
+# `rust-version` above - the SDK declares 1.94.1.
+aws-sdk-s3 = { version = "1.146", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"], optional = true }
+aws-config = { version = "1.8", default-features = false, features = ["credentials-process", "default-https-client", "rt-tokio", "sso"], optional = true }
+
+# Azure Blob Storage. `hmac_rust` is on because the SDK carries no shared-key authentication, and
+# `azure_core::hmac::hmac_sha256` behind that feature is what signs a request with the account key -
+# see `storage/azure_signing.rs`. The feature pulls `hmac` and `sha2`, both already in the tree.
+#
+# Default features are off to leave out the SDK's gzip and deflate transports: its own clients build
+# their HTTP client with automatic decompression disabled, so the codecs are dead weight - seven
+# crates of `async-compression`, `flate2` and their checksum tails. The rest of the listed features
+# are the SDK's own defaults. `tokio` among them adds no crate - it only makes the SDK spawn and
+# sleep on the runtime this crate already runs on, where leaving it off would have it start an OS
+# thread per task and block one to sleep.
+azure_core = { version = "1.1", default-features = false, features = ["hmac_rust", "reqwest", "reqwest_rustls", "tokio"], optional = true }
+azure_storage_blob = { version = "1.1", default-features = false, features = ["tokio"], optional = true }
+
+# Google Cloud Storage. The JSON API client is written in `storage/gcs_client.rs`, so the only thing
+# taken from Google's SDK is the authorization header: none of the four published clients survives
+# the contract of `Storage` - see the invariant on what a call of `Storage` may cost in `AGENTS.md`.
+google-cloud-auth = { version = "1.16", optional = true }
+# The transport that client speaks over. Already in the tree through `azure_core`; named here because
+# this crate's own code uses it. `rustls` rather than the platform's TLS for the reason the S3
+# dependency gives, `json` for the metadata the JSON API answers with, `http2` because a pool of
+# workers reaches one host on one connection. `charset` is left out: a state object is read as bytes
+# and a metadata answer as JSON, so nothing here decodes a body by its declared charset.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "http2"], optional = true }
+# Carries the header map `google-cloud-auth` hands back and the extensions map it takes.
+http = { version = "1", optional = true }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

@@ -9,24 +9,22 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
-use super::common::s3_container::S3TestContainer;
+use super::common::provider_harness::{ProviderHarness, ProviderStorageRequest};
 use crate::storage::Storage;
 use crate::{
-    CachedStorage, JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStateCodecKind, JobStatus,
-    JobsManagerConfig, NoopMetrics, S3Storage, S3StorageConfig, TaskCode, TaskDefinition, TaskLimits, TaskOutcome,
-    task_fn,
+    CachedStorage, JobCode, JobDefinition, JobDefinitionId, JobDefinitionRegistry, JobRegistry, JobStateCodecKind,
+    JobStatus, JobsManagerConfig, NoopMetrics, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, task_fn,
 };
 
-/// Runs two jobs in parallel with two workers.
-#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
-async fn test_two_jobs_concurrent() -> Result<(), Box<dyn std::error::Error>> {
-    super::common::init_tracing();
+/// Storage timeout the case runs with, kept from the original S3 configuration: two jobs polled by
+/// two workers must not have a pass held up by a request the store is slow to answer.
+const TWO_JOBS_REQUEST_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Two jobs run in parallel under two workers, each reaching its iteration budget with its own
+/// tasks and nothing crossing between them.
+async fn run_two_jobs_concurrent(harness: &dyn ProviderHarness) -> Result<(), Box<dyn std::error::Error>> {
     let tasks_per_iter = 3usize;
     let max_iterations = 3u64;
-
-    // 1. Start object storage
-    let store = S3TestContainer::start().await?;
 
     let primary_job_code = JobCode::new("test_two_jobs_a");
     let secondary_job_code = JobCode::new("test_two_jobs_b");
@@ -94,35 +92,24 @@ async fn test_two_jobs_concurrent() -> Result<(), Box<dyn std::error::Error>> {
     )?
     .with_max_iterations(max_iterations)?;
 
-    // 3. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![
         primary_job_def.clone(),
         secondary_job_def.clone(),
     ])?);
 
-    // 4. Create storage
-    let storage = Arc::new(
-        S3Storage::new(
-            S3StorageConfig::new(
-                store.endpoint(),
-                store.username(),
-                store.password(),
-                "test-jobs",
-                "us-east-1",
+    let object_storage = harness
+        .build_storage(
+            &ProviderStorageRequest::new(
+                "two-jobs",
+                JobStateCodecKind::Json,
+                Arc::clone(&job_registry) as Arc<dyn JobDefinitionRegistry>,
+                Arc::new(NoopMetrics),
             )
-            .with_job_state_codec(JobStateCodecKind::Json)
-            .with_request_timeout(Duration::from_millis(100)),
-            job_registry.clone(),
-            Arc::new(NoopMetrics),
+            .with_request_timeout(TWO_JOBS_REQUEST_TIMEOUT),
         )
-        .await?,
-    );
-    let storage = Arc::new(CachedStorage::new(
-        storage.clone() as Arc<dyn Storage>,
-        Arc::new(NoopMetrics),
-    ));
+        .await?;
+    let storage = Arc::new(CachedStorage::new(object_storage, Arc::new(NoopMetrics))) as Arc<dyn Storage>;
 
-    // 5. Start manager with 2 workers
     let config = JobsManagerConfig {
         worker_count: 2,
         worker_config: super::common::build_worker_config(Duration::from_millis(100), Duration::from_millis(10)),
@@ -136,7 +123,6 @@ async fn test_two_jobs_concurrent() -> Result<(), Box<dyn std::error::Error>> {
         vec![primary_job_def.clone(), secondary_job_def.clone()],
     )?;
 
-    // 6. Wait for completion
     manager_env.wait_for_all_jobs_completion(Duration::from_secs(30)).await?;
     manager_env.stop().await;
 
@@ -151,7 +137,6 @@ async fn test_two_jobs_concurrent() -> Result<(), Box<dyn std::error::Error>> {
         "job B tasks should be executed for all iterations"
     );
 
-    // 7. Verify final job state
     let cancel_token = CancellationToken::new();
     let primary_job_state = manager_env.storage().get_job(&primary_job_code, &cancel_token).await?;
     assert_eq!(*primary_job_state.status(), JobStatus::Completed);
@@ -180,4 +165,40 @@ async fn test_two_jobs_concurrent() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(secondary_job_timeouts, 0, "job B should not have timeouts");
 
     Ok(())
+}
+
+#[cfg(feature = "storage-s3")]
+mod on_s3 {
+    use super::run_two_jobs_concurrent;
+    use crate::tests::common::provider_harness::S3ProviderHarness;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+    async fn two_jobs_run_side_by_side_on_s3() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_two_jobs_concurrent(&S3ProviderHarness::start().await?).await
+    }
+}
+
+#[cfg(feature = "storage-azure")]
+mod on_azure {
+    use super::run_two_jobs_concurrent;
+    use crate::tests::common::provider_harness::AzureProviderHarness;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+    async fn two_jobs_run_side_by_side_on_azure() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_two_jobs_concurrent(&AzureProviderHarness::start().await?).await
+    }
+}
+
+#[cfg(feature = "storage-gcs")]
+mod on_gcs {
+    use super::run_two_jobs_concurrent;
+    use crate::tests::common::provider_harness::GcsProviderHarness;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+    async fn two_jobs_run_side_by_side_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_two_jobs_concurrent(&GcsProviderHarness::start().await?).await
+    }
 }

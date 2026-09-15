@@ -1,10 +1,16 @@
 use std::{sync::Arc, time::Duration};
 
+#[cfg(feature = "storage-azure")]
+use crate::{AzureBackend, AzureConfig};
 use crate::{
     CachedStorage, Error, InMemoryStorage, JobCleanerConfig, JobCode, JobDefinition, JobDefinitionId,
     JobDefinitionRegistry, JobRegistry, JobsManager, JobsManagerConfig, MetricsSink, NoopMetrics, RetrierConfig,
-    S3Storage, S3StorageConfig, Storage, TaskCode, TaskDefinition, TaskExecutor, TaskLimits, TaskRef, WorkerConfig,
+    Storage, TaskCode, TaskDefinition, TaskExecutor, TaskLimits, TaskRef, WorkerConfig,
 };
+#[cfg(feature = "storage-gcs")]
+use crate::{GcsBackend, GcsConfig};
+#[cfg(feature = "storage-s3")]
+use crate::{S3Backend, S3Config};
 
 /// Describes one job: its schedule, its initial tasks, and every executor it may run.
 ///
@@ -133,7 +139,12 @@ impl JobBuilder {
 /// Which backend the pool persists job state to.
 enum StorageChoice {
     Unset,
-    S3(Box<S3StorageConfig>),
+    #[cfg(feature = "storage-s3")]
+    S3(Box<S3Config>),
+    #[cfg(feature = "storage-azure")]
+    Azure(Box<AzureConfig>),
+    #[cfg(feature = "storage-gcs")]
+    Gcs(Box<GcsConfig>),
     InMemory,
 }
 
@@ -143,8 +154,8 @@ enum StorageChoice {
 /// reassigning the builder. Nothing is validated until [`Self::build`].
 pub struct JobsManagerBuilder {
     storage: StorageChoice,
-    /// Whether an S3 backend is put behind the read cache. Kept apart from [`StorageChoice`] so
-    /// `no_cache()` works whichever side of `s3()` it is called on.
+    /// Whether an object backend is put behind the read cache. Kept apart from [`StorageChoice`] so
+    /// `no_cache()` works whichever side of the backend call it is on.
     cache_storage: bool,
     jobs: Vec<JobBuilder>,
     worker_count: usize,
@@ -188,15 +199,39 @@ impl JobsManagerBuilder {
     /// The cache is on by default because a worker re-reads the same job on every poll; drop it
     /// with [`Self::no_cache`].
     #[must_use]
-    pub fn s3(mut self, config: S3StorageConfig) -> Self {
+    #[cfg(feature = "storage-s3")]
+    pub fn s3(mut self, config: S3Config) -> Self {
         self.storage = StorageChoice::S3(Box::new(config));
+        self
+    }
+
+    /// Persists job state to an Azure Blob Storage container, behind the read cache.
+    ///
+    /// The cache is on by default because a worker re-reads the same job on every poll; drop it
+    /// with [`Self::no_cache`].
+    #[must_use]
+    #[cfg(feature = "storage-azure")]
+    pub fn azure(mut self, config: AzureConfig) -> Self {
+        self.storage = StorageChoice::Azure(Box::new(config));
+        self
+    }
+
+    /// Persists job state to a Google Cloud Storage bucket, behind the read cache.
+    ///
+    /// The cache is on by default because a worker re-reads the same job on every poll; drop it
+    /// with [`Self::no_cache`].
+    #[must_use]
+    #[cfg(feature = "storage-gcs")]
+    pub fn gcs(mut self, config: GcsConfig) -> Self {
+        self.storage = StorageChoice::Gcs(Box::new(config));
         self
     }
 
     /// Reads job state straight from the store, without the cache in front of it.
     ///
-    /// Order-independent: it only clears a flag, so calling it before [`Self::s3`] works the same.
-    /// Only [`Self::s3`] is cached, so on an [`Self::in_memory`] pool this changes nothing.
+    /// Order-independent: it only clears a flag, so calling it before the backend was chosen works
+    /// the same. Only the object backends - `s3()`, `azure()` and `gcs()` - are cached, so on an
+    /// [`Self::in_memory`] pool this changes nothing.
     #[must_use]
     pub const fn no_cache(mut self) -> Self {
         self.cache_storage = false;
@@ -380,20 +415,59 @@ async fn build_storage(
     metrics: &Arc<dyn MetricsSink>,
 ) -> Result<Arc<dyn Storage>, Error> {
     match choice {
-        StorageChoice::Unset => Err(Error::Other(
-            "storage backend is not configured: call s3() or in_memory()".into(),
-        )),
+        StorageChoice::Unset => Err(Error::Other(format!(
+            "storage backend is not configured: call {}",
+            describe_compiled_backends()
+        ))),
+        #[cfg(feature = "storage-s3")]
         StorageChoice::S3(config) => {
             let registry = Arc::clone(registry) as Arc<dyn JobDefinitionRegistry>;
-            let storage = Arc::new(S3Storage::new(*config, registry, metrics.clone()).await?) as Arc<dyn Storage>;
-            if cache_storage {
-                Ok(Arc::new(CachedStorage::new(storage, metrics.clone())))
-            } else {
-                Ok(storage)
-            }
+            let storage = Arc::new(S3Backend::build(*config, registry, metrics.clone()).await?) as Arc<dyn Storage>;
+            Ok(cache_object_storage(storage, cache_storage, metrics))
+        }
+        #[cfg(feature = "storage-azure")]
+        StorageChoice::Azure(config) => {
+            let registry = Arc::clone(registry) as Arc<dyn JobDefinitionRegistry>;
+            let storage = Arc::new(AzureBackend::build(*config, registry, metrics.clone()).await?) as Arc<dyn Storage>;
+            Ok(cache_object_storage(storage, cache_storage, metrics))
+        }
+        #[cfg(feature = "storage-gcs")]
+        StorageChoice::Gcs(config) => {
+            let registry = Arc::clone(registry) as Arc<dyn JobDefinitionRegistry>;
+            let storage = Arc::new(GcsBackend::build(*config, registry, metrics.clone()).await?) as Arc<dyn Storage>;
+            Ok(cache_object_storage(storage, cache_storage, metrics))
         }
         StorageChoice::InMemory => Ok(Arc::new(InMemoryStorage::new())),
     }
+}
+
+/// Puts the read cache in front of an object backend unless the caller took it off.
+fn cache_object_storage(
+    storage: Arc<dyn Storage>,
+    cache_storage: bool,
+    metrics: &Arc<dyn MetricsSink>,
+) -> Arc<dyn Storage> {
+    if cache_storage {
+        Arc::new(CachedStorage::new(storage, metrics.clone()))
+    } else {
+        storage
+    }
+}
+
+/// Names the backend methods this build actually carries, so a pool built without one is told what
+/// it may call rather than what the crate can be compiled with.
+fn describe_compiled_backends() -> String {
+    let mut methods = vec![
+        #[cfg(feature = "storage-s3")]
+        "s3()",
+        #[cfg(feature = "storage-azure")]
+        "azure()",
+        #[cfg(feature = "storage-gcs")]
+        "gcs()",
+    ];
+    methods.push("in_memory()");
+
+    methods.join(" or ")
 }
 
 #[cfg(test)]
@@ -411,8 +485,11 @@ mod tests {
         TaskDefinition::new(code, Duration::from_secs(1))
     }
 
+    /// The message a caller reads when it forgot to pick a backend, which is the one place where
+    /// the text of an error is the contract: it has to name the methods *this* build carries, not
+    /// the ones the crate can be compiled with.
     #[tokio::test]
-    async fn build_rejects_missing_storage() {
+    async fn a_builder_without_a_backend_names_the_compiled_ones() {
         let error = JobsManagerBuilder::new()
             .job("j", |j| {
                 j.add_task(task("t"), noop_executor());
@@ -422,7 +499,17 @@ mod tests {
             .err()
             .expect("a pool without a backend must not build");
 
-        assert!(error.to_string().contains("storage backend"), "got: {error}");
+        let message = error.to_string();
+        assert!(message.contains("storage backend"), "got: {message}");
+        assert!(message.contains("in_memory()"), "got: {message}");
+        #[cfg(feature = "storage-s3")]
+        assert!(message.contains("s3()"), "got: {message}");
+        #[cfg(feature = "storage-azure")]
+        assert!(message.contains("azure()"), "got: {message}");
+        #[cfg(feature = "storage-gcs")]
+        assert!(message.contains("gcs()"), "got: {message}");
+        #[cfg(not(feature = "storage-s3"))]
+        assert!(!message.contains(" s3()"), "got: {message}");
     }
 
     #[tokio::test]
@@ -818,8 +905,8 @@ mod tests {
         assert!(!builder.cleaner_config.enabled);
     }
 
-    /// Opting out of the read cache must leave the flag the S3 backend is wrapped by cleared rather
-    /// than merely unconfigured; what the cache itself spares the backend is asserted in
+    /// Opting out of the read cache must leave the flag an object backend is wrapped by cleared
+    /// rather than merely unconfigured; what the cache itself spares the backend is asserted in
     /// `cache_invalidation_test`.
     #[test]
     fn no_cache_switches_the_read_cache_off() {

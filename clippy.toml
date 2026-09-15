@@ -37,8 +37,8 @@ too-many-lines-threshold = 150
 single-char-binding-names-threshold = 4
 
 # Enforce minimum Rust version. MUST track Cargo.toml's `rust-version`.
-# Rust 2024 edition needs 1.85+; the crate pins 1.92.0.
-msrv = "1.92.0"
+# Rust 2024 edition needs 1.85+.
+msrv = "1.94.1"
 
 # Literal representation
 literal-representation-threshold = 65536

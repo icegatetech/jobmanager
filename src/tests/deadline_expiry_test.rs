@@ -9,25 +9,23 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
-use super::common::s3_container::S3TestContainer;
+use super::common::provider_harness::{ProviderHarness, ProviderStorageRequest};
 use crate::storage::Storage;
 use crate::{
-    CachedStorage, JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStateCodecKind, JobStatus,
-    JobsManagerConfig, NoopMetrics, S3Storage, S3StorageConfig, TaskCode, TaskDefinition, TaskLimits, TaskOutcome,
-    task_fn,
+    CachedStorage, JobCode, JobDefinition, JobDefinitionId, JobDefinitionRegistry, JobRegistry, JobStateCodecKind,
+    JobStatus, JobsManagerConfig, NoopMetrics, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, task_fn,
 };
 
-/// `TestTaskDeadlineExpiry` verifies that a task started by one worker is re-picked by another worker after its deadline expires.
-#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
-async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
-    super::common::init_tracing();
+/// Storage timeout the case runs with: a request that outlived the deadline it is racing would let
+/// a takeover be decided by the store rather than by the deadline.
+const DEADLINE_RACE_REQUEST_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// A task started by one worker is picked up again by another once its deadline expires, and the
+/// takeover spends no attempt.
+async fn run_task_deadline_expiry(harness: &dyn ProviderHarness) -> Result<(), Box<dyn std::error::Error>> {
     let expected_executions: u32 = 4;
 
-    // 1. Start object storage
-    let store = S3TestContainer::start().await?;
-
-    // 2. Track task executions, which the takeovers no longer show up in the attempt counter as
+    // Track task executions, which the takeovers no longer show up in the attempt counter as
     let execution_count = Arc::new(AtomicU32::new(0));
 
     let execution_count_clone = Arc::clone(&execution_count);
@@ -65,32 +63,21 @@ async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
     )?
     .with_max_iterations(1)?;
 
-    // 3. Create job definitions
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
 
-    // 4. Create storage
-    let storage = Arc::new(
-        S3Storage::new(
-            S3StorageConfig::new(
-                store.endpoint(),
-                store.username(),
-                store.password(),
-                "test-jobs",
-                "us-east-1",
+    let object_storage = harness
+        .build_storage(
+            &ProviderStorageRequest::new(
+                "deadline-expiry",
+                JobStateCodecKind::Json,
+                Arc::clone(&job_registry) as Arc<dyn JobDefinitionRegistry>,
+                Arc::new(NoopMetrics),
             )
-            .with_job_state_codec(JobStateCodecKind::Json)
-            .with_request_timeout(Duration::from_millis(100)),
-            job_registry.clone(),
-            Arc::new(NoopMetrics),
+            .with_request_timeout(DEADLINE_RACE_REQUEST_TIMEOUT),
         )
-        .await?,
-    );
-    let storage = Arc::new(CachedStorage::new(
-        storage.clone() as Arc<dyn Storage>,
-        Arc::new(NoopMetrics),
-    ));
+        .await?;
+    let storage = Arc::new(CachedStorage::new(object_storage, Arc::new(NoopMetrics))) as Arc<dyn Storage>;
 
-    // 5. Start manager
     let config = JobsManagerConfig {
         worker_count: 3, // need more concurrency for small resources system
         worker_config: super::common::build_worker_config(Duration::from_millis(10), Duration::ZERO),
@@ -99,18 +86,15 @@ async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut manager_env = ManagerEnv::new(storage, config, Arc::clone(&job_registry), vec![job_def])?;
 
-    // 6. Wait for job completion (should re-pick after deadline expires)
     manager_env.wait_for_all_jobs_completion(Duration::from_secs(15)).await?;
     manager_env.stop().await;
 
-    // 7. Verify task was executed multiple times
     assert_eq!(
         execution_count.load(Ordering::SeqCst),
         expected_executions,
         "task should be executed {expected_executions} times due to deadline expiry"
     );
 
-    // Verify final job state
     let cancel_token = CancellationToken::new();
     let job = manager_env
         .storage()
@@ -125,4 +109,40 @@ async fn test_task_deadline_expiry() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     Ok(())
+}
+
+#[cfg(feature = "storage-s3")]
+mod on_s3 {
+    use super::run_task_deadline_expiry;
+    use crate::tests::common::provider_harness::S3ProviderHarness;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+    async fn an_expired_deadline_hands_the_task_to_another_worker_on_s3() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_task_deadline_expiry(&S3ProviderHarness::start().await?).await
+    }
+}
+
+#[cfg(feature = "storage-azure")]
+mod on_azure {
+    use super::run_task_deadline_expiry;
+    use crate::tests::common::provider_harness::AzureProviderHarness;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+    async fn an_expired_deadline_hands_the_task_to_another_worker_on_azure() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_task_deadline_expiry(&AzureProviderHarness::start().await?).await
+    }
+}
+
+#[cfg(feature = "storage-gcs")]
+mod on_gcs {
+    use super::run_task_deadline_expiry;
+    use crate::tests::common::provider_harness::GcsProviderHarness;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+    async fn an_expired_deadline_hands_the_task_to_another_worker_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_task_deadline_expiry(&GcsProviderHarness::start().await?).await
+    }
 }

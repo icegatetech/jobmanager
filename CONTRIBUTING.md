@@ -10,8 +10,10 @@ The toolchain is pinned in `rust-toolchain.toml` and picked up automatically.
 
 ## Tests
 
-Integration tests start a real S3-compatible container (RustFS) through testcontainers, so
-**Docker must be running**.
+Integration tests start real storage containers through testcontainers — RustFS for the S3 backend,
+Azurite for the Azure one and Google's `storage-testbench` for the Google Cloud Storage one — so
+**Docker must be running**. The test bench image is built for `linux/amd64` only, so on an arm64 host
+it runs under emulation and its perimeter is slower than the other two.
 
 ```bash
 make test
@@ -29,6 +31,14 @@ DOCKER_HOST=unix://$HOME/.orbstack/run/docker.sock make test
 
 To run the examples you need the same kind of store, but long-lived; the commands for it are in
 [examples/README.md](examples/README.md).
+
+A new example that reaches a storage backend needs its own `[[example]]` block in `Cargo.toml`
+naming the feature it requires, next to the ones already there. Cargo has no way to declare
+`required-features` for auto-discovered examples as a group, so an example added without that block
+is built under every feature selection — including one that leaves its backend out, where it fails
+to compile and takes that whole selection down with it. Each backend feature has a CI step of its
+own — `storage-s3`, `storage-azure` and `storage-gcs` today — and that step is what would report
+the breakage.
 
 ## Before committing
 

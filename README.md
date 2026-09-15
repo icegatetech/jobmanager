@@ -1,10 +1,10 @@
 # jobmanager
 
-Distributed job and task manager for Rust, with job state kept in S3.
+Distributed job and task manager for Rust, with job state kept in an object store.
 
 Workers coordinate through conditional writes on the object store itself — no ZooKeeper, no
-etcd, no database. If you already have S3 (or MinIO, RustFS, or any S3-compatible store), you
-have everything this needs.
+etcd, no database. If you already have an object store — S3 (or MinIO, RustFS, or any
+S3-compatible one), Azure Blob Storage, or Google Cloud Storage — you have everything this needs.
 
 ## Model
 
@@ -61,14 +61,15 @@ blocks, or fails an iteration.
 
 ## Quick start
 
-The examples run against a local S3-compatible store; [`examples/README.md`](examples/README.md) has
-the commands that bring it up and run one.
+The S3 examples run against a local S3-compatible store, and the Azure and Google Cloud Storage ones
+against the emulator of their own provider; [`examples/README.md`](examples/README.md) has the
+commands that bring each up and run one.
 
 The shape of it:
 
 ```rust
 use jobmanager::prelude::*;
-use jobmanager::{JobStateCodecKind, S3StorageConfig};
+use jobmanager::S3Config;
 
 let manager = JobsManager::builder()
     .s3(s3_config)
@@ -105,11 +106,19 @@ attempt budgets, and adaptive scheduling. See [its README](examples/README.md) f
 
 ## Storage backends
 
-| Builder call | Backend |
-|---|---|
-| `.s3(config)` | production; one object per job, conditional writes for concurrency, read cache in front |
-| `.s3(config).no_cache()` | the same without the cache |
-| `.in_memory()` | tests and examples; conditional writes as above, but only the current iteration and nothing survives the process |
+| Builder call     | Feature                          | Backend                                                                                                          |
+|------------------|----------------------------------|------------------------------------------------------------------------------------------------------------------|
+| `.s3(config)`    | `storage-s3`, in the default set | production; one object per job, conditional writes for concurrency, read cache in front                          |
+| `.azure(config)` | `storage-azure`                  | production, the same shape over an Azure Blob Storage container                                                  |
+| `.gcs(config)`   | `storage-gcs`                    | production, the same shape over a Google Cloud Storage bucket                                                    |
+| `.no_cache()`    | any of the above                 | the same backend without the cache                                                                               |
+| `.in_memory()`   | none                             | tests and examples; conditional writes as above, but only the current iteration and nothing survives the process |
+
+Every object backend answers a read, a write and a listing page with one request each, and pays the
+same number of requests for every scenario a pool repeats — the register of those numbers is
+`make quota`. Deleting old iterations is where they part: S3 carries a whole sweep in one
+multi-object delete, Azure and Google Cloud Storage send one delete per iteration, and `make quota`
+states that difference as separate numbers.
 
 The backends themselves are not part of the public API — the builder constructs and wires them,
 including the registry they read job settings from.
@@ -117,19 +126,32 @@ including the registry they read job settings from.
 Job state serializes as either JSON (readable, debuggable) or CBOR (compact) — pick with
 `JobStateCodecKind`.
 
+## Features
+
+| Feature         | Default | What it brings                                                                                         |
+|-----------------|---------|--------------------------------------------------------------------------------------------------------|
+| `storage-s3`    | yes     | `.s3(config)` and the `aws-sdk-s3` / `aws-config` dependencies                                         |
+| `storage-azure` | no      | `.azure(config)` and the `azure_storage_blob` / `azure_core` dependencies                              |
+| `storage-gcs`   | no      | `.gcs(config)` and the `google-cloud-auth` / `reqwest` / `http` dependencies                           |
+| `metrics-otel`  | no      | `OtelMetrics`, the `MetricsSink` implementation over OpenTelemetry, and the `opentelemetry` dependency |
+
+At least one storage backend feature must be selected — `storage-s3`, `storage-azure` or
+`storage-gcs` — and a selection with none fails to compile with a message saying so. `.in_memory()`
+needs no feature, but it persists nothing, so it is not a backend to run work on. Pick the features
+explicitly like this:
+
+```toml
+jobmanager = { git = "...", default-features = false, features = ["storage-s3", "metrics-otel"] }
+```
+
 ## Observability
 
 Job and task durations, storage latency, cache hit rate, task takeovers, and save-conflict retries
 are written to a `MetricsSink`. Nothing is recorded until one is registered with
-`.metrics(...)`. `OtelMetrics` implements it on top of OpenTelemetry and lives behind the
-`metrics-otel` feature, which is off by default — it takes a `Meter` you own, so it is only useful
-to a consumer that already depends on `opentelemetry`:
+`.metrics(...)`. `OtelMetrics` implements it on top of OpenTelemetry and takes a `Meter` you own, so
+the `metrics-otel` feature is only useful to a consumer that already depends on `opentelemetry`.
 
-```toml
-jobmanager = { git = "...", features = ["metrics-otel"] }
-```
-
-Without the feature the `opentelemetry` dependency is absent from your tree while every measurement
+Without that feature the `opentelemetry` dependency is absent from your tree while every measurement
 still reaches a sink of your own.
 
 ## Status
@@ -144,7 +166,7 @@ jobmanager = { git = "https://github.com/icegatetech/jobmanager", rev = "..." }
 ## Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Tests need Docker — they start a real S3-compatible
-container.
+container, and an emulator per provider for the Azure and Google Cloud Storage backends.
 
 ## License
 
