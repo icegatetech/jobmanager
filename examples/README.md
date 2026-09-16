@@ -21,12 +21,28 @@ cargo run --example simple_job_gcs --no-default-features --features storage-gcs
 so neither the compose file nor a bucket is involved.
 
 Each example writes under its own `state_prefix`, so they never read each other's state. Set
-`RUST_LOG` to change the log filter.
+`RUST_LOG` to change the log filter — on the command line, or in the settings file below.
 
-`support/` holds the connection details and the tracing setup shared by all of them. It is a
+`harness/` holds the connection details and the tracing setup shared by all of them. It is a
 directory without a `main.rs`, so cargo does not build it as an example of its own. An example that
 caps its iterations nests one more path segment under its prefix, unique per run — otherwise its
 second run would find the iteration budget already spent and wait forever.
+
+## Against a provider's own service
+
+Every connection detail is a setting with a default naming the local store, so the store an example
+runs against is changed by a file rather than by the example. Copy the settings file and edit what
+your run needs — `.env` is ignored by git, which is where a real key belongs:
+
+```bash
+cp examples/.env.example examples/.env
+```
+
+[`.env.example`](.env.example) is the list: every setting beside the default it overrides, and what
+each provider asks for that its emulator does not.
+
+An example writing to a provider's service pays that provider for every poll it makes, and these
+examples poll until they are stopped.
 
 ## Start here
 

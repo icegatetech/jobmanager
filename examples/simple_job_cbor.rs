@@ -13,7 +13,7 @@ use jobmanager::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    harness::init_tracing();
+    harness::init_tracing()?;
 
     tracing::info!("Starting simple job example with CBOR-encoded state");
 
@@ -21,7 +21,7 @@ async fn main() -> Result<()> {
         .s3(harness::build_s3_config_with_codec(
             "simple-cbor",
             JobStateCodecKind::Cbor,
-        ))
+        )?)
         .job("simple job", |j| {
             j.add_task(
                 TaskDefinition::new("my task code", Duration::from_secs(5)),

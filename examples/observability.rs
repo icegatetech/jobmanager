@@ -102,11 +102,11 @@ struct WorkInput {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    harness::init_tracing();
+    harness::init_tracing()?;
 
     let job_code = JobCode::new("observability");
     let manager = JobsManager::builder()
-        .s3(harness::build_run_scoped_s3_config("observability"))
+        .s3(harness::build_run_scoped_s3_config("observability")?)
         .workers(3)
         .metrics(Arc::new(LoggingMetrics))
         .job(job_code.clone(), |j| {

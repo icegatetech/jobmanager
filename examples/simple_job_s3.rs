@@ -8,12 +8,12 @@ use jobmanager::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    harness::init_tracing();
+    harness::init_tracing()?;
 
     tracing::info!("Starting simple job example");
 
     let manager = JobsManager::builder()
-        .s3(harness::build_s3_config("simple-json"))
+        .s3(harness::build_s3_config("simple-json")?)
         .job("simple job", |j| {
             j.add_task(
                 TaskDefinition::new("my task code", Duration::from_secs(5)),

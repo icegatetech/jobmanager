@@ -9,12 +9,12 @@ use jobmanager::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    harness::init_tracing();
+    harness::init_tracing()?;
 
     tracing::info!("Starting simple job example on gcs");
 
     let manager = JobsManager::builder()
-        .gcs(harness::build_gcs_config("simple-json-gcs"))
+        .gcs(harness::build_gcs_config("simple-json-gcs")?)
         .job("simple job", |j| {
             j.add_task(
                 TaskDefinition::new("my task code", Duration::from_secs(5)),

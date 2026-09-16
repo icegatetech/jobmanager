@@ -51,13 +51,13 @@ impl BlobStore {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    harness::init_tracing();
+    harness::init_tracing()?;
 
     let blobs = Arc::new(BlobStore::new());
     let job_code = JobCode::new("payload-by-reference");
 
     let manager = JobsManager::builder()
-        .s3(harness::build_run_scoped_s3_config("payload-by-reference"))
+        .s3(harness::build_run_scoped_s3_config("payload-by-reference")?)
         .workers(2)
         .job(job_code.clone(), |j| {
             j.max_iterations(1);

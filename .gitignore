@@ -4,3 +4,5 @@ target/
 .claude/
 .tmp
 *.iml
+# Connection details of a real store, per developer. `examples/.env.example` is the tracked copy.
+examples/.env

@@ -213,6 +213,10 @@ dashmap = "6.1"
 
 [dev-dependencies]
 testcontainers = { version = "0.27", features = ["blocking"] }
+
+# Lets the examples read `examples/.env`, so the store they run against is changed by editing a file
+# rather than the shared harness. A dev-dependency: nothing in `src/` reads an environment file.
+dotenvy = "0.15"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tokio = { version = "1.48.0", features = ["rt-multi-thread", "net", "process", "signal"] }
 

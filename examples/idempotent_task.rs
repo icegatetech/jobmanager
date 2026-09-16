@@ -69,7 +69,7 @@ impl CommittedOffset {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    harness::init_tracing();
+    harness::init_tracing()?;
 
     let committed = Arc::new(CommittedOffset::new());
     // Counts executions rather than reading the task's attempts: a takeover spends no attempt, so
@@ -78,7 +78,7 @@ async fn main() -> Result<()> {
     let job_code = JobCode::new("idempotent-task");
 
     let manager = JobsManager::builder()
-        .s3(harness::build_run_scoped_s3_config("idempotent-task"))
+        .s3(harness::build_run_scoped_s3_config("idempotent-task")?)
         // Two workers, so the second one can take the expired task over.
         .workers(2)
         .poll_interval(Duration::from_millis(300))

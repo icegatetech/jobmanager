@@ -52,10 +52,10 @@ const TASK_MAX_LIFETIME: Duration = TASK_TIMEOUT.saturating_mul(TASK_LIFETIME_IN
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    harness::init_tracing();
+    harness::init_tracing()?;
 
     let manager = JobsManager::builder()
-        .s3(harness::build_s3_config("graceful-shutdown"))
+        .s3(harness::build_s3_config("graceful-shutdown")?)
         .job("graceful shutdown", |j| {
             j.max_iterations(1);
             j.add_task(
