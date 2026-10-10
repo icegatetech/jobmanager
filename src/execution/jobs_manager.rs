@@ -3,26 +3,35 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
-use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
+use uuid::Uuid;
 
+use crate::core::error::{Error, InternalError};
+use crate::core::job::JobCode;
+use crate::core::registry::JobRegistry;
+use crate::execution::builder::JobsManagerBuilder;
 use crate::execution::job_cleaner::JobIterationStarted;
-use crate::{
-    Error, FinishedIterationSink, InternalError, JobCleaner, JobCleanerConfig, JobCode, JobRegistry,
-    JobsManagerBuilder, MetricsSink, Storage, Worker, WorkerConfig,
-};
+use crate::execution::job_cleaner::{JobCleaner, JobCleanerConfig};
+use crate::execution::scheduler::{PollScheduler, PollSchedulerConfig};
+use crate::execution::worker::{FinishedIterationSink, Worker, WorkerContext};
+use crate::execution::worker_pool::WorkerPool;
+use crate::infra::metrics::MetricsSink;
+use crate::infra::retrier::RetrierConfig;
+use crate::storage::Storage;
 
 /// Settings a [`JobsManager`] is assembled with, filled in by [`JobsManagerBuilder`] - the only way
 /// a caller reaches them.
 #[derive(Clone)]
 pub struct JobsManagerConfig {
-    /// Number of worker tasks to spawn. Each worker executes at most one task at a time, so
+    /// Number of workers in the pool. Each worker runs at most one task start or one execution at a time, so
     /// this bounds how many tasks run concurrently across all jobs. Must be at least 1;
     /// [`JobsManager::new`] rejects 0.
     pub worker_count: usize,
-    /// Polling interval, backoff, and retry policy applied by every spawned worker.
-    pub worker_config: WorkerConfig,
+    /// Polling settings of the pool's poll schedule.
+    pub scheduler_config: PollSchedulerConfig,
+    /// Retry policy every worker applies to its storage operations.
+    pub retrier_config: RetrierConfig,
     /// Old-iteration cleanup behavior.
     pub cleaner_config: JobCleanerConfig,
 }
@@ -31,7 +40,8 @@ impl Default for JobsManagerConfig {
     fn default() -> Self {
         Self {
             worker_count: 1,
-            worker_config: WorkerConfig::default(),
+            scheduler_config: PollSchedulerConfig::default(),
+            retrier_config: RetrierConfig::default(),
             cleaner_config: JobCleanerConfig::default(),
         }
     }
@@ -54,8 +64,8 @@ pub struct JobsManager {
 /// before the pool does: the number stays readable, so a wait called after the iteration finished
 /// still sees it.
 ///
-/// The workers must be its only owners: a sender held elsewhere would leave a wait hanging after
-/// the last worker died.
+/// The pool's workers must be its only owners: a sender held elsewhere would leave a wait hanging
+/// after the pool stopped.
 pub(crate) struct FinishedIterations {
     last_finished_by_job: HashMap<JobCode, watch::Sender<Option<u64>>>,
 }
@@ -219,7 +229,7 @@ impl JobsManagerHandle {
                     // Error is already logged inside the worker task.
                 }
                 Err(e) => {
-                    error!("Worker panicked: {}", e);
+                    error!("A task of the worker pool panicked: {}", e);
                 }
             }
         }
@@ -235,8 +245,6 @@ impl Drop for JobsManagerHandle {
 }
 
 impl JobsManager {
-    const WORKER_START_STAGGER_MS: u64 = 50;
-
     /// Starts describing a pool: its storage backend, its jobs, and their executors.
     ///
     /// This is the entry point of the crate; see [`JobsManagerBuilder`].
@@ -254,7 +262,7 @@ impl JobsManager {
     /// # Errors
     ///
     /// Returns an error if `config.worker_count` is 0. The polling settings are checked by
-    /// [`WorkerConfig`] as they are set, so one that arrives here is already valid.
+    /// [`PollSchedulerConfig`] as they are set, so one that arrives here is already valid.
     pub(crate) fn new(
         storage: Arc<dyn Storage>,
         config: JobsManagerConfig,
@@ -275,6 +283,8 @@ impl JobsManager {
     }
 
     /// Start worker tasks and return a handle for lifecycle control.
+    // `Result` is part of the public signature; dropping it is a breaking change.
+    #[allow(clippy::unnecessary_wraps)]
     pub fn start(&self) -> Result<JobsManagerHandle, Error> {
         info!("Starting jobmanager with {} workers", self.config.worker_count);
 
@@ -284,40 +294,31 @@ impl JobsManager {
         // Goes out of scope here, leaving the workers as its only owners.
         let finished_iterations = Arc::new(FinishedIterations::new(self.job_registry.list_jobs()));
         let cleanup_notifier = self.spawn_job_cleaner(&mut join_set, &cancel_token);
+        let scheduler = PollScheduler::new(self.job_registry.list_jobs(), self.config.scheduler_config.clone());
 
-        // TODO(med): dynamic worker count - reduce workers when there's little work to minimize storage
-        // requests
-        for i in 0..self.config.worker_count {
-            let worker = Worker::new(
-                Arc::clone(&self.job_registry),
-                Arc::clone(&self.storage),
-                self.config.worker_config.clone(),
-                self.metrics.clone(),
-                cleanup_notifier.clone(),
-                Arc::clone(&finished_iterations) as Arc<dyn FinishedIterationSink>,
-            );
+        let worker_context = WorkerContext {
+            job_registry: Arc::clone(&self.job_registry),
+            storage: Arc::clone(&self.storage),
+            metrics: self.metrics.clone(),
+            iteration_notifier: cleanup_notifier,
+            finished_iterations: Arc::clone(&finished_iterations) as Arc<dyn FinishedIterationSink>,
+        };
 
-            let token = cancel_token.clone();
-            let worker_id = i;
-            let worker_start_delay = worker_start_delay(i, Self::WORKER_START_STAGGER_MS);
-
-            join_set.spawn(async move {
-                if !worker_start_delay.is_zero() {
-                    tokio::select! {
-                        () = token.cancelled() => return Ok(()),
-                        () = sleep(worker_start_delay) => {}
-                    }
-                }
-
-                // TODO(high): decide what to do with the panic, now the worker is dying.
-                if let Err(e) = worker.start(token).await {
-                    tracing::error!("Worker {} stopped with error: {}", worker_id, e);
-                    Err(e)
-                } else {
-                    Ok(())
-                }
-            });
-        }
+        let workers = (0..self.config.worker_count)
+            .map(|_| {
+                Worker::new(
+                    Uuid::new_v4(),
+                    self.config.retrier_config.clone(),
+                    worker_context.clone(),
+                )
+            })
+            .collect();
+        let worker_pool = WorkerPool::new(scheduler, workers);
+        let pool_token = cancel_token.clone();
+        join_set.spawn(async move {
+            worker_pool.run(pool_token).await;
+            Ok(())
+        });
 
         Ok(JobsManagerHandle {
             cancel_token,
@@ -330,12 +331,13 @@ impl JobsManager {
     /// Spawns the [`JobCleaner`] into the pool and returns the sender workers report iterations
     /// through, or `None` when cleanup is disabled.
     ///
-    /// The cleaner starts without the workers' stagger delay: its start-up reconciliation should
-    /// run before the first iterations arrive. The channel is sized for five passes of every
-    /// worker over every job, so a burst of reports arriving while the start-up reconciliation is
-    /// still running does not push reports out. A cleaner that falls further behind than that has
-    /// its reports dropped by [`Worker`], and the tail they would have trimmed waits for the next
-    /// start-up reconciliation. Every factor is at least 1, so the capacity never reaches the
+    /// The channel holds five reports per job, so a burst of reports arriving while the start-up
+    /// reconciliation is still running does not push reports out. The worker count is no factor: a
+    /// report is sent only by the worker whose write of the iteration start was `SaveOutcome::Saved`,
+    /// so each iteration is reported once however many workers the pool has, and the iterations of
+    /// one job start one after another. A cleaner that falls further behind than that has its
+    /// reports dropped by [`Worker`], and the tail they would have trimmed waits for the next
+    /// start-up reconciliation. A pool holds at least one job, so the capacity never reaches the
     /// value `mpsc::channel` panics on.
     fn spawn_job_cleaner(
         &self,
@@ -347,7 +349,7 @@ impl JobsManager {
             return None;
         }
 
-        let (sender, receiver) = mpsc::channel(self.config.worker_count * self.job_registry.list_jobs().len() * 5);
+        let (sender, receiver) = mpsc::channel(self.job_registry.jobs_count() * 5);
         let cleaner = JobCleaner::new(
             Arc::clone(&self.job_registry),
             Arc::clone(&self.storage),
@@ -366,11 +368,6 @@ impl JobsManager {
 
         Some(sender)
     }
-}
-
-fn worker_start_delay(worker_index: usize, stagger_ms: u64) -> std::time::Duration {
-    let worker_index_u64 = u64::try_from(worker_index).unwrap_or(u64::MAX);
-    std::time::Duration::from_millis(worker_index_u64.saturating_mul(stagger_ms))
 }
 
 #[cfg(test)]

@@ -5,12 +5,15 @@ use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
 use super::common::provider_harness::{ProviderHarness, ProviderStorageRequest};
+use crate::core::job::{JobCode, JobDefinition, JobDefinitionId, JobStatus, TaskLimits};
+use crate::core::registry::JobRegistry;
 use crate::core::task::SkipCause;
-use crate::{
-    DependencyTolerance, JobCode, JobDefinition, JobDefinitionId, JobDefinitionRegistry, JobRegistry,
-    JobStateCodecKind, JobStatus, JobsManagerConfig, NoopMetrics, Task, TaskCode, TaskDefinition, TaskLimits,
-    TaskOutcome, TaskRef, TaskRetry, task_fn,
-};
+use crate::core::task::{DependencyTolerance, Task, TaskCode, TaskDefinition, TaskRef, TaskRetry};
+use crate::execution::executor::{TaskOutcome, task_fn};
+use crate::execution::jobs_manager::JobsManagerConfig;
+use crate::infra::metrics::NoopMetrics;
+use crate::storage::JobDefinitionRegistry;
+use crate::storage::state_codec::JobStateCodecKind;
 
 const DETECT_TASK_CODE: &str = "detect";
 const RULES_TASK_CODE: &str = "rules";
@@ -94,7 +97,7 @@ async fn run_branch_outcome_round_trip(
 
     let config = JobsManagerConfig {
         worker_count: 1,
-        worker_config: super::common::build_worker_config(Duration::from_millis(20), Duration::ZERO),
+        scheduler_config: super::common::build_poll_schedule_config(Duration::from_millis(20), Duration::ZERO),
         ..Default::default()
     };
     let mut manager_env = ManagerEnv::new(Arc::clone(&storage), config, Arc::clone(&job_registry), vec![job_def])?;
@@ -159,7 +162,7 @@ async fn run_branch_outcome_round_trip(
 
 /// The one task of the stored iteration carrying `code`, or an error naming what was missing - the
 /// description gives every task a code of its own.
-fn find_task_by_code<'a>(job: &'a crate::Job, code: &str) -> Result<&'a Task, Box<dyn std::error::Error>> {
+fn find_task_by_code<'a>(job: &'a crate::core::job::Job, code: &str) -> Result<&'a Task, Box<dyn std::error::Error>> {
     job.tasks_as_iter()
         .find(|task| task.code() == &TaskCode::new(code))
         .ok_or_else(|| format!("the stored iteration must hold its '{code}' task").into())

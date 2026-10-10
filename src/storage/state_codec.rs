@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::storage::state::StoredJob;
-use crate::{StorageError, StorageResult};
+use crate::storage::{StorageError, StorageResult};
 
 pub(crate) trait JobStateCodec: Send + Sync {
     fn file_extension(&self) -> &'static str;

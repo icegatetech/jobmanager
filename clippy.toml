@@ -40,6 +40,10 @@ single-char-binding-names-threshold = 4
 # Rust 2024 edition needs 1.85+.
 msrv = "1.94.1"
 
+# Lint the public API like the rest: the crate is pre-1.0, so a breaking rename or signature change
+# is allowed, and the default exempts exactly the items a consumer sees.
+avoid-breaking-exported-api = false
+
 # Literal representation
 literal-representation-threshold = 65536
 

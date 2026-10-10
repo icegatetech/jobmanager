@@ -4,7 +4,9 @@ use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use uuid::Uuid;
 
-use crate::{Error, ImmutableTask, Job, JobError, TaskCode, TaskDefinition, TaskRef, TaskRetry};
+use crate::core::error::{Error, JobError};
+use crate::core::job::Job;
+use crate::core::task::{ImmutableTask, TaskCode, TaskDefinition, TaskRef, TaskRetry};
 
 // TODO(med): add method to complete all job iterations
 // TODO(med): add method to complete current job iteration
@@ -268,7 +270,8 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::*;
-    use crate::{JobCode, JobDefinition, JobDefinitionId, TaskLimits, TaskOutcome, task_fn};
+    use crate::core::job::{JobCode, JobDefinition, JobDefinitionId, TaskLimits};
+    use crate::execution::executor::{TaskOutcome, task_fn};
 
     /// Longest a test waits for a thread it expects to make progress. A wait that runs out is a
     /// failure with a diagnostic, never a silently passing test.

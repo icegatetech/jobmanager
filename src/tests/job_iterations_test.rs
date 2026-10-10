@@ -11,11 +11,15 @@ use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
 use super::common::provider_harness::{ProviderHarness, ProviderStorageRequest};
+use crate::core::job::{JobCode, JobDefinition, JobDefinitionId, JobStatus, TaskLimits};
+use crate::core::registry::JobRegistry;
+use crate::core::task::{TaskCode, TaskDefinition};
+use crate::execution::executor::{TaskOutcome, task_fn};
+use crate::execution::jobs_manager::JobsManagerConfig;
+use crate::infra::metrics::NoopMetrics;
+use crate::storage::JobDefinitionRegistry;
 use crate::storage::in_memory::InMemoryStorage;
-use crate::{
-    JobCode, JobDefinition, JobDefinitionId, JobDefinitionRegistry, JobRegistry, JobStateCodecKind, JobStatus,
-    JobsManagerConfig, NoopMetrics, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, task_fn,
-};
+use crate::storage::state_codec::JobStateCodecKind;
 
 /// A job completes an iteration and starts the next one until its budget is spent, and the stored
 /// state ends at the last iteration rather than at a job created anew.
@@ -62,7 +66,10 @@ async fn run_job_iterations(harness: &dyn ProviderHarness) -> Result<(), Box<dyn
 
     let config = JobsManagerConfig {
         worker_count: 1,
-        worker_config: super::common::build_worker_config(Duration::from_millis(100), Duration::from_millis(10)),
+        scheduler_config: super::common::build_poll_schedule_config(
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+        ),
         ..Default::default()
     };
 
@@ -138,11 +145,11 @@ async fn test_job_iterations_honors_next_start_at() -> Result<(), Box<dyn std::e
     let storage = Arc::new(InMemoryStorage::new());
     let config = JobsManagerConfig {
         worker_count: 1,
-        worker_config: super::common::build_worker_config(Duration::from_millis(20), Duration::ZERO),
+        scheduler_config: super::common::build_poll_schedule_config(Duration::from_millis(20), Duration::ZERO),
         ..Default::default()
     };
     let mut manager_env = ManagerEnv::new(
-        storage.clone() as Arc<dyn crate::Storage>,
+        storage.clone() as Arc<dyn crate::storage::Storage>,
         config,
         Arc::clone(&job_registry),
         vec![job_def],

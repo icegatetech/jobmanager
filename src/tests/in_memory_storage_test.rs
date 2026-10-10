@@ -7,11 +7,13 @@ use super::common::{
     manager_env::ManagerEnv,
     storage_wrapper::{ContendingStorage, CountingStorage},
 };
+use crate::core::job::{Job, JobCode, JobDefinition, JobDefinitionId, JobStatus, TaskLimits};
+use crate::core::registry::JobRegistry;
+use crate::core::task::{TaskCode, TaskDefinition};
+use crate::execution::executor::{TaskOutcome, task_fn};
+use crate::execution::jobs_manager::JobsManagerConfig;
+use crate::storage::Storage;
 use crate::storage::in_memory::InMemoryStorage;
-use crate::{
-    Job, JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStatus, JobsManagerConfig, Storage, TaskCode,
-    TaskDefinition, TaskLimits, TaskOutcome, task_fn,
-};
 
 /// Bound on the only wait in this file: a job that never finishes fails the test with a diagnostic
 /// instead of hanging the suite.
@@ -208,7 +210,7 @@ async fn a_worker_merges_and_retries_its_save_after_a_conflict() -> Result<(), B
 
     let config = JobsManagerConfig {
         worker_count: 1,
-        worker_config: super::common::build_worker_config(Duration::from_millis(10), Duration::ZERO),
+        scheduler_config: super::common::build_poll_schedule_config(Duration::from_millis(10), Duration::ZERO),
         ..Default::default()
     };
     let mut manager_env = ManagerEnv::new(
@@ -235,7 +237,10 @@ async fn a_worker_merges_and_retries_its_save_after_a_conflict() -> Result<(), B
 
     let stored = backend.get_job(&job_code, &CancellationToken::new()).await?;
     assert_eq!(*stored.status(), JobStatus::Completed);
-    let outputs: Vec<&[u8]> = stored.tasks_as_iter().map(crate::ImmutableTask::get_output).collect();
+    let outputs: Vec<&[u8]> = stored
+        .tasks_as_iter()
+        .map(crate::core::task::ImmutableTask::get_output)
+        .collect();
     assert_eq!(
         outputs,
         vec![b"done".as_slice()],

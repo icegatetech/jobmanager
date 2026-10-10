@@ -10,11 +10,14 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
+use crate::core::error::Error;
+use crate::core::job::{Job, JobCode, JobDefinition, JobDefinitionId, JobStatus, TaskLimits};
+use crate::core::registry::JobRegistry;
+use crate::core::task::{TaskCode, TaskDefinition, TaskRetry, TaskStatus};
+use crate::execution::executor::{TaskExecutor, TaskOutcome, task_fn};
+use crate::execution::jobs_manager::JobsManagerConfig;
+use crate::storage::Storage;
 use crate::storage::in_memory::InMemoryStorage;
-use crate::{
-    Error, Job, JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStatus, JobsManagerConfig, Storage, TaskCode,
-    TaskDefinition, TaskExecutor, TaskLimits, TaskOutcome, TaskRetry, TaskStatus, task_fn,
-};
 
 /// How long a test waits for the single iteration to finish.
 const ITERATION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -29,7 +32,7 @@ fn task_definition() -> TaskDefinition {
 
 /// Starts a one-job pool around `executor` on the in-memory backend.
 ///
-/// The object store is not the subject here - what is, is how [`crate::Worker`] reads the outcome an
+/// The object store is not the subject here - what is, is how [`crate::execution::worker::Worker`] reads the outcome an
 /// executor returned - so the backend only has to refuse the same conflicting writes, which the
 /// in-memory one does.
 fn start_one_task_job(
@@ -50,7 +53,7 @@ fn start_one_task_job(
 
     let config = JobsManagerConfig {
         worker_count: 1,
-        worker_config: super::common::build_worker_config(Duration::from_millis(20), Duration::ZERO),
+        scheduler_config: super::common::build_poll_schedule_config(Duration::from_millis(20), Duration::ZERO),
         ..Default::default()
     };
 

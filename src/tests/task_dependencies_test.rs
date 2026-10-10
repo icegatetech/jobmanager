@@ -9,11 +9,13 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
+use crate::core::job::{JobCode, JobDefinition, JobDefinitionId, JobStatus, TaskLimits};
+use crate::core::registry::JobRegistry;
+use crate::core::task::{TaskCode, TaskDefinition};
+use crate::execution::executor::{TaskOutcome, task_fn};
+use crate::execution::jobs_manager::JobsManagerConfig;
+use crate::storage::Storage;
 use crate::storage::in_memory::InMemoryStorage;
-use crate::{
-    JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStatus, JobsManagerConfig, Storage, TaskCode,
-    TaskDefinition, TaskLimits, TaskOutcome, task_fn,
-};
 
 /// `TestTaskDependencies` verifies that task dependencies are respected.
 ///
@@ -114,7 +116,10 @@ async fn test_task_dependencies() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Start manager
     let config = JobsManagerConfig {
         worker_count: 3,
-        worker_config: super::common::build_worker_config(Duration::from_millis(50), Duration::from_millis(10)),
+        scheduler_config: super::common::build_poll_schedule_config(
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+        ),
         ..Default::default()
     };
 

@@ -10,11 +10,15 @@ use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
 use super::common::provider_harness::{ProviderHarness, ProviderStorageRequest};
+use crate::core::job::{JobCode, JobDefinition, JobDefinitionId, JobStatus, TaskLimits};
+use crate::core::registry::JobRegistry;
+use crate::core::task::{TaskCode, TaskDefinition, TaskRetry};
+use crate::execution::executor::{TaskOutcome, task_fn};
+use crate::execution::jobs_manager::JobsManagerConfig;
+use crate::infra::metrics::NoopMetrics;
 use crate::storage::in_memory::InMemoryStorage;
-use crate::{
-    JobCode, JobDefinition, JobDefinitionId, JobDefinitionRegistry, JobRegistry, JobStateCodecKind, JobStatus,
-    JobsManagerConfig, NoopMetrics, Storage, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, TaskRetry, task_fn,
-};
+use crate::storage::state_codec::JobStateCodecKind;
+use crate::storage::{JobDefinitionRegistry, Storage};
 
 /// Bound on every wait here, so a job that never finishes fails the test instead of hanging it.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -60,7 +64,10 @@ async fn run_a_terminal_refusal_is_not_retried(
         .await?;
     let config = JobsManagerConfig {
         worker_count: 1,
-        worker_config: super::common::build_worker_config(Duration::from_millis(100), Duration::from_millis(10)),
+        scheduler_config: super::common::build_poll_schedule_config(
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+        ),
         ..Default::default()
     };
     let mut env = ManagerEnv::new(storage, config, Arc::clone(&job_registry), vec![job_def])?;
@@ -121,7 +128,7 @@ async fn a_terminal_refusal_declared_through_the_handle_is_not_retried() -> Resu
     let storage = Arc::new(InMemoryStorage::new()) as Arc<dyn Storage>;
     let config = JobsManagerConfig {
         worker_count: 1,
-        worker_config: super::common::build_worker_config(Duration::from_millis(20), Duration::ZERO),
+        scheduler_config: super::common::build_poll_schedule_config(Duration::from_millis(20), Duration::ZERO),
         ..Default::default()
     };
     let mut env = ManagerEnv::new(Arc::clone(&storage), config, Arc::clone(&job_registry), vec![job_def])?;

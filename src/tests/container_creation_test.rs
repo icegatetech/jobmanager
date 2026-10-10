@@ -19,9 +19,10 @@ mod on_s3 {
     use std::sync::Arc;
 
     use super::{ABSENT_CONTAINER_NAME, PRESENT_CONTAINER_NAME};
+    use crate::infra::metrics::NoopMetrics;
+    use crate::storage::s3::{S3Backend, S3Config};
     use crate::tests::common::UnusedJobRegistry;
     use crate::tests::common::s3_container::S3TestContainer;
-    use crate::{NoopMetrics, S3Backend, S3Config};
 
     /// S3 client of the test itself, so what the backend did is read without going through it.
     async fn build_bucket_probe(store: &S3TestContainer) -> aws_sdk_s3::Client {
@@ -161,9 +162,10 @@ mod on_gcs {
     use std::sync::Arc;
 
     use super::{ABSENT_CONTAINER_NAME, PRESENT_CONTAINER_NAME};
+    use crate::infra::metrics::NoopMetrics;
+    use crate::storage::gcs::{GcsBackend, GcsConfig};
     use crate::tests::common::UnusedJobRegistry;
     use crate::tests::common::gcs_container::GcsTestContainer;
-    use crate::{GcsBackend, GcsConfig, NoopMetrics};
 
     /// Project the backend creates the bucket under. The emulator accepts any name.
     const CREATION_PROJECT_ID: &str = "jobmanager-container-creation";
@@ -308,9 +310,10 @@ mod on_azure {
     use std::sync::Arc;
 
     use super::{ABSENT_CONTAINER_NAME, PRESENT_CONTAINER_NAME};
+    use crate::infra::metrics::NoopMetrics;
+    use crate::storage::azure::{AzureBackend, AzureConfig};
     use crate::tests::common::UnusedJobRegistry;
     use crate::tests::common::azure_container::AzureTestContainer;
-    use crate::{AzureBackend, AzureConfig, NoopMetrics};
 
     fn build_config(store: &AzureTestContainer, container_name: &str) -> AzureConfig {
         AzureConfig::new(

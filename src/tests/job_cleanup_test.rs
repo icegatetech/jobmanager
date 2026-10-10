@@ -16,15 +16,18 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
+use crate::core::error::InternalError;
+use crate::core::job::{Job, JobCode, JobDefinition, JobDefinitionId, TaskLimits};
+use crate::core::registry::JobRegistry;
+use crate::core::task::{TaskCode, TaskDefinition};
+use crate::execution::executor::{TaskOutcome, task_fn};
 use crate::execution::job_cleaner::JobIterationStarted;
+use crate::execution::job_cleaner::{JobCleaner, JobCleanerConfig};
+use crate::execution::jobs_manager::JobsManagerConfig;
+use crate::infra::metrics::NoopMetrics;
+use crate::storage::cached::CachedStorage;
 use crate::storage::in_memory::InMemoryStorage;
-use crate::{
-    CachedStorage, InternalError, Job, JobCleaner, JobCleanerConfig, JobCode, JobDefinition, JobDefinitionId,
-    JobRegistry, JobsManagerConfig, NoopMetrics, Storage, StorageError, TaskCode, TaskDefinition, TaskLimits,
-    TaskOutcome,
-    storage::{JobMeta, StorageResult},
-    task_fn,
-};
+use crate::storage::{JobMeta, Storage, StorageError, StorageResult};
 
 /// Bound on every wait in this file: cleanup is asynchronous, so tests poll for its effect instead
 /// of assuming a delay is enough.
@@ -374,7 +377,7 @@ fn build_recording_storage(storage: RecordingCleanupStorage) -> Arc<RecordingCle
 /// A retry policy short enough that an exhausted cleanup is observable inside a test.
 fn cleaner_config(max_attempts: usize) -> JobCleanerConfig {
     JobCleanerConfig {
-        retrier_config: crate::RetrierConfig {
+        retrier_config: crate::infra::retrier::RetrierConfig {
             max_attempts,
             rand_delay: Duration::from_millis(1),
             delays: vec![Duration::from_millis(1)],
@@ -844,7 +847,7 @@ async fn test_started_iterations_delete_one_iteration_each_without_listing() -> 
         Arc::clone(&storage) as Arc<dyn Storage>,
         JobsManagerConfig {
             worker_count: 1,
-            worker_config: super::common::build_worker_config(Duration::from_millis(20), Duration::ZERO),
+            scheduler_config: super::common::build_poll_schedule_config(Duration::from_millis(20), Duration::ZERO),
             ..Default::default()
         },
         Arc::clone(&job_registry),
@@ -884,8 +887,8 @@ async fn test_full_cleanup_channel_drops_reports_and_keeps_worker_iterating() ->
     let job_code = JobCode::new("cleanup_full_channel_job");
     let job_def = build_job_definition(&job_code, iteration_retention)?.with_max_iterations(max_iterations)?;
     let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
-    // One worker and one job give the report channel a capacity of 5 - `JobsManager` sizes it for
-    // five passes of every worker over every job - and the closed gate parks the cleaner on its
+    // One job gives the report channel a capacity of 5 - `JobsManager` sizes it for five reports
+    // per job - and the closed gate parks the cleaner on its
     // first delete. Iterations 2 to 5 are reported and consumed at once, because a retention window
     // of 5 leaves them nothing to delete; iterations 6 to 12 all leave the window, so seven reports
     // compete for the parked cleaner plus five queued slots and at least one of them is dropped.
@@ -901,7 +904,7 @@ async fn test_full_cleanup_channel_drops_reports_and_keeps_worker_iterating() ->
         Arc::clone(&storage) as Arc<dyn Storage>,
         JobsManagerConfig {
             worker_count: 1,
-            worker_config: super::common::build_worker_config(Duration::from_millis(20), Duration::ZERO),
+            scheduler_config: super::common::build_poll_schedule_config(Duration::from_millis(20), Duration::ZERO),
             ..Default::default()
         },
         Arc::clone(&job_registry),
@@ -972,7 +975,7 @@ async fn test_cleanup_through_cached_storage_reaches_the_backend() -> Result<(),
         Arc::clone(&cached_storage),
         JobsManagerConfig {
             worker_count: 1,
-            worker_config: super::common::build_worker_config(Duration::from_millis(20), Duration::ZERO),
+            scheduler_config: super::common::build_poll_schedule_config(Duration::from_millis(20), Duration::ZERO),
             ..Default::default()
         },
         Arc::clone(&job_registry),
@@ -1013,11 +1016,12 @@ async fn test_disabled_cleaner_deletes_no_iteration() -> Result<(), Box<dyn std:
         Arc::clone(&storage) as Arc<dyn Storage>,
         JobsManagerConfig {
             worker_count: 1,
-            worker_config: super::common::build_worker_config(Duration::from_millis(20), Duration::ZERO),
+            scheduler_config: super::common::build_poll_schedule_config(Duration::from_millis(20), Duration::ZERO),
             cleaner_config: JobCleanerConfig {
                 enabled: false,
                 ..Default::default()
             },
+            ..Default::default()
         },
         Arc::clone(&job_registry),
         vec![job_def],

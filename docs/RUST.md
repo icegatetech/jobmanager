@@ -26,11 +26,23 @@ crate-wide precisely so that promise stays honest.
   storage) — the detail can change and the name would then lie. Disambiguate similar things by
   subject, not by mechanism. An implementation detail belongs in a name only where it is literally
   that thing's responsibility at its layer.
+- **Rust's naming conventions**, restated from the Rust API Guidelines and RFC 430: constructors
+  are `new`, `with_<thing>`, `from_<source>`; a conversion is `as_` (cheap, borrows), `to_`
+  (costly), `into_` (consumes `self`); a getter is named after what it returns, never `get_`
+  (`code()`), its setter `set_<field>`; iterators are `iter`, `iter_mut`, `into_iter`.
+  `make clippy` rejects a prefix taking the wrong receiver; the getter rule has no lint.
 - **Functions and methods MUST be `verb_object`** — a verb (the action) plus the noun it acts on.
-  **NEVER** name a function with a bare adjective, participle, or state word: there is no object and
-  the call site is unreadable. Banned: `ensure_staged`, `rebuild_stale`, `validate_inner`. Good:
-  `pick_task_to_execute`, `save_job`, `find_job_meta`. Constructors keep Rust convention: `new`,
-  `with_<thing>`, `from_<source>`, `try_<verb>`.
+  **NEVER** put an adjective, participle, or state word in the object's place — the call site then
+  names nothing. Banned: `ensure_staged`, `rebuild_stale`, `validate_inner`. Good:
+  `pick_task_to_execute`, `save_job`, `find_job_meta`.
+- **The receiver can be the object.** A `self` method is a bare verb when the verb acts on the
+  receiver as a whole (`task.start(..)`, `handle.close()`) or is the one responsibility the type is
+  named after (`executor.execute(ctx)`, `codec.serialize(job)`) — and only while the type has no
+  second method with that verb. A verb acting on what the receiver holds or finds names it
+  (`storage.save_job(..)`); a function without `self` always names its object. Rust has no such
+  rule for methods; this one is the crate's own.
+- **Builder setters** are named after the setting (`workers(count)`). `try_<verb>` is the fallible
+  form of `<verb>` (`try_claim_due_job`), as in std.
 - **The verb MUST NOT lie about behavior.** `restore` must not create, `find` must not write.
 - **Variables, arguments, and fields MUST be nouns** naming what the value *is* — the type is
   already in the signature, so the name carries meaning, not the type. An adjective is allowed
@@ -39,7 +51,8 @@ crate-wide precisely so that promise stays honest.
 - **Booleans MUST read as predicates:** `is_expired`, `has_started_task`, `should_poll_job`.
 - **No abbreviations** except domain-canonical ones (`id`, `uri`, `etag`, `iter_num`). The same
   concept **MUST** share one name across the codebase; different concepts **MUST NOT** share a name.
-- **Acid test:** the name **MUST** be understandable at the call site without reading the body.
+- **Acid test:** the name, read at the call site with its receiver and arguments, **MUST** be
+  understandable without reading the body.
 
 ## Documentation
 
@@ -125,6 +138,11 @@ crate-wide precisely so that promise stays honest.
   it through the type's own configuration; a second, test-only way to set the same field is the
   parallel mechanism this file forbids. An exception needs an explicit agreement and a comment
   saying why the configuration path could not carry it.
+- **A function belongs to the type whose behavior it implements.** A helper called only from the
+  methods of one type is an associated function of that type (`fn name(..)` inside its `impl`,
+  without `self` when it needs none) — never a free function beside it. A free function is allowed only when no single
+  type owns it — it serves several types of the module, or it is a module-level conversion with no subject of its own —
+  and its doc comment names the types it serves.
 
 ## Async and concurrency
 
@@ -168,6 +186,9 @@ crate-wide precisely so that promise stays honest.
 ## Imports and dependencies
 
 - **MUST** avoid wildcard imports except in test modules (`use super::*`).
+- Inside the crate, import an item by the path of the module that owns it
+  (e.g. `crate::core::job::Job`), never by a short path re-exported from `lib.rs`: the path is what
+  shows which layer the importing module depends on.
 - Import grouping is `StdExternalCrate`, sorted by rustfmt — do not hand-order imports.
 - New dependencies need a version constraint in `Cargo.toml` and a reason. This is a published
   library, so every added dependency lands in every consumer's tree; prefer the standard library
@@ -177,16 +198,16 @@ crate-wide precisely so that promise stays honest.
 ## Features and conditional compilation
 
 - `#[cfg(feature = ...)]` says the item is dead in a selection without that feature. `src/lib.rs`
-refuses a selection with no backend by `compile_error!`, so `any(<every backend feature>)` is true
-wherever the crate compiles: it drops nothing and adds one list to edit per added backend. An item
-every backend needs carries no `#[cfg]`; the list of backend features is written once, on that
-`compile_error!`.
-  - **An `any(...)` names the features whose backends use the item** — `normalize_etag`, for example,
-    which `GcsBackend` never calls. Its doc comment says which backend leaves it out and why.
-  - **A backend module carries its `#[cfg]` on the `mod` line** in `storage/mod.rs`; the items inside
-    carry none. A `use` carries the `#[cfg]` of the code that names the imported item, none where
-    that code is unconditional.
-  - **`not(feature = ...)` is for tests** asserting what a selection without the feature does not carry.
+  refuses a selection with no backend by `compile_error!`, so `any(<every backend feature>)` is true
+  wherever the crate compiles: it drops nothing and adds one list to edit per added backend. An item
+  every backend needs carries no `#[cfg]`; the list of backend features is written once, on that
+  `compile_error!`.
+    - **An `any(...)` names the features whose backends use the item** — `normalize_etag`, for example,
+      which `GcsBackend` never calls. Its doc comment says which backend leaves it out and why.
+    - **A backend module carries its `#[cfg]` on the `mod` line** in `storage/mod.rs`; the items inside
+      carry none. A `use` carries the `#[cfg]` of the code that names the imported item, none where
+      that code is unconditional.
+    - **`not(feature = ...)` is for tests** asserting what a selection without the feature does not carry.
 
 ## Version control
 

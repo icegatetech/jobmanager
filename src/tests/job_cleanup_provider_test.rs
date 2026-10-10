@@ -8,11 +8,19 @@ use super::common::manager_env::ManagerEnv;
 use super::common::persist_completed_iterations;
 use super::common::provider_harness::{ProviderHarness, ProviderStorageRequest};
 use super::common::storage_wrapper::CountingStorage;
-use crate::{
-    FinishedIterationSink, JobCleaner, JobCleanerConfig, JobCode, JobDefinition, JobDefinitionId,
-    JobDefinitionRegistry, JobRegistry, JobStateCodecKind, JobsManagerConfig, MetricsSink, NoopMetrics, Storage,
-    StorageError, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, Worker, task_fn,
-};
+use crate::core::job::{JobCode, JobDefinition, JobDefinitionId, TaskLimits};
+use crate::core::registry::JobRegistry;
+use crate::core::task::{TaskCode, TaskDefinition};
+use crate::execution::executor::{TaskOutcome, task_fn};
+use crate::execution::job_cleaner::{JobCleaner, JobCleanerConfig};
+use crate::execution::jobs_manager::JobsManagerConfig;
+use crate::execution::scheduler::PollScheduler;
+use crate::execution::worker::{FinishedIterationSink, Worker, WorkerContext};
+use crate::execution::worker_pool::WorkerPool;
+use crate::infra::metrics::{MetricsSink, NoopMetrics};
+use crate::infra::retrier::RetrierConfig;
+use crate::storage::state_codec::JobStateCodecKind;
+use crate::storage::{JobDefinitionRegistry, Storage, StorageError};
 
 /// Sink for the tests here, which drive workers without a manager and do not observe iteration ends.
 struct DiscardedIterations;
@@ -190,17 +198,27 @@ async fn run_concurrent_workers_report_each_started_iteration_once(
     let finished_iterations = Arc::new(DiscardedIterations) as Arc<dyn FinishedIterationSink>;
     let cancel_token = CancellationToken::new();
     let mut worker_tasks = JoinSet::new();
+    // A pool of its own for every worker, which makes three pools of one: the starts of an
+    // iteration are serialized within a pool, so only a race between pools reports one twice.
     for _ in 0..3 {
+        let poll_schedule_config = super::common::build_poll_schedule_config(Duration::from_millis(20), Duration::ZERO);
         let worker = Worker::new(
-            Arc::clone(&job_registry),
-            Arc::clone(&storage) as Arc<dyn Storage>,
-            super::common::build_worker_config(Duration::from_millis(20), Duration::ZERO),
-            Arc::new(NoopMetrics),
-            Some(sender.clone()),
-            Arc::clone(&finished_iterations),
+            uuid::Uuid::new_v4(),
+            RetrierConfig::default(),
+            WorkerContext {
+                job_registry: Arc::clone(&job_registry),
+                storage: Arc::clone(&storage) as Arc<dyn Storage>,
+                metrics: Arc::new(NoopMetrics),
+                iteration_notifier: Some(sender.clone()),
+                finished_iterations: Arc::clone(&finished_iterations),
+            },
         );
-        let worker_token = cancel_token.clone();
-        worker_tasks.spawn(async move { worker.start(worker_token).await });
+        let worker_pool = WorkerPool::new(
+            PollScheduler::new(job_registry.list_jobs(), poll_schedule_config),
+            vec![worker],
+        );
+        let pool_token = cancel_token.clone();
+        worker_tasks.spawn(worker_pool.run(pool_token));
     }
 
     // The diagnostics are turned into a `String` here rather than carried as an error: the value
@@ -210,7 +228,7 @@ async fn run_concurrent_workers_report_each_started_iteration_once(
         .map_err(|e| e.to_string());
     cancel_token.cancel();
     while let Some(worker_result) = worker_tasks.join_next().await {
-        worker_result??;
+        worker_result?;
     }
     wait_result?;
 
@@ -460,7 +478,10 @@ async fn run_restarted_manager_continues_iterations_after_cleanup(
     let first_storage = build_storage(harness, &first_registry, codec).await?;
     let manager_config = JobsManagerConfig {
         worker_count: 1,
-        worker_config: super::common::build_worker_config(Duration::from_millis(50), Duration::from_millis(10)),
+        scheduler_config: super::common::build_poll_schedule_config(
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+        ),
         ..Default::default()
     };
 
@@ -509,7 +530,7 @@ mod on_s3 {
         run_repeated_delete_of_absent_iterations_succeeds, run_restarted_manager_continues_iterations_after_cleanup,
         run_startup_reconciliation_trims_tail_left_by_earlier_run,
     };
-    use crate::JobStateCodecKind;
+    use crate::storage::state_codec::JobStateCodecKind;
     use crate::tests::common::provider_harness::S3ProviderHarness;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -589,7 +610,7 @@ mod on_azure {
         run_repeated_delete_of_absent_iterations_succeeds, run_restarted_manager_continues_iterations_after_cleanup,
         run_startup_reconciliation_trims_tail_left_by_earlier_run,
     };
-    use crate::JobStateCodecKind;
+    use crate::storage::state_codec::JobStateCodecKind;
     use crate::tests::common::provider_harness::AzureProviderHarness;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -671,7 +692,7 @@ mod on_gcs {
         run_repeated_delete_of_absent_iterations_succeeds, run_restarted_manager_continues_iterations_after_cleanup,
         run_startup_reconciliation_trims_tail_left_by_earlier_run,
     };
-    use crate::JobStateCodecKind;
+    use crate::storage::state_codec::JobStateCodecKind;
     use crate::tests::common::provider_harness::GcsProviderHarness;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

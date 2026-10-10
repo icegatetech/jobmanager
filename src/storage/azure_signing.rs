@@ -20,7 +20,7 @@ use azure_core::{
     time::{OffsetDateTime, to_rfc7231},
 };
 
-use crate::{StorageError, StorageResult};
+use crate::storage::{StorageError, StorageResult};
 
 /// Signs every request with the storage account key, in the `SharedKey` scheme the Blob service
 /// documents under "Authorize with Shared Key".

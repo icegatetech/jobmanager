@@ -9,12 +9,15 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
+use crate::core::error::Error;
+use crate::core::job::{JobCode, JobDefinition, JobDefinitionId, JobStatus, TaskLimits};
+use crate::core::registry::JobRegistry;
 use crate::core::task::DEFAULT_MAX_ATTEMPTS;
+use crate::core::task::{TaskCode, TaskDefinition};
+use crate::execution::executor::{TaskExecutor, TaskOutcome, task_fn};
+use crate::execution::jobs_manager::JobsManagerConfig;
+use crate::storage::Storage;
 use crate::storage::in_memory::InMemoryStorage;
-use crate::{
-    Error, JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStatus, JobsManagerConfig, Storage, TaskCode,
-    TaskDefinition, TaskExecutor, TaskLimits, TaskOutcome, task_fn,
-};
 
 /// Attempt budget the failing task is given explicitly in the dependency test.
 const MAX_ATTEMPTS: u32 = 2;
@@ -28,9 +31,12 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 fn manager_config() -> JobsManagerConfig {
     JobsManagerConfig {
         worker_count: 1,
-        worker_config: super::common::build_worker_config(Duration::from_millis(20), Duration::from_millis(5))
-            .with_max_poll_interval(Duration::from_millis(50))
-            .expect("a ceiling above the poll interval is accepted"),
+        scheduler_config: super::common::build_poll_schedule_config(
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+        )
+        .with_max_poll_interval(Duration::from_millis(50))
+        .expect("a ceiling above the poll interval is accepted"),
         ..Default::default()
     }
 }
@@ -54,7 +60,7 @@ async fn wait_for_job<F>(
     predicate: F,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
-    F: Fn(&crate::Job) -> bool,
+    F: Fn(&crate::core::job::Job) -> bool,
 {
     let cancel_token = CancellationToken::new();
     let start = tokio::time::Instant::now();

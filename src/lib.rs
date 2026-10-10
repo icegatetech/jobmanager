@@ -1,9 +1,9 @@
 //! Distributed job and task manager that keeps its state in an object store.
 //!
 //! A *job* is a named unit of work made of one or more *tasks*. Each [`JobsManager`] runs a pool
-//! of workers that poll a storage backend for pickable jobs, execute their tasks one at a time
-//! per worker (multiple workers may run different tasks of the same job concurrently), and
-//! persist the updated state back to storage.
+//! of workers that poll a storage backend for pickable jobs on one schedule shared by the pool,
+//! execute their tasks one at a time per worker (multiple workers may run different tasks of the
+//! same job concurrently), and persist the updated state back to storage.
 //!
 //! Job state is a single object per job, so any number of workers can operate on the same job
 //! without an external lock service: an object backend round-trips it as one object and resolves
@@ -144,55 +144,36 @@ pub use opentelemetry::metrics::Meter;
 pub use tokio_util::sync::CancellationToken;
 pub use uuid::Uuid;
 
-// `pub` re-exports form the crate's public API; `pub(crate)` ones are short paths used
-// across the crate. rustfmt sorts them into one alphabetical list, so the two kinds are
-// interleaved on purpose — read the visibility, not the position.
+// These re-exports form the crate's public API. Code inside the crate imports by the owner
+// module's path, never through them (see docs/RUST.md, "Imports and dependencies").
 //
 // A type is public only if the public API can produce or consume it. Everything reachable solely
 // through `JobsManagerBuilder`'s internals - the registry, the job definition, the assembled
 // backends, the config structs the builder fills in - stays crate-internal, because the builder
 // took over their construction and `Storage` itself is not public (see `storage/mod.rs`).
 pub use crate::core::error::{Error, Result, TaskError};
-pub(crate) use crate::core::error::{InternalError, JobError};
 pub use crate::core::job::{DEFAULT_ITERATION_RETENTION, IterationVerdict, JobCode, TaskLimits};
-pub(crate) use crate::core::job::{IterationStep, Job, JobDefinition, JobDefinitionId, JobStatus, TaskPickup};
-pub(crate) use crate::core::registry::JobRegistry;
 pub use crate::core::task::{
-    DEFAULT_LIFETIME_MULTIPLIER, DEFAULT_MAX_ATTEMPTS, DependencyTolerance, ImmutableTask, TaskCode, TaskDefinition,
-    TaskRef, TaskResolution, TaskRetry,
+    DEFAULT_LIFETIME_MULTIPLIER, DEFAULT_MAX_ATTEMPTS, DependencyTolerance, FAILED_TASK_RETRY_PAUSE, ImmutableTask,
+    TaskCode, TaskDefinition, TaskRef, TaskResolution, TaskRetry,
 };
-pub(crate) use crate::core::task::{RestoredTask, Task, TaskStatus};
 pub use crate::execution::builder::{JobBuilder, JobsManagerBuilder};
 pub use crate::execution::executor::{TaskExecutor, TaskOutcome, TaskResult, task_fn};
-pub(crate) use crate::execution::job_cleaner::JobCleaner;
 pub use crate::execution::job_cleaner::JobCleanerConfig;
 pub use crate::execution::job_handle::JobHandle;
-pub(crate) use crate::execution::jobs_manager::JobsManagerConfig;
 pub use crate::execution::jobs_manager::{JobsManager, JobsManagerHandle};
 pub use crate::execution::task_context::TaskContext;
-pub(crate) use crate::execution::worker::{FinishedIterationSink, Worker, WorkerConfig};
 pub use crate::infra::metrics::{MetricsSink, NoopMetrics};
 #[cfg(feature = "metrics-otel")]
 pub use crate::infra::metrics_otel::OtelMetrics;
 pub use crate::infra::retrier::RetrierConfig;
-pub(crate) use crate::infra::retrier::{Retrier, RetryStep};
-pub(crate) use crate::storage::JobDefinitionRegistry;
-#[cfg(feature = "storage-azure")]
-pub(crate) use crate::storage::azure::AzureBackend;
 #[cfg(feature = "storage-azure")]
 pub use crate::storage::azure::AzureConfig;
-pub(crate) use crate::storage::cached::CachedStorage;
-#[cfg(feature = "storage-gcs")]
-pub(crate) use crate::storage::gcs::GcsBackend;
 #[cfg(feature = "storage-gcs")]
 pub use crate::storage::gcs::GcsConfig;
-pub(crate) use crate::storage::in_memory::InMemoryStorage;
-#[cfg(feature = "storage-s3")]
-pub(crate) use crate::storage::s3::S3Backend;
 #[cfg(feature = "storage-s3")]
 pub use crate::storage::s3::S3Config;
 pub use crate::storage::state_codec::JobStateCodecKind;
-pub(crate) use crate::storage::{JobMeta, Storage, StorageError, StorageResult};
 
 #[cfg(test)]
 mod tests;

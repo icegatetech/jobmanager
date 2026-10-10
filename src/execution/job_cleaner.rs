@@ -4,10 +4,11 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::{
-    InternalError, JobCode, JobRegistry, Retrier, RetrierConfig, RetryStep, Storage, StorageError, StorageResult,
-    storage::JobMeta,
-};
+use crate::core::error::InternalError;
+use crate::core::job::JobCode;
+use crate::core::registry::JobRegistry;
+use crate::infra::retrier::{Retrier, RetrierConfig, RetryStep};
+use crate::storage::{JobMeta, Storage, StorageError, StorageResult};
 
 /// Behavior of the background cleanup that deletes iterations which fell out of a job's retention
 /// window, set through [`JobsManagerBuilder::cleaner`](crate::JobsManagerBuilder::cleaner).
@@ -53,7 +54,7 @@ pub(crate) struct JobIterationStarted {
 }
 
 /// Deletes the state objects of iterations that fell outside their job's retention window
-/// ([`JobDefinition::with_iteration_retention`](crate::JobDefinition::with_iteration_retention)).
+/// ([`JobDefinition::with_iteration_retention`](crate::core::job::JobDefinition::with_iteration_retention)).
 ///
 /// # Guarantees
 ///
@@ -293,8 +294,10 @@ impl JobCleaner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::job::{Job, JobDefinition, JobDefinitionId, TaskLimits};
+    use crate::core::task::{TaskCode, TaskDefinition};
+    use crate::execution::executor::{TaskOutcome, task_fn};
     use crate::storage::in_memory::InMemoryStorage;
-    use crate::{Job, JobDefinition, JobDefinitionId, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, task_fn};
 
     /// Storage whose deletes always fail with the given error; every other call is delegated, so
     /// the double stays an implementation of the production trait.

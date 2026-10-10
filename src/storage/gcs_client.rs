@@ -16,7 +16,7 @@ use google_cloud_auth::credentials::{CacheableResource, Credentials};
 use reqwest::{Client, RequestBuilder, Url, redirect};
 use serde::Deserialize;
 
-use crate::Error;
+use crate::core::error::Error;
 
 /// Header the store names an object's generation in. Answered by a read of the object's bytes,
 /// where the body is the state rather than the metadata, so it is the only place the new version

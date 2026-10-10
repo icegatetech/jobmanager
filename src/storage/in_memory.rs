@@ -4,8 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
+use crate::core::job::{Job, JobCode};
 use crate::storage::state::copy_persisted_state;
-use crate::{Job, JobCode, JobMeta, Storage, StorageError, StorageResult};
+use crate::storage::{JobMeta, Storage, StorageError, StorageResult};
 
 /// In-memory `Storage` for tests and examples: holds the current iteration of every job it was
 /// given, and no history.
@@ -172,7 +173,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::{JobStatus, TaskLimits};
+    use crate::core::job::{JobStatus, TaskLimits};
 
     /// Builds a storage holding one saved job, and returns the meta naming its current state.
     async fn storage_with_saved_job() -> (InMemoryStorage, JobMeta, Job) {

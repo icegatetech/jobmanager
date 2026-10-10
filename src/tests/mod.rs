@@ -26,6 +26,7 @@ mod job_iterations_test;
 mod list_boundary_azure_test;
 mod metrics_sink_test;
 mod poll_scheduling_test;
+mod pool_poll_schedule_test;
 mod request_quota_test;
 mod shutdown_test;
 mod simple_job_test;

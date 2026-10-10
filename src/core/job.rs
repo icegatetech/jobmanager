@@ -7,13 +7,13 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::core::error::{Error, JobError};
 use crate::core::task::{DependencyVerdict, SkipCause, TaskAvailability, TaskRefKind};
-use crate::{
-    Error, ImmutableTask, JobError, Task, TaskCode, TaskDefinition, TaskExecutor, TaskRef, TaskRetry, TaskStatus,
-};
+use crate::core::task::{ImmutableTask, Task, TaskCode, TaskDefinition, TaskRef, TaskRetry, TaskStatus};
+use crate::execution::executor::TaskExecutor;
 
 /// Job identifier used to select a job definition and persisted state.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct JobCode(String);
 
@@ -80,8 +80,9 @@ pub(crate) enum JobStatus {
     /// Terminal for the iteration in the same way as `Completed`, and re-enterable only via
     /// `Started`. A failed *task* moves the iteration here only once it is terminal - its attempt
     /// budget or its maximum lifetime spent, or the refusal declared final by its executor - and
-    /// nothing else is executing: until then it stays pickable and is retried within the same
-    /// iteration. A terminal failure nobody answered for ends the iteration here wherever it
+    /// nothing else is executing: until then it stays in the iteration and is retried within it
+    /// once [`FAILED_TASK_RETRY_PAUSE`](crate::core::task::FAILED_TASK_RETRY_PAUSE) has passed since
+    /// its refusal. A terminal failure nobody answered for ends the iteration here wherever it
     /// surfaces: on the task that refused, or on a task skipped because of it.
     Failed,
 }
@@ -165,28 +166,39 @@ impl JobStatus {
 pub(crate) enum TaskPickup {
     /// This task is ready to be started by the caller.
     Ready(Uuid),
-    /// Nothing can be started right now: the remaining tasks are either
-    /// in flight or blocked behind tasks that are still running.
-    Waiting,
+    /// Nothing can be started right now: the remaining tasks are either in flight, blocked behind
+    /// tasks that are still running, or failed and waiting out their retry pause.
+    Waiting {
+        /// The earliest moment a failed task of the iteration may be started again; `None` when no
+        /// failed task waits for one.
+        retry_at: Option<DateTime<Utc>>,
+    },
     /// The iteration was closed by the verdict the domain settled it with, which the job itself
     /// now carries. The caller must persist the job so the scheduler starts the next iteration,
     /// which replans from scratch.
     IterationSettled,
 }
 
-/// What a job's state allows to be done about its next iteration.
+/// Whether a job's current iteration is open, and what a closed one allows of the next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IterationStep {
+pub(crate) enum IterationStatus {
     /// The current iteration is open: its tasks can be taken into work.
-    IterationInProgress,
-    /// The current iteration ended and the next one is allowed now.
-    NextIterationReady,
-    /// The current iteration ended; the next one is allowed no earlier than the given moment.
-    NextIterationDueAt(DateTime<Utc>),
-    /// The current iteration ended and the job spent its iteration budget.
-    IterationBudgetSpent,
-    /// The current iteration ended, but no moment for the next one can be derived.
-    NextIterationUnscheduled,
+    InProgress,
+    /// The current iteration ended.
+    Closed(NextIterationStatus),
+}
+
+/// What a closed iteration allows to be done about the next one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NextIterationStatus {
+    /// The next iteration is allowed now.
+    Ready,
+    /// The next iteration is allowed no earlier than the given moment.
+    DueAt(DateTime<Utc>),
+    /// The job spent its iteration budget.
+    BudgetSpent,
+    /// No moment for the next iteration can be derived.
+    Unscheduled,
 }
 
 /// Payload size caps applied to every task of a job.
@@ -309,7 +321,7 @@ impl JobDefinition {
         })
     }
 
-    /// Code identifying this job, unique within its [`JobRegistry`](crate::JobRegistry) and used
+    /// Code identifying this job, unique within its [`JobRegistry`](crate::core::registry::JobRegistry) and used
     /// as the storage prefix of the job's persisted state.
     pub const fn code(&self) -> &JobCode {
         &self.code
@@ -638,7 +650,7 @@ pub(crate) struct Job {
     completed_at: Option<DateTime<Utc>>,
     next_start_at: Option<DateTime<Utc>>,
     metadata: HashMap<String, serde_json::Value>,
-    version: String,
+    version: String,                                 // TODO(high): remove and use in storage only
     max_iterations: Option<u64>,                     // None = unlimited
     iteration_interval: Option<std::time::Duration>, // None = no minimum delay between iterations
     task_limits: TaskLimits,
@@ -895,7 +907,11 @@ impl Job {
             return Ok(TaskPickup::Ready(task_id));
         }
 
-        Ok(TaskPickup::Waiting)
+        // A walk of its own rather than a part of the search above: that one stops at the first
+        // pickable task, and only a pass that found none pays for visiting them all.
+        Ok(TaskPickup::Waiting {
+            retry_at: self.find_earliest_retry_at(),
+        })
     }
 
     /// Identifier of a task a worker may start right now, if the iteration holds one.
@@ -908,6 +924,28 @@ impl Job {
             .iter()
             .find(|(_, task)| task.can_be_picked_up_at(now))
             .map(|(task_id, _)| *task_id)
+    }
+
+    fn find_earliest_retry_at(&self) -> Option<DateTime<Utc>> {
+        let now = Utc::now();
+        self.tasks_by_id
+            .values()
+            .filter_map(|task| match task.check_availability_at(now) {
+                TaskAvailability::AwaitingRetry { retry_at } => Some(retry_at),
+                TaskAvailability::Pickable | TaskAvailability::ExpiredPastLifetime | TaskAvailability::Unavailable => {
+                    None
+                }
+            })
+            .min()
+    }
+
+    /// Whether the iteration holds a task a worker may start right now: a `Todo` task, a `Started`
+    /// one past its deadline, or a failed one whose retry pause has passed. A failed task still
+    /// within the pause is left out, and so is a `Blocked` task whose dependencies have settled but
+    /// which no pass has unblocked yet.
+    pub(crate) fn has_pickable_task(&self) -> bool {
+        let now = Utc::now();
+        self.tasks_by_id.values().any(|task| task.can_be_picked_up_at(now))
     }
 
     /// Fails every task that outlived its maximum lifetime, which is the one resolution a worker
@@ -1010,12 +1048,12 @@ impl Job {
         matches!(self.status, JobStatus::Started | JobStatus::Running)
     }
 
-    /// Earliest moment the domain allows the next iteration to begin - the step of
-    /// [`Self::pick_iteration_step`] that derives a moment, and the only caller of this.
+    /// Earliest moment the domain allows the next iteration to begin - the part of
+    /// [`Self::find_iteration_status`] that derives a moment, and the only caller of this.
     ///
-    /// `None` where no moment follows from the state: the two cases the step has already ruled out
-    /// by the time it asks, and an interval that is not expressible as a moment. The moment itself
-    /// may lie in the past, which is what the step reads as "allowed now".
+    /// `None` where no moment follows from the state: the two cases the status has already ruled
+    /// out by the time it asks, and an interval that is not expressible as a moment. The moment
+    /// itself may lie in the past, which is what the status reads as "allowed now".
     fn next_iteration_start_at(&self) -> Option<DateTime<Utc>> {
         if !self.is_processed() || self.is_iteration_limit_reached() {
             return None;
@@ -1035,7 +1073,8 @@ impl Job {
         })
     }
 
-    /// What this state allows to be done about the next iteration.
+    /// Whether the current iteration is open, and what this state allows to be done about the next
+    /// one once it is not.
     ///
     /// A spent iteration budget outranks a due moment: a job at its limit starts no further
     /// iteration, however long ago the moment for one passed.
@@ -1043,23 +1082,26 @@ impl Job {
     // not compensated for - a lagging one delays the start of an iteration by the whole difference,
     // a leading one loses the write it races. The cost is a delay and not a wrong state, because
     // every write stays conditional.
-    pub(crate) fn pick_iteration_step(&self) -> IterationStep {
+    pub(crate) fn find_iteration_status(&self) -> IterationStatus {
         if !self.is_processed() {
-            return IterationStep::IterationInProgress;
+            return IterationStatus::InProgress;
         }
         if self.is_iteration_limit_reached() {
-            return IterationStep::IterationBudgetSpent;
+            return IterationStatus::Closed(NextIterationStatus::BudgetSpent);
         }
 
-        match self.next_iteration_start_at() {
-            Some(due) if Utc::now() >= due => IterationStep::NextIterationReady,
-            Some(due) => IterationStep::NextIterationDueAt(due),
-            None => IterationStep::NextIterationUnscheduled,
-        }
+        IterationStatus::Closed(match self.next_iteration_start_at() {
+            Some(due) if Utc::now() >= due => NextIterationStatus::Ready,
+            Some(due) => NextIterationStatus::DueAt(due),
+            None => NextIterationStatus::Unscheduled,
+        })
     }
 
     fn is_ready_to_next_iteration(&self) -> bool {
-        matches!(self.pick_iteration_step(), IterationStep::NextIterationReady)
+        matches!(
+            self.find_iteration_status(),
+            IterationStatus::Closed(NextIterationStatus::Ready)
+        )
     }
 
     // State mutations
@@ -1124,7 +1166,16 @@ impl Job {
         self.skip_unreachable_tasks(now)?;
         self.unblock_satisfied_tasks(now)?;
 
-        if self.has_started_task() || self.tasks_as_iter().any(|task| task.can_be_picked_up_at(now)) {
+        // A failed task waiting out its retry pause keeps the iteration open exactly as a pickable
+        // one does: the pause decides when it starts again, not whether it does.
+        if self.has_started_task()
+            || self.tasks_as_iter().any(|task| {
+                matches!(
+                    task.check_availability_at(now),
+                    TaskAvailability::Pickable | TaskAvailability::AwaitingRetry { .. }
+                )
+            })
+        {
             return Ok(false);
         }
 
@@ -1273,7 +1324,7 @@ impl Job {
     /// carried: that copy never saw the tasks the stored state holds. A task another worker created
     /// through [`JobHandle::add_task`](crate::JobHandle::add_task) would stay `Todo` inside an
     /// iteration closed over a state that did not hold it, and it would never run - the next poll
-    /// reads [`Self::pick_iteration_step`] and moves the job to an iteration planned from scratch.
+    /// reads [`Self::find_iteration_status`] and moves the job to an iteration planned from scratch.
     ///
     /// # Errors
     ///
@@ -1642,9 +1693,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::DependencyTolerance;
-    use crate::core::task::{DEFAULT_MAX_ATTEMPTS, RestoredTask};
-    use crate::{TaskOutcome, TaskRef, task_fn};
+    use crate::core::task::DependencyTolerance;
+    use crate::core::task::TaskRef;
+    use crate::core::task::{DEFAULT_MAX_ATTEMPTS, FAILED_TASK_RETRY_PAUSE, RestoredTask};
+    use crate::execution::executor::{TaskOutcome, task_fn};
 
     fn noop_executor() -> Arc<dyn TaskExecutor> {
         task_fn(|_ctx| async { Ok(TaskOutcome::empty()) })
@@ -2665,7 +2717,7 @@ mod tests {
         );
 
         let picked = job.pick_task_to_execute(&worker_id).unwrap();
-        assert_eq!(picked, TaskPickup::Waiting);
+        assert_eq!(picked, TaskPickup::Waiting { retry_at: None });
     }
 
     #[test]
@@ -3091,7 +3143,7 @@ mod tests {
         );
 
         let picked = job.pick_task_to_execute(&worker_id).unwrap();
-        assert_eq!(picked, TaskPickup::Waiting);
+        assert_eq!(picked, TaskPickup::Waiting { retry_at: None });
         assert!(matches!(job.status(), JobStatus::Running));
     }
 
@@ -3559,7 +3611,7 @@ mod tests {
     fn an_open_iteration_steps_to_the_iteration_in_progress() {
         let job = scheduled_job(410, JobStatus::Running, 1, None);
 
-        assert_eq!(job.pick_iteration_step(), IterationStep::IterationInProgress);
+        assert_eq!(job.find_iteration_status(), IterationStatus::InProgress);
     }
 
     /// The budget outranks the moment, and the case that proves it is the one where both apply: a
@@ -3569,26 +3621,38 @@ mod tests {
         let mut job = scheduled_job(420, JobStatus::Completed, 2, Some(2));
         job.set_next_start_at(Utc::now() - Duration::seconds(1));
 
-        assert_eq!(job.pick_iteration_step(), IterationStep::IterationBudgetSpent);
+        assert_eq!(
+            job.find_iteration_status(),
+            IterationStatus::Closed(NextIterationStatus::BudgetSpent)
+        );
     }
 
     /// The three cases around the moment itself: ahead of it the caller is told to wait for it,
     /// at it and past it the next iteration is allowed.
     #[test]
-    fn the_step_follows_the_due_moment_across_its_boundary() {
+    fn the_status_follows_the_due_moment_across_its_boundary() {
         let mut job = scheduled_job(430, JobStatus::Completed, 1, None);
 
         let ahead = Utc::now() + Duration::seconds(60);
         job.set_next_start_at(ahead);
-        assert_eq!(job.pick_iteration_step(), IterationStep::NextIterationDueAt(ahead));
+        assert_eq!(
+            job.find_iteration_status(),
+            IterationStatus::Closed(NextIterationStatus::DueAt(ahead))
+        );
 
         // Read back a nanosecond later at the earliest, which is what "at the moment" amounts to
         // for a rule comparing against the wall clock.
         job.set_next_start_at(Utc::now());
-        assert_eq!(job.pick_iteration_step(), IterationStep::NextIterationReady);
+        assert_eq!(
+            job.find_iteration_status(),
+            IterationStatus::Closed(NextIterationStatus::Ready)
+        );
 
         job.set_next_start_at(Utc::now() - Duration::seconds(1));
-        assert_eq!(job.pick_iteration_step(), IterationStep::NextIterationReady);
+        assert_eq!(
+            job.find_iteration_status(),
+            IterationStatus::Closed(NextIterationStatus::Ready)
+        );
     }
 
     /// A completed iteration whose next one is scheduled by the given interval, which is the only
@@ -3620,7 +3684,10 @@ mod tests {
     fn an_interval_that_names_no_moment_steps_to_nothing_scheduled() {
         let job = job_with_iteration_interval(440, std::time::Duration::MAX);
 
-        assert_eq!(job.pick_iteration_step(), IterationStep::NextIterationUnscheduled);
+        assert_eq!(
+            job.find_iteration_status(),
+            IterationStatus::Closed(NextIterationStatus::Unscheduled)
+        );
     }
 
     /// The interval an iteration is counted from is the second way a moment can be out of range: it
@@ -3635,7 +3702,10 @@ mod tests {
 
         let job = job_with_iteration_interval(450, three_hundred_thousand_years);
 
-        assert_eq!(job.pick_iteration_step(), IterationStep::NextIterationUnscheduled);
+        assert_eq!(
+            job.find_iteration_status(),
+            IterationStatus::Closed(NextIterationStatus::Unscheduled)
+        );
     }
 
     #[test]
@@ -6028,5 +6098,209 @@ mod tests {
         let task = job.get_task_arc(&task_id).unwrap();
         assert!(matches!(task.status(), TaskStatus::Completed));
         assert_eq!(task.output().len(), 4);
+    }
+
+    /// A task refused at `refused_at` with attempts and lifetime to spare.
+    fn failed_task_refused(id: Uuid, code: &str, refused_at: DateTime<Utc>) -> Task {
+        Task::restore(RestoredTask {
+            id,
+            code: TaskCode::new(code),
+            status: TaskStatus::Failed,
+            started_at: Some(refused_at),
+            completed_at: Some(refused_at),
+            lifetime_deadline_at: Some(Utc::now() + Duration::seconds(600)),
+            attempt: 1,
+            ..restored_task_fields()
+        })
+    }
+
+    /// Checked by dropping the `can_be_picked_up_at` condition: the tests below that expect
+    /// nothing pickable then find a task.
+    #[test]
+    fn a_todo_task_is_pickable() {
+        let job = running_job(vec![make_task(
+            Uuid::from_u128(1),
+            "todo",
+            TaskStatus::Todo,
+            Vec::new(),
+        )]);
+
+        assert!(job.has_pickable_task());
+    }
+
+    /// A failed task is retried no sooner than its retry pause, so within it the task is no work a
+    /// worker can take at once. Checked by dropping the pause from `Task::check_availability_at`.
+    #[test]
+    fn a_failed_task_within_its_retry_pause_is_not_pickable() {
+        let job = running_job(vec![failed_task_refused(Uuid::from_u128(1), "failed", Utc::now())]);
+
+        assert!(!job.has_pickable_task());
+    }
+
+    #[test]
+    fn a_failed_task_past_its_retry_pause_is_pickable() {
+        let job = running_job(vec![failed_task_refused(
+            Uuid::from_u128(1),
+            "failed",
+            Utc::now() - FAILED_TASK_RETRY_PAUSE - Duration::seconds(1),
+        )]);
+
+        assert!(job.has_pickable_task());
+    }
+
+    /// A start past the deadline is a takeover, and a takeover is work a worker can take at once.
+    #[test]
+    fn a_started_task_past_its_deadline_is_pickable() {
+        let job = running_job(vec![make_expired_started_task(
+            Uuid::from_u128(1),
+            1,
+            DEFAULT_MAX_ATTEMPTS,
+            Duration::seconds(60),
+        )]);
+
+        assert!(job.has_pickable_task());
+    }
+
+    #[test]
+    fn a_started_task_within_its_deadline_is_not_pickable() {
+        let running = Task::restore(RestoredTask {
+            id: Uuid::from_u128(1),
+            status: TaskStatus::Started,
+            processing_by_worker: Some(Uuid::from_u128(101)),
+            started_at: Some(Utc::now()),
+            deadline_at: Some(Utc::now() + Duration::seconds(60)),
+            lifetime_deadline_at: Some(Utc::now() + Duration::seconds(120)),
+            attempt: 1,
+            ..restored_task_fields()
+        });
+        let job = running_job(vec![running]);
+
+        assert!(!job.has_pickable_task());
+    }
+
+    /// A task past its lifetime is failed by the next pass rather than taken over, so it is no work
+    /// to start either.
+    #[test]
+    fn a_started_task_past_its_lifetime_is_not_pickable() {
+        let job = running_job(vec![make_expired_started_task(
+            Uuid::from_u128(1),
+            1,
+            DEFAULT_MAX_ATTEMPTS,
+            -Duration::seconds(1),
+        )]);
+
+        assert!(!job.has_pickable_task());
+    }
+
+    /// Unblocking is part of settling, which a pass that picks a task never reaches; the dependent
+    /// it would release stays `Blocked` in the state that pass writes.
+    #[test]
+    fn a_blocked_task_is_not_pickable_before_a_pass_unblocks_it() {
+        let dependency_id = Uuid::from_u128(1);
+        let job = running_job(vec![
+            make_task(dependency_id, "dependency", TaskStatus::Completed, Vec::new()),
+            make_task(
+                Uuid::from_u128(2),
+                "dependent",
+                TaskStatus::Blocked,
+                vec![dependency_id],
+            ),
+        ]);
+
+        assert!(!job.has_pickable_task());
+    }
+
+    /// The regression the retry pause exists for: with another task to start, a pass used to pick
+    /// the failed task in `HashMap` order, and a refusal was repeated with no pause at all. Every
+    /// job below is a fresh map, so a rule that still picked the failed one would do so in about
+    /// half of them. Checked by dropping the pause from `Task::check_availability_at`.
+    #[test]
+    fn a_pick_starts_another_task_while_the_failed_one_waits_out_its_retry_pause() {
+        let todo_id = Uuid::from_u128(1);
+        for _ in 0..32 {
+            let mut job = running_job(vec![
+                make_task(todo_id, "todo", TaskStatus::Todo, Vec::new()),
+                failed_task_refused(Uuid::from_u128(2), "failed", Utc::now()),
+            ]);
+
+            let picked = job.pick_task_to_execute(&WORKER_ID).unwrap();
+
+            assert_eq!(picked, TaskPickup::Ready(todo_id));
+        }
+    }
+
+    /// A failed task counts as resolved for `Task::resolution`, so an iteration holding nothing else
+    /// but one within its pause would be closed as failed with its retries unspent. Checked by
+    /// passing the real pause to the pickability check of `Job::try_settle_iteration`.
+    #[test]
+    fn a_pick_finding_only_a_failed_task_within_its_retry_pause_waits_for_the_end_of_the_pause() {
+        let refused_at = Utc::now();
+        let mut job = running_job(vec![
+            make_task(Uuid::from_u128(1), "done", TaskStatus::Completed, Vec::new()),
+            failed_task_refused(Uuid::from_u128(2), "failed", refused_at),
+        ]);
+
+        let picked = job.pick_task_to_execute(&WORKER_ID).unwrap();
+
+        assert_eq!(
+            picked,
+            TaskPickup::Waiting {
+                retry_at: Some(refused_at + FAILED_TASK_RETRY_PAUSE)
+            }
+        );
+        assert!(
+            matches!(job.status(), JobStatus::Running),
+            "the iteration must stay open"
+        );
+    }
+
+    /// The retry a pick names is the one the job is polled at, so of several failed tasks within
+    /// their pause it is the earliest: a later one would hold the earlier task past its pause.
+    /// Every job below is a fresh map, as in
+    /// `a_pick_starts_another_task_while_the_failed_one_waits_out_its_retry_pause`. Checked by
+    /// taking the latest retry instead, and by taking the first failed task in map order.
+    #[test]
+    fn a_pick_finding_several_failed_tasks_within_their_pause_names_the_earliest_retry() {
+        let later_refused_at = Utc::now();
+        let earlier_refused_at = later_refused_at - Duration::milliseconds(500);
+        for _ in 0..32 {
+            let mut job = running_job(vec![
+                failed_task_refused(Uuid::from_u128(1), "earlier", earlier_refused_at),
+                failed_task_refused(Uuid::from_u128(2), "later", later_refused_at),
+            ]);
+
+            let picked = job.pick_task_to_execute(&WORKER_ID).unwrap();
+
+            assert_eq!(
+                picked,
+                TaskPickup::Waiting {
+                    retry_at: Some(earlier_refused_at + FAILED_TASK_RETRY_PAUSE)
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_pick_starts_a_failed_task_whose_retry_pause_has_passed() {
+        let failed_id = Uuid::from_u128(2);
+        let mut job = running_job(vec![failed_task_refused(
+            failed_id,
+            "failed",
+            Utc::now() - FAILED_TASK_RETRY_PAUSE - Duration::seconds(1),
+        )]);
+
+        let picked = job.pick_task_to_execute(&WORKER_ID).unwrap();
+
+        assert_eq!(picked, TaskPickup::Ready(failed_id));
+    }
+
+    /// The save of a refusal settles the iteration in the same write, while the refused task is
+    /// within its pause: the iteration must stay open for the retry.
+    #[test]
+    fn a_failed_task_within_its_retry_pause_keeps_the_iteration_open() {
+        let mut job = running_job(vec![failed_task_refused(Uuid::from_u128(1), "failed", Utc::now())]);
+
+        assert!(!job.try_settle_iteration(&WORKER_ID).unwrap());
+        assert!(matches!(job.status(), JobStatus::Running));
     }
 }

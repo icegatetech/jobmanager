@@ -49,6 +49,9 @@ module tree *is* the architecture.
   them.
 - A domain rule lives in `core` and nowhere else. `storage` and `execution` **MUST NOT** re-derive a
   rule `Job`/`Task` already owns: a backend maps state, it does not decide it.
+- The state of a `Job` and its `Task` is mutated by a limited set of components. Only a `Worker` can mutate a `Job`
+  directly. A `JobHandle` uses a special interface to modify it. Mutations elsewhere must be agreed upon in advance.
+  Any modification outside of a `Worker` must be made exclusively through the interface.
 - **The domain does not know it is stored.** `core` is written as if a job and its tasks live on
   whole: which fields a backend writes, drops, or reconstructs is `storage`'s business and appears
   nowhere in `core` — not in a method, not in a doc comment justifying a rule. A domain rule
@@ -122,25 +125,23 @@ iteration. The mechanics are documented on the types themselves; what follows is
   deleting it would let `find_job_meta` miss the job and a worker recreate it from `iter_num = 1`.
 - **Never make workers wait for one another.** A storage call is issued outside every lock: a lock is
   held only long enough to take a snapshot or to record a result. The hot path — a cache hit — is
-  what this is for: every worker of a pool reaches storage in parallel and holds the entry for
+  what this is for: the workers of a pool reach storage in parallel and hold the entry for
   microseconds, and widening that hold turns one round trip into a queue the whole pool stands in, on
-  every poll. The counterpart is that concurrent access stays the assumption: state taken out from
-  under a lock may be stale by the time it is used, and the write that follows is conditional for
-  exactly that reason.
+  every poll.
 - **Never add a request to a pass.** Storage bills per request and the poll loop never ends, so a
-  `LIST`, a `GET` or a `PUT` added to one pass is paid by every worker of every pool, for every job,
+  `LIST`, a `GET` or a `PUT` added to one pass is paid by every pool, for every job,
   for as long as the job exists. A pass some quota already covers fails loudly; a scenario nobody
   quoted is where this fails silently, so a new one is given its number before it ships. What each
   scenario is allowed to cost, and the rules those numbers are held to, are in
   [docs/tests.md](docs/tests.md); a number that has to go up is a change to be agreed, never a test
   to be updated.
 - **Never let a call of `Storage` cost more requests than its own contract names** - one listing,
-    one write, one delete per iteration. A quota is a number only while that holds: a backend turning
-    one call into several moves every quota at once and no test name with it, the silent failure this
-    register exists to catch. Both causes are configuration rather than code - the SDK's own retry,
-    and the size above which it splits a transfer into ranges or blocks - so a backend turns both off
-    where it builds its client. A provider whose SDK lets a backend turn neither off has quotas that
-    are ranges: say so before adding it.
+  one write, one delete per iteration. A quota is a number only while that holds: a backend turning
+  one call into several moves every quota at once and no test name with it, the silent failure this
+  register exists to catch. Both causes are configuration rather than code - the SDK's own retry,
+  and the size above which it splits a transfer into ranges or blocks - so a backend turns both off
+  where it builds its client. A provider whose SDK lets a backend turn neither off has quotas that
+  are ranges: say so before adding it.
 - Job settings (`max_iterations`, `iteration_interval`, `TaskLimits`, `iteration_retention`) are
   re-read from the `JobDefinition` on every load, so they are changed in code, never by editing a
   stored object.

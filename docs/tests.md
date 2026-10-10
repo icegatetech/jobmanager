@@ -98,7 +98,7 @@ The areas listed below represent a minimum set, not an exhaustive list.
 
 ## Request quotas
 
-Providers bill per request, and a pass that grew by one is paid on every poll of every worker, for
+Providers bill per request, and a pass that grew by one is paid on every poll of every worker pool, for
 as long as the job exists. Every scenario the pool repeats therefore has a **quota**: a number of
 requests fixed by a test and asserted against a real store. The quotas live together in
 [`request_quota_test.rs`](../src/tests/request_quota_test.rs), which is what gives them one address

@@ -5,7 +5,10 @@ use std::time::Duration;
 
 use tracing_subscriber::{EnvFilter, fmt};
 
-use crate::{Error, Job, JobCode, JobDefinition, JobDefinitionRegistry, JobMeta, WorkerConfig};
+use crate::core::error::Error;
+use crate::core::job::{Job, JobCode, JobDefinition};
+use crate::execution::scheduler::PollSchedulerConfig;
+use crate::storage::{JobDefinitionRegistry, JobMeta};
 
 #[cfg(feature = "storage-azure")]
 pub mod azure_container;
@@ -40,11 +43,11 @@ pub fn meta_of(job: &Job) -> JobMeta {
 ///
 /// Returns whatever `storage` refuses a write with.
 pub async fn persist_completed_iterations(
-    storage: &dyn crate::Storage,
+    storage: &dyn crate::storage::Storage,
     job_code: &JobCode,
     iter_nums: impl IntoIterator<Item = u64> + Send,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let cancel_token = crate::CancellationToken::new();
+    let cancel_token = tokio_util::sync::CancellationToken::new();
     let job_id = uuid::Uuid::from_u128(7_001);
     let worker_id = uuid::Uuid::from_u128(7_002);
 
@@ -54,7 +57,7 @@ pub async fn persist_completed_iterations(
             job_code.clone(),
             String::new(),
             iter_num,
-            crate::JobStatus::Completed,
+            crate::core::job::JobStatus::Completed,
             Vec::new(),
             worker_id,
             chrono::Utc::now(),
@@ -64,7 +67,7 @@ pub async fn persist_completed_iterations(
             std::collections::HashMap::new(),
             None,
             None,
-            crate::TaskLimits::default(),
+            crate::core::job::TaskLimits::default(),
         );
         storage.save_job(&mut job, &cancel_token).await?;
     }
@@ -87,8 +90,8 @@ impl JobDefinitionRegistry for UnusedJobRegistry {
 
 /// Worker settings a test polls by: an interval short enough that a test does not wait out the
 /// defaults, plus the jitter it wants the workers spread by.
-pub fn build_worker_config(poll_interval: Duration, poll_jitter: Duration) -> WorkerConfig {
-    WorkerConfig::new()
+pub fn build_poll_schedule_config(poll_interval: Duration, poll_jitter: Duration) -> PollSchedulerConfig {
+    PollSchedulerConfig::new()
         .with_poll_interval(poll_interval)
         .expect("a positive poll interval is accepted")
         .with_poll_jitter(poll_jitter)

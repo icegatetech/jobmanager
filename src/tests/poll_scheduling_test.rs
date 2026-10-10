@@ -8,13 +8,19 @@ use super::common::storage_wrapper::{
     CacheRacingStorage, ConditionalReadFailingStorage, CountingStorage, RendezvousReadStorage, UnconditionalReadStorage,
 };
 use super::common::waiting::{OBSERVATION_WINDOW, measure_settled_requests, wait_until_job_is_processed};
+use crate::core::job::TaskPickup;
+use crate::core::job::{Job, JobCode, JobDefinition, JobDefinitionId, TaskLimits};
+use crate::core::registry::JobRegistry;
+use crate::core::task::{TaskCode, TaskDefinition};
+use crate::execution::executor::{TaskOutcome, task_fn};
+use crate::execution::job_cleaner::JobCleanerConfig;
+use crate::execution::jobs_manager::JobsManagerConfig;
+use crate::infra::metrics::NoopMetrics;
+use crate::storage::cached::CachedStorage;
 use crate::storage::in_memory::InMemoryStorage;
-use crate::{
-    CachedStorage, Job, JobCleanerConfig, JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobsManagerConfig,
-    NoopMetrics, Storage, StorageError, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, TaskPickup, task_fn,
-};
+use crate::storage::{Storage, StorageError};
 
-fn job_definition(job_code: &JobCode) -> Result<JobDefinition, crate::Error> {
+fn job_definition(job_code: &JobCode) -> Result<JobDefinition, crate::core::error::Error> {
     JobDefinition::new(
         JobDefinitionId::new(),
         job_code.clone(),
@@ -90,11 +96,12 @@ async fn a_job_waiting_for_its_next_iteration_is_not_polled() -> Result<(), Box<
         )) as Arc<dyn Storage>,
         JobsManagerConfig {
             worker_count: 1,
-            worker_config: super::common::build_worker_config(Duration::from_millis(20), Duration::ZERO),
+            scheduler_config: super::common::build_poll_schedule_config(Duration::from_millis(20), Duration::ZERO),
             cleaner_config: JobCleanerConfig {
                 enabled: false,
                 ..Default::default()
             },
+            ..Default::default()
         },
         Arc::new(JobRegistry::new(vec![job_def.clone()])?),
         vec![job_def],
@@ -119,10 +126,9 @@ async fn a_job_waiting_for_its_next_iteration_is_not_polled() -> Result<(), Box<
     Ok(())
 }
 
-/// FR2 with the wait between passes taken out of the picture: a neighbour that is ready again on
-/// every pass wakes the worker at its base interval, so the gate is the only thing left holding the
-/// waiting job off the store. With one job in the pool the two cannot be told apart - the wait is
-/// then the interval until that job's own moment.
+/// FR2 with the worker kept awake: a neighbour that is ready again on every pass is claimed at the
+/// base interval, so only the poll moment the pool's schedule holds for the waiting job keeps it off
+/// the store. With one job in the pool the worker would have nothing else to wake for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_waiting_job_is_not_polled_while_a_neighbour_wakes_the_worker() -> Result<(), Box<dyn std::error::Error>> {
     super::common::init_tracing();
@@ -143,11 +149,12 @@ async fn a_waiting_job_is_not_polled_while_a_neighbour_wakes_the_worker() -> Res
         )) as Arc<dyn Storage>,
         JobsManagerConfig {
             worker_count: 1,
-            worker_config: super::common::build_worker_config(Duration::from_millis(20), Duration::ZERO),
+            scheduler_config: super::common::build_poll_schedule_config(Duration::from_millis(20), Duration::ZERO),
             cleaner_config: JobCleanerConfig {
                 enabled: false,
                 ..Default::default()
             },
+            ..Default::default()
         },
         Arc::new(JobRegistry::new(job_defs.clone())?),
         job_defs,
@@ -455,11 +462,12 @@ async fn a_pool_finishes_its_job_against_a_store_ignoring_the_precondition() -> 
         )) as Arc<dyn Storage>,
         JobsManagerConfig {
             worker_count: 1,
-            worker_config: super::common::build_worker_config(Duration::from_millis(20), Duration::ZERO),
+            scheduler_config: super::common::build_poll_schedule_config(Duration::from_millis(20), Duration::ZERO),
             cleaner_config: JobCleanerConfig {
                 enabled: false,
                 ..Default::default()
             },
+            ..Default::default()
         },
         Arc::new(JobRegistry::new(vec![job_def.clone()])?),
         vec![job_def],

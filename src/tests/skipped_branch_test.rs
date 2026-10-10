@@ -12,13 +12,16 @@ use tokio_util::sync::CancellationToken;
 use super::common::counting_metrics::CountingMetrics;
 use super::common::manager_env::ManagerEnv;
 use super::common::storage_wrapper::{ContendedSave, ContendingStorage};
+use crate::core::error::Error;
+use crate::core::job::{JobCode, JobDefinition, JobDefinitionId, JobStatus, TaskLimits};
+use crate::core::registry::JobRegistry;
 use crate::core::task::SkipCause;
+use crate::core::task::{DependencyTolerance, TaskCode, TaskDefinition, TaskRef, TaskStatus};
+use crate::execution::executor::{TaskOutcome, task_fn};
+use crate::execution::jobs_manager::{JobsManager, JobsManagerConfig};
+use crate::infra::metrics::MetricsSink;
+use crate::storage::Storage;
 use crate::storage::in_memory::InMemoryStorage;
-use crate::{
-    DependencyTolerance, Error, JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStatus, JobsManager,
-    JobsManagerConfig, MetricsSink, Storage, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, TaskRef, TaskStatus,
-    task_fn,
-};
 
 /// Bound on every wait here: a job that never finishes must fail the test rather than hang the
 /// suite.
@@ -288,7 +291,7 @@ async fn a_cascade_lost_to_a_race_is_derived_again_on_the_stored_state() -> Resu
         Arc::clone(&storage) as Arc<dyn Storage>,
         JobsManagerConfig {
             worker_count: 1,
-            worker_config: super::common::build_worker_config(Duration::from_millis(20), Duration::ZERO),
+            scheduler_config: super::common::build_poll_schedule_config(Duration::from_millis(20), Duration::ZERO),
             ..Default::default()
         },
         Arc::clone(&job_registry),

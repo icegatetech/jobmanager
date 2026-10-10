@@ -5,7 +5,7 @@
 //! above all whether repeating the request can clear it - is a property of the error, not of the
 //! conversation that produced it.
 
-use crate::StorageError;
+use crate::storage::StorageError;
 use crate::storage::backend::{ProviderError, RequestStatus};
 use crate::storage::gcs_client::{GcsRequestError, JsonApiResponse};
 use crate::storage::http_error::{HttpOutcome, classify_http_status};

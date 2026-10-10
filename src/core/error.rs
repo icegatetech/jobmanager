@@ -1,6 +1,8 @@
 use thiserror::Error;
 
-use crate::{JobCode, JobStatus, infra::retrier::RetryError, storage::StorageError};
+use crate::core::job::{JobCode, JobStatus};
+use crate::infra::retrier::RetryError;
+use crate::storage::StorageError;
 
 /// Error type an executor returns.
 ///
@@ -39,7 +41,9 @@ impl Error {
     /// result of the storage layer's own retries. It exists so callers branch on a decision rather
     /// than on variants, matching `StorageError::is_retryable`.
     pub const fn is_retryable(&self) -> bool {
-        false
+        match self {
+            Self::Serialization(_) | Self::Cancelled | Self::TaskExecution(_) | Self::Other(_) => false,
+        }
     }
 }
 

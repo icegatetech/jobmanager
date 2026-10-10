@@ -8,7 +8,10 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 
-use crate::{JobDefinitionRegistry, JobStateCodecKind, JobsManagerBuilder, MetricsSink, Storage};
+use crate::execution::builder::JobsManagerBuilder;
+use crate::infra::metrics::MetricsSink;
+use crate::storage::state_codec::JobStateCodecKind;
+use crate::storage::{JobDefinitionRegistry, Storage};
 
 /// Container or bucket every harness keeps its state objects in. One per provider is enough:
 /// harnesses own their container, so two tests never share a store.
@@ -92,8 +95,11 @@ mod s3 {
     use async_trait::async_trait;
 
     use super::{PERIMETER_CONTAINER_NAME, ProviderHarness, ProviderStorageRequest};
+    use crate::execution::builder::JobsManagerBuilder;
+    use crate::storage::Storage;
+    use crate::storage::s3::{S3Backend, S3Config};
+    use crate::storage::state_codec::JobStateCodecKind;
     use crate::tests::common::s3_container::S3TestContainer;
-    use crate::{JobStateCodecKind, JobsManagerBuilder, S3Backend, S3Config, Storage};
 
     /// Region the test store is addressed with; an S3-compatible store ignores it, but the SDK
     /// requires one.
@@ -219,8 +225,11 @@ mod azure {
     use futures_util::TryStreamExt;
 
     use super::{PERIMETER_CONTAINER_NAME, ProviderHarness, ProviderStorageRequest};
+    use crate::execution::builder::JobsManagerBuilder;
+    use crate::storage::Storage;
+    use crate::storage::azure::{AzureBackend, AzureConfig};
+    use crate::storage::state_codec::JobStateCodecKind;
     use crate::tests::common::azure_container::AzureTestContainer;
-    use crate::{AzureBackend, AzureConfig, JobStateCodecKind, JobsManagerBuilder, Storage};
 
     /// An Azure Blob Storage emulator started for a test, torn down with the harness.
     pub struct AzureProviderHarness {
@@ -317,8 +326,11 @@ mod gcs {
     use serde::Deserialize;
 
     use super::{PERIMETER_CONTAINER_NAME, ProviderHarness, ProviderStorageRequest};
+    use crate::execution::builder::JobsManagerBuilder;
+    use crate::storage::Storage;
+    use crate::storage::gcs::{GcsBackend, GcsConfig};
+    use crate::storage::state_codec::JobStateCodecKind;
     use crate::tests::common::gcs_container::GcsTestContainer;
-    use crate::{GcsBackend, GcsConfig, JobStateCodecKind, JobsManagerBuilder, Storage};
 
     /// Project the perimeter's bucket is created under. The emulator accepts any name; the service
     /// would check it.

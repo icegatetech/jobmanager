@@ -216,7 +216,7 @@ jobs:
           components: rustfmt
 
       - name: Check formatting
-        run: cargo +nightly fmt -- --check
+        run: make fmt
 
   clippy:
     name: Clippy

@@ -2,11 +2,14 @@ use std::{sync::Arc, time::Duration};
 
 use super::common::counting_metrics::CountingMetrics;
 use super::common::storage_wrapper::ContendingStorage;
+use crate::core::job::{JobCode, JobDefinition, JobDefinitionId, TaskLimits};
+use crate::core::registry::JobRegistry;
+use crate::core::task::TaskDefinition;
+use crate::execution::executor::{TaskOutcome, task_fn};
+use crate::execution::jobs_manager::{JobsManager, JobsManagerConfig};
+use crate::infra::metrics::MetricsSink;
+use crate::storage::Storage;
 use crate::storage::in_memory::InMemoryStorage;
-use crate::{
-    JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobsManager, JobsManagerConfig, MetricsSink, Storage,
-    TaskDefinition, TaskLimits, TaskOutcome, task_fn,
-};
 
 /// Bound on every wait here: a job that never finishes must fail the test rather than hang the
 /// suite.
@@ -117,7 +120,7 @@ async fn a_save_that_lost_a_race_is_measured_once_as_a_retry() -> Result<(), Box
         Arc::clone(&contending) as Arc<dyn Storage>,
         JobsManagerConfig {
             worker_count: 1,
-            worker_config: super::common::build_worker_config(Duration::from_millis(20), Duration::ZERO),
+            scheduler_config: super::common::build_poll_schedule_config(Duration::from_millis(20), Duration::ZERO),
             ..Default::default()
         },
         job_registry,
