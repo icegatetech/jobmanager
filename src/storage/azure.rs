@@ -19,6 +19,9 @@ use futures_util::TryStreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+use crate::core::error::Error;
+use crate::infra::metrics::MetricsSink;
+use crate::infra::retrier::{Retrier, RetrierConfig, RetryStep};
 use crate::storage::azure_signing::SharedKeySigningPolicy;
 use crate::storage::backend::{
     Backend, ExpectedAnswer, ListedObject, ListedPage, ListingRequest, ListingStartBound, ProviderError, PutCondition,
@@ -27,9 +30,7 @@ use crate::storage::backend::{
 use crate::storage::object_storage::ObjectStorage;
 use crate::storage::paths::{DEFAULT_STATE_PREFIX, JobPaths};
 use crate::storage::state_codec::JobStateCodecKind;
-use crate::{
-    Error, JobDefinitionRegistry, MetricsSink, Retrier, RetrierConfig, RetryStep, StorageError, StorageResult,
-};
+use crate::storage::{JobDefinitionRegistry, StorageError, StorageResult};
 
 /// Timeout of a single Azure operation unless overridden. The transport the SDK builds bounds
 /// connecting and the silence between two reads, but neither bounds the operation as a whole -
@@ -42,7 +43,7 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// [`AzureConfig::with_list_page_size`] accepts.
 const DEFAULT_LIST_PAGE_SIZE: i32 = 5000;
 
-/// Bytes the SDK moves in one request, which is what keeps one call of [`Storage`](crate::Storage)
+/// Bytes the SDK moves in one request, which is what keeps one call of [`Storage`](crate::storage::Storage)
 /// costing one request: this is the size above which the SDK splits a transfer on its own - a write
 /// into `Put Block`/`Put Block List` and a read into ranged `Get Blob` requests - and a quota stops
 /// being a number. There is no switch that turns the splitting off, so the threshold is set as high
@@ -432,7 +433,7 @@ impl AzureBackend {
     ///
     /// Kept out of [`AzureBackend::build_client`] because a built client hands none of them back, and one
     /// of them - the SDK's own retry policy - is what decides whether a call of
-    /// [`Storage`](crate::Storage) costs the one request its quota names.
+    /// [`Storage`](crate::storage::Storage) costs the one request its quota names.
     ///
     /// # Errors
     ///
@@ -631,11 +632,13 @@ mod tests {
     use tokio::task::JoinHandle;
 
     use super::*;
+    use crate::core::job::{Job, JobCode};
+    use crate::infra::metrics::NoopMetrics;
+    use crate::storage::{JobMeta, Storage};
     use crate::tests::common::UnusedJobRegistry;
     use crate::tests::common::counting_metrics::CountingMetrics;
     use crate::tests::common::scripted_endpoint::{ScriptedEndpoint, build_http_response};
     use crate::tests::common::silent_endpoint::{cancel_after_delay, start_silent_endpoint as start_silent_listener};
-    use crate::{Job, JobCode, JobMeta, NoopMetrics, Storage};
 
     /// Account key every case signs with: base64, because signing rejects anything else.
     const TEST_ACCOUNT_KEY: &str = "a2V5";
@@ -1039,7 +1042,7 @@ mod tests {
             JobCode::new("job"),
             version.to_string(),
             1,
-            crate::JobStatus::Started,
+            crate::core::job::JobStatus::Started,
             Vec::new(),
             uuid::Uuid::from_u128(9_002),
             chrono::Utc::now(),
@@ -1049,7 +1052,7 @@ mod tests {
             std::collections::HashMap::new(),
             None,
             None,
-            crate::TaskLimits::default(),
+            crate::core::job::TaskLimits::default(),
         )
     }
 

@@ -3,197 +3,23 @@ use std::{any::Any, collections::HashMap, future::Future, panic::AssertUnwindSaf
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
 use parking_lot::{Mutex, RwLock};
-use rand::Rng;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::core::error::{InternalError, JobError};
+use crate::core::job::{IterationStatus, IterationVerdict, Job, JobCode, NextIterationStatus, TaskPickup};
+use crate::core::registry::JobRegistry;
+use crate::core::task::{Task, TaskCode, TaskResolution, TaskRetry};
+use crate::execution::executor::{TaskOutcome, TaskResult};
 use crate::execution::job_cleaner::JobIterationStarted;
-use crate::execution::job_handle::{JobHandleImpl, JobHandleState};
-use crate::{
-    Error, InternalError, IterationStep, IterationVerdict, Job, JobCode, JobError, JobHandle, JobRegistry, MetricsSink,
-    Retrier, RetrierConfig, RetryStep, Storage, StorageError, TaskCode, TaskContext, TaskOutcome, TaskPickup,
-    TaskResult, TaskRetry,
-};
-// TODO(low): implement subscription mechanism for job updates between workers - if worker received/saved job, other workers should update their state to reduce races.
-// Can be done via storage wrapper.
-
-/// Polling and retry behavior applied to every worker spawned by a
-/// [`JobsManager`](crate::JobsManager), set through
-/// [`JobsManagerBuilder::poll_interval`](crate::JobsManagerBuilder::poll_interval),
-/// [`poll_jitter`](crate::JobsManagerBuilder::poll_jitter),
-/// [`max_poll_interval`](crate::JobsManagerBuilder::max_poll_interval) and
-/// [`retrier`](crate::JobsManagerBuilder::retrier).
-///
-/// Every setting is checked as it is set, so an assembled `WorkerConfig` is always a set of
-/// intervals a worker can poll by: there is no separate validation step and no state in between.
-#[derive(Clone)]
-pub struct WorkerConfig {
-    poll_interval: Duration,
-    poll_jitter: Duration,
-    max_poll_interval: Option<Duration>,
-    retrier_config: RetrierConfig,
-}
-
-impl Default for WorkerConfig {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl WorkerConfig {
-    /// How many times above the base interval the backoff ceiling sits when no ceiling was named.
-    const DEFAULT_MAX_POLL_INTERVAL_FACTOR: u32 = 10;
-    const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(200);
-    /// Longest interval a worker accepts, either as its base or as its backoff ceiling.
-    // The product spells the year out in the units the bound is stated in; the `from_hours(8760)`
-    // the lint asks for names the same value in a number nobody reads as a year.
-    #[allow(clippy::duration_suboptimal_units)]
-    const LONGEST_ACCEPTED_POLL_INTERVAL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
-    const DEFAULT_POLL_JITTER: Duration = Duration::from_millis(50);
-
-    /// Settings a worker polls by unless a `with_*` method replaces one of them.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            poll_interval: Self::DEFAULT_POLL_INTERVAL,
-            poll_jitter: Self::DEFAULT_POLL_JITTER,
-            max_poll_interval: None,
-            retrier_config: RetrierConfig::default(),
-        }
-    }
-
-    /// Replaces the base interval a worker polls storage at after a pass that found work.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Other`] if `interval` is zero - a worker would then poll storage in a loop
-    /// without ever pausing - if it is above [`Self::LONGEST_ACCEPTED_POLL_INTERVAL`], or if it is
-    /// above a ceiling already named through [`Self::with_max_poll_interval`], which would turn the
-    /// backoff into a speed-up.
-    pub fn with_poll_interval(mut self, interval: Duration) -> Result<Self, Error> {
-        if interval.is_zero() {
-            return Err(Error::Other("poll interval must be positive".to_string()));
-        }
-        if interval > Self::LONGEST_ACCEPTED_POLL_INTERVAL {
-            return Err(Error::Other("poll interval must not exceed a year".to_string()));
-        }
-        if self.max_poll_interval.is_some_and(|ceiling| ceiling < interval) {
-            return Err(Error::Other(
-                "max poll interval must not be below the poll interval".to_string(),
-            ));
-        }
-
-        self.poll_interval = interval;
-        Ok(self)
-    }
-
-    /// Replaces the upper bound of the random delay added to each poll, which keeps workers from
-    /// polling in lockstep. A zero bound adds nothing.
-    #[must_use]
-    pub const fn with_poll_jitter(mut self, jitter: Duration) -> Self {
-        self.poll_jitter = jitter;
-        self
-    }
-
-    /// Replaces the ceiling the poll interval backs off to while there is no work.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Other`] if `ceiling` is below the poll interval, which would turn the
-    /// backoff into a speed-up, or above [`Self::LONGEST_ACCEPTED_POLL_INTERVAL`].
-    pub fn with_max_poll_interval(mut self, ceiling: Duration) -> Result<Self, Error> {
-        if ceiling < self.poll_interval {
-            return Err(Error::Other(
-                "max poll interval must not be below the poll interval".to_string(),
-            ));
-        }
-        if ceiling > Self::LONGEST_ACCEPTED_POLL_INTERVAL {
-            return Err(Error::Other("max poll interval must not exceed a year".to_string()));
-        }
-
-        self.max_poll_interval = Some(ceiling);
-        Ok(self)
-    }
-
-    /// Replaces the retry policy a worker applies to its storage operations.
-    #[must_use]
-    pub fn with_retrier(mut self, config: RetrierConfig) -> Self {
-        self.retrier_config = config;
-        self
-    }
-
-    /// Base interval a worker polls storage at after a pass that found work.
-    ///
-    /// Applies per job: a job with nothing to wait for is polled at this interval, while one whose
-    /// next iteration is not due yet is not polled until it is.
-    pub const fn poll_interval(&self) -> Duration {
-        self.poll_interval
-    }
-
-    /// Upper bound of the random delay added to each poll.
-    ///
-    /// Also spreads the moment jobs sharing a schedule are picked up: without it every worker of
-    /// every pool wakes at the same instant when an interval-scheduled job becomes due, and all but
-    /// one pay a rejected write. A fleet of many workers on interval-scheduled jobs wants this
-    /// raised.
-    pub const fn poll_jitter(&self) -> Duration {
-        self.poll_jitter
-    }
-
-    /// Ceiling the poll interval backs off to while there is no work.
-    ///
-    /// A ceiling nobody named is [`Self::DEFAULT_MAX_POLL_INTERVAL_FACTOR`] times the poll
-    /// interval, so the backoff spans the same number of doublings whatever the base interval is;
-    /// a ceiling named through [`Self::with_max_poll_interval`] replaces it outright. A pool that
-    /// wants a rare poll while idle without a frequent one while busy names both.
-    pub fn max_poll_interval(&self) -> Duration {
-        self.max_poll_interval
-            .unwrap_or(self.poll_interval * Self::DEFAULT_MAX_POLL_INTERVAL_FACTOR)
-    }
-
-    /// Retry policy a worker applies to its storage operations.
-    pub const fn retrier_config(&self) -> &RetrierConfig {
-        &self.retrier_config
-    }
-}
-
-struct JobCacheEntry {
-    next_poll: std::time::Instant,
-    // Backoff step of this job alone: a busy job must not hold an idle neighbour at the base
-    // interval, nor an idle one drag a busy neighbour up to the ceiling.
-    poll_interval: Duration,
-    exhausted: bool, // true if job reached maxIterations
-}
-
-/// How one pass over a job ended, which is what decides when polling it again can change anything.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum JobPassOutcome {
-    /// The job spent its iteration budget: no later pass can change anything.
-    IterationBudgetSpent,
-    /// The iteration finished; the next one is not due before the given moment.
-    NextIterationDueAt(DateTime<Utc>),
-    /// The pass moved the job.
-    Processed,
-    /// The pass changed nothing, or failed.
-    Stalled,
-}
-
-/// Time left until `moment`, or zero if it has already passed, and never more than
-/// [`WorkerConfig::LONGEST_ACCEPTED_POLL_INTERVAL`].
-///
-/// The cap holds the scheduler's arithmetic inside the range configured intervals are checked
-/// against: a moment set through [`JobHandle::set_next_start_at`] passes no such check, and adding a
-/// far enough one to an `Instant` panics. A job polled a year before it is due pays one pass, which
-/// schedules it again.
-fn calculate_duration_until(moment: DateTime<Utc>) -> Duration {
-    std::cmp::min(
-        (moment - Utc::now()).to_std().unwrap_or(Duration::ZERO),
-        WorkerConfig::LONGEST_ACCEPTED_POLL_INTERVAL,
-    )
-}
+use crate::execution::job_handle::{JobHandle, JobHandleImpl, JobHandleState};
+use crate::execution::task_context::TaskContext;
+use crate::infra::metrics::MetricsSink;
+use crate::infra::retrier::{Retrier, RetrierConfig, RetryStep};
+use crate::storage::{Storage, StorageError};
 
 struct JobMergeContext<'a> {
     current_job: &'a Job,
@@ -211,6 +37,21 @@ enum SaveOutcome {
 enum MergeDecision {
     Retry(Job),
     Done(Job, SaveOutcome),
+}
+
+/// What the run of an executor left: the state its job handle held, and how the run ended.
+struct ExecutorRun {
+    job: Job,
+    result: ExecutorResult,
+}
+
+/// How the run of an executor ended.
+enum ExecutorResult {
+    /// The executor returned an outcome, or panicked: what it says is recorded on the task.
+    Returned(Result<TaskResult, Box<dyn Any + Send>>),
+    /// The task's deadline released the executor: the task stays as it is for another worker to
+    /// take over, and nothing is recorded.
+    ReleasedByDeadline,
 }
 
 fn panic_payload_to_string(panic: &(dyn Any + Send)) -> String {
@@ -234,192 +75,203 @@ pub(crate) trait FinishedIterationSink: Send + Sync {
     fn record_finished_iteration(&self, job_code: &JobCode, iter_num: u64);
 }
 
-/// Iterates through jobs known to the [`JobRegistry`], polling storage for each and executing
-/// at most one task per job per pass. A single `Worker` runs tasks strictly sequentially;
-/// concurrency across tasks is achieved by running multiple workers (see
-/// [`JobsManagerConfig::worker_count`](crate::JobsManagerConfig::worker_count)).
+/// What every worker is given alike.
+#[derive(Clone)]
+pub(crate) struct WorkerContext {
+    pub(crate) job_registry: Arc<JobRegistry>,
+    pub(crate) storage: Arc<dyn Storage>,
+    pub(crate) metrics: Arc<dyn MetricsSink>,
+    pub(crate) iteration_notifier: Option<mpsc::Sender<JobIterationStarted>>,
+    pub(crate) finished_iterations: Arc<dyn FinishedIterationSink>,
+}
+
+/// A task whose start [`Worker::start_task`] wrote, together with the state that write stored. The
+/// state is the worker's alone: whoever holds a started task only hands it back to
+/// [`Worker::execute_task`].
+pub(crate) struct StartedTask {
+    // Do not publish; it needs to be passed to `execution` in `Worker`.
+    job: Job,
+    task_id: Uuid,
+}
+
+impl StartedTask {
+    pub(crate) const fn task_id(&self) -> Uuid {
+        self.task_id
+    }
+
+    /// The deadline the written start set on the task.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::TaskNotFound`] if the stored state does not hold the started task.
+    pub(crate) fn deadline_at(&self) -> Result<Option<DateTime<Utc>>, JobError> {
+        self.job.find_task(&self.task_id).map(Task::deadline_at)
+    }
+}
+
+/// What the state an execution ended with leaves of the job's iteration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExecutionEnd {
+    /// The execution's own write closed the iteration; the next one stands at this status.
+    IterationClosed(NextIterationStatus),
+    /// The iteration is still open.
+    TaskEnded {
+        /// Whether a task may be started at once; a failed one still within its retry pause is
+        /// not one.
+        has_pickable_task_left: bool,
+    },
+}
+
+/// How [`Worker::start_task`] ended.
+// Moved once into the pool's report; boxing the started task would add an allocation to every task
+// start to shrink that one move.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum TaskStart {
+    /// The worker wrote the start of a task, which it executes when the pool asks.
+    Started {
+        started_task: StartedTask,
+        /// Whether the state that start wrote holds another task that may be started at once; a
+        /// failed one still within its retry pause is not one.
+        has_pickable_task_left: bool,
+    },
+    /// The iteration the job is in holds no task this worker may start: every one left is running,
+    /// waits for another, or waits out its retry pause.
+    NoTaskAvailable {
+        /// The earliest moment a failed task of the iteration may be started again; `None` when no
+        /// failed task waits for one.
+        retry_at: Option<DateTime<Utc>>,
+    },
+    /// The iteration the job is in is closed - it was read so, or this worker's own write of its
+    /// verdict closed it - and the next one stands at this status.
+    IterationClosed(NextIterationStatus),
+    /// Another worker got the task, or the verdict, this worker was writing.
+    LostToAnotherWorker,
+    /// The worker moved nothing: a storage call failed or was cancelled, or the state it got back
+    /// had nothing left for it.
+    Stalled,
+}
+
+impl TaskStart {
+    pub(crate) fn into_started_task(self) -> Option<StartedTask> {
+        match self {
+            Self::Started { started_task, .. } => Some(started_task),
+            Self::NoTaskAvailable { .. } | Self::IterationClosed(_) | Self::LostToAnotherWorker | Self::Stalled => None,
+        }
+    }
+}
+
+/// Where a job's iteration stands once a worker moved it on as far as its state allows.
+// Lives only for the step from the move to the task start; boxing the job would add an allocation
+// to every task start to shrink that one move.
+#[allow(clippy::large_enum_variant)]
+enum IterationAdvance {
+    /// The iteration is open, and a task of it may be started.
+    Open(Job),
+    /// The iteration is closed, and the next one stands at this status.
+    Closed(NextIterationStatus),
+    /// The worker moved nothing: a storage call failed or was cancelled, or the state it got back
+    /// had nothing left for it.
+    Stalled,
+}
+
+/// Starts at most one task of the job a [`WorkerPool`](crate::execution::worker_pool::WorkerPool)
+/// hands it, and executes a started task when the pool asks. A single `Worker` does one of the two
+/// at a time; concurrency across tasks is achieved by running multiple workers (see
+/// [`JobsManagerConfig::worker_count`](crate::execution::jobs_manager::JobsManagerConfig::worker_count)).
 pub(crate) struct Worker {
     id: Uuid,
     job_registry: Arc<JobRegistry>,
     storage: Arc<dyn Storage>,
-    config: WorkerConfig,
     retrier: Retrier,
     metrics: Arc<dyn MetricsSink>,
     iteration_notifier: Option<mpsc::Sender<JobIterationStarted>>,
     finished_iterations: Arc<dyn FinishedIterationSink>,
-
-    // Cache to minimize S3 poll requests
-    job_cache: RwLock<HashMap<JobCode, JobCacheEntry>>,
     // TODO(med): combine metrics, iteration_notifier, finished_iterations so that the worker simply publishes the event, and subscribers process the event themselves.
 }
 
-// TODO(low): separate the job polling logic into a separate module
-
 impl Worker {
-    pub fn new(
-        job_registry: Arc<JobRegistry>,
-        storage: Arc<dyn Storage>,
-        config: WorkerConfig,
-        metrics: Arc<dyn MetricsSink>,
-        cleanup_notifier: Option<mpsc::Sender<JobIterationStarted>>,
-        finished_iterations: Arc<dyn FinishedIterationSink>,
-    ) -> Self {
-        let retrier = Retrier::new(config.retrier_config().clone());
-
-        Self {
-            id: Uuid::new_v4(),
+    pub fn new(id: Uuid, retrier_config: RetrierConfig, context: WorkerContext) -> Self {
+        let retrier = Retrier::new(retrier_config);
+        let WorkerContext {
             job_registry,
             storage,
-            config,
+            metrics,
+            iteration_notifier,
+            finished_iterations,
+        } = context;
+
+        Self {
+            id,
+            job_registry,
+            storage,
             retrier,
             metrics,
-            iteration_notifier: cleanup_notifier,
+            iteration_notifier,
             finished_iterations,
-            job_cache: RwLock::new(HashMap::new()),
         }
     }
 
-    // Do not add trace instrumentation here, it will cause an infinite trace.
-    pub async fn start(&self, cancel_token: CancellationToken) -> Result<(), InternalError> {
-        info!("Starting worker {}", self.id);
-
-        loop {
-            let wait_duration = self.calculate_wait_duration();
-            tokio::select! {
-                () = cancel_token.cancelled() => {
-                    info!("Stopping worker {}", self.id);
-                    return Ok(());
-                }
-                () = sleep(wait_duration) => {}
-            }
-
-            self.process_jobs(&cancel_token).await;
-        }
-    }
-
-    /// Interval for the pass after an idle one: twice the last, capped at the configured maximum.
-    fn calculate_backed_off_poll_interval(config: &WorkerConfig, last_poll_interval: Duration) -> Duration {
-        std::cmp::min(last_poll_interval * 2, config.max_poll_interval())
-    }
-
-    /// Spreads `poll_interval` over a random share of the configured jitter, which is what keeps
-    /// workers from polling in lockstep. A zero jitter draws nothing, so the wait is the interval
-    /// itself.
-    fn calculate_jittered_wait(config: &WorkerConfig, poll_interval: Duration) -> Duration {
-        let max_jitter_nanos = u64::try_from(config.poll_jitter().as_nanos()).unwrap_or(u64::MAX);
-        let jitter = if max_jitter_nanos == 0 {
-            Duration::ZERO
-        } else {
-            Duration::from_nanos(rand::rng().random_range(0..max_jitter_nanos))
-        };
-
-        poll_interval + jitter
-    }
-
-    /// How long to wait before the next pass: until the nearest job is due for a poll, plus jitter.
-    ///
-    /// A job this worker has not polled yet has no scheduled moment, so the base interval stands in
-    /// for it. A worker whose jobs have all spent their iteration budget polls nothing at all and
-    /// waits the ceiling rather than waking on the base interval to do nothing.
-    fn calculate_wait_duration(&self) -> Duration {
-        let job_count = self.job_registry.jobs_count();
-        let poll_interval = {
-            let cache = self.job_cache.read();
-            let now = std::time::Instant::now();
-            if cache.len() < job_count {
-                self.config.poll_interval()
-            } else {
-                cache
-                    .values()
-                    .filter(|entry| !entry.exhausted)
-                    .map(|entry| entry.next_poll.saturating_duration_since(now))
-                    .min()
-                    .unwrap_or_else(|| self.config.max_poll_interval())
-            }
-        };
-
-        Self::calculate_jittered_wait(&self.config, poll_interval)
-    }
-
-    async fn process_jobs(&self, cancel_token: &CancellationToken) {
-        for job_code in self.job_registry.list_jobs() {
-            if !self.should_poll_job(&job_code) {
-                continue;
-            }
-            let pass_outcome = self.process_job(&job_code, cancel_token).await;
-            debug!("Job processed: {} ({:?})", job_code, pass_outcome);
-            self.schedule_next_poll(&job_code, pass_outcome);
-        }
-    }
-
-    /// Records when polling `job_code` can change anything again, given how its last pass ended.
-    fn schedule_next_poll(&self, job_code: &JobCode, pass_outcome: JobPassOutcome) {
-        let base_interval = self.config.poll_interval();
-        let now = std::time::Instant::now();
-        let mut cache = self.job_cache.write();
-        let entry = cache.entry(job_code.clone()).or_insert_with(|| JobCacheEntry {
-            next_poll: now,
-            poll_interval: base_interval,
-            exhausted: false,
-        });
-
-        match pass_outcome {
-            JobPassOutcome::IterationBudgetSpent => entry.exhausted = true,
-            JobPassOutcome::Processed => {
-                entry.poll_interval = base_interval;
-                entry.next_poll = now + base_interval;
-            }
-            JobPassOutcome::Stalled => {
-                entry.poll_interval = Self::calculate_backed_off_poll_interval(&self.config, entry.poll_interval);
-                entry.next_poll = now + entry.poll_interval;
-            }
-            JobPassOutcome::NextIterationDueAt(due) => {
-                entry.poll_interval = base_interval;
-                entry.next_poll = now + calculate_duration_until(due);
-            }
-        }
-        drop(cache);
-    }
-
-    /// One pass over `job_code`.
-    async fn process_job(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> JobPassOutcome {
+    /// Reads the job, moves it on as far as its state allows, and writes the start of at most one
+    /// task; the execution is left to [`Self::execute_task`].
+    #[tracing::instrument(
+        skip(self, cancel_token),
+        fields(
+            worker_id = %self.id,
+            job_code = %job_code,
+            job_id = tracing::field::Empty,
+            job_start_at = tracing::field::Empty,
+            iter = tracing::field::Empty,
+            otel.name = %format!("start_task-{job_code}")
+        )
+    )]
+    pub(crate) async fn start_task(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> TaskStart {
         let job = match self.storage.get_job(job_code, cancel_token).await {
             Ok(job) => job,
             Err(StorageError::NotFound(_)) => match self.create_new_job(job_code, cancel_token).await {
                 Ok(job) => job,
                 Err(InternalError::Cancelled) => {
                     debug!("Job creation cancelled");
-                    return JobPassOutcome::Stalled;
+                    return TaskStart::Stalled;
                 }
                 Err(e) => {
                     error!("Failed to create new job {}: {}", job_code, e);
-                    return JobPassOutcome::Stalled;
+                    return TaskStart::Stalled;
                 }
             },
             // go to process job
             Err(StorageError::Cancelled) => {
                 debug!("Job processing cancelled");
-                return JobPassOutcome::Stalled;
+                return TaskStart::Stalled;
             }
             Err(e) => {
                 error!("Failed to get job {} for processing: {}", job_code, e);
-                return JobPassOutcome::Stalled;
+                return TaskStart::Stalled;
             }
         };
+        // Recorded as read, before the iteration moves on: what this start found, not what it left.
+        tracing::Span::current()
+            .record("job_id", tracing::field::display(job.id()))
+            .record("job_start_at", tracing::field::display(job.started_at()))
+            .record("iter", job.iter_num());
 
-        self.try_process_job(job, cancel_token).await
-    }
-
-    fn should_poll_job(&self, job_code: &JobCode) -> bool {
-        let cache = self.job_cache.read();
-        if let Some(entry) = cache.get(job_code) {
-            // Don't poll jobs that exhausted iteration limit
-            if entry.exhausted {
-                return false;
+        let job = match self.advance_job_iteration(job, cancel_token).await {
+            IterationAdvance::Open(job) => job,
+            IterationAdvance::Closed(next_iteration_status) => {
+                return TaskStart::IterationClosed(next_iteration_status);
             }
-            std::time::Instant::now() > entry.next_poll
-        } else {
-            true
+            IterationAdvance::Stalled => return TaskStart::Stalled,
+        };
+
+        match self.start_task_in_iteration(job, cancel_token).await {
+            Ok(task_start) => task_start,
+            Err(InternalError::Cancelled) => {
+                debug!("Job processing cancelled");
+                TaskStart::Stalled
+            }
+            Err(e) => {
+                error!("Failed to start a task: {}", e);
+                TaskStart::Stalled
+            }
         }
     }
 
@@ -452,18 +304,7 @@ impl Worker {
         Ok(job)
     }
 
-    #[tracing::instrument(
-        skip(self, job, cancel_token),
-        fields(
-            worker_id = %self.id,
-            job_code = %job.code(),
-            job_id = %job.id(),
-            job_start_at = %job.started_at(),
-            iter = job.iter_num(),
-            otel.name = %format!("try_process_job-{}", job.code())
-        )
-    )]
-    async fn try_process_job(&self, mut job: Job, cancel_token: &CancellationToken) -> JobPassOutcome {
+    async fn advance_job_iteration(&self, mut job: Job, cancel_token: &CancellationToken) -> IterationAdvance {
         // An iteration this worker did not finish itself - one from a previous run of the pool, or
         // one another worker completed - is only observable here, on the pickup. Reporting it
         // before the branches below, because starting the next iteration overwrites the number and
@@ -475,57 +316,46 @@ impl Worker {
         // The next-iteration gate anchors on the persisted started_at of the current
         // iteration, which survives process restarts. Log the inputs so a restart that
         // appears to "shift" the schedule can be traced back to the actual anchor.
-        let iteration_step = job.pick_iteration_step();
+        let iteration_status = job.find_iteration_status();
         debug!(
             status = %job.status(),
             started_at = %job.started_at(),
             completed_at = ?job.completed_at(),
             next_start_at = ?job.next_start_at(),
-            ?iteration_step,
+            ?iteration_status,
             "Evaluating job scheduling on pickup"
         );
 
-        match iteration_step {
-            IterationStep::IterationInProgress => {}
-            IterationStep::NextIterationReady => {
+        match iteration_status {
+            IterationStatus::InProgress => {}
+            IterationStatus::Closed(NextIterationStatus::Ready) => {
                 job = match self.start_new_job_iteration(job, cancel_token).await {
                     Ok(job) => job,
                     Err(InternalError::Cancelled) => {
                         debug!("Job iteration start cancelled");
-                        return JobPassOutcome::Stalled;
+                        return IterationAdvance::Stalled;
                     }
                     Err(e) => {
                         error!("Failed to start job iteration: {}", e);
-                        return JobPassOutcome::Stalled;
+                        return IterationAdvance::Stalled;
                     }
                 };
             }
-            IterationStep::NextIterationDueAt(due) => return JobPassOutcome::NextIterationDueAt(due),
-            IterationStep::IterationBudgetSpent => return JobPassOutcome::IterationBudgetSpent,
-            // Nothing to wait for and nothing terminal about the state, so the job falls back to
-            // the ordinary backoff rather than to a moment nobody can compute.
-            IterationStep::NextIterationUnscheduled => return JobPassOutcome::Stalled,
+            IterationStatus::Closed(
+                next_iteration_status @ (NextIterationStatus::DueAt(_)
+                | NextIterationStatus::BudgetSpent
+                | NextIterationStatus::Unscheduled),
+            ) => return IterationAdvance::Closed(next_iteration_status),
         }
 
         // The start above can come back with the state another worker saved, which may already be
         // an iteration this worker has nothing left to do in.
         if !job.is_ready_for_processing() {
-            return JobPassOutcome::Stalled;
+            return IterationAdvance::Stalled;
         }
 
         debug!(started_at = %job.started_at(), "Job ready for processing");
-        match self.pick_and_execute_task(job, cancel_token).await {
-            Ok(true) => JobPassOutcome::Processed,
-            Ok(false) => JobPassOutcome::Stalled,
-            Err(InternalError::Cancelled) => {
-                debug!("Job processing cancelled");
-                JobPassOutcome::Stalled
-            }
-            Err(e) => {
-                error!("Failed to execute task: {}", e);
-                JobPassOutcome::Stalled
-            }
-        }
+        IterationAdvance::Open(job)
     }
 
     // This can be either first job run or next iteration of job run.
@@ -594,21 +424,21 @@ impl Worker {
         }
     }
 
-    async fn pick_and_execute_task(
+    /// Picks a task of the job's open iteration and writes its start; the execution is left to the
+    /// caller, outside the claim.
+    async fn start_task_in_iteration(
         &self,
         mut job: Job,
         cancel_token: &CancellationToken,
-    ) -> Result<bool, InternalError> {
+    ) -> Result<TaskStart, InternalError> {
         // TODO(low): think about what to do here, likely we have invalid job state
         let task_id = match job.pick_task_to_execute(&self.id)? {
             TaskPickup::Ready(task_id) => task_id,
-            TaskPickup::Waiting => {
+            TaskPickup::Waiting { retry_at } => {
                 debug!("Tasks for job {} not found", job.code());
-                return Ok(false);
+                return Ok(TaskStart::NoTaskAvailable { retry_at });
             }
-            TaskPickup::IterationSettled => {
-                return self.save_settled_job_iteration(job, cancel_token).await;
-            }
+            TaskPickup::IterationSettled => return self.save_settled_job_iteration(job, cancel_token).await,
         };
         let task_code = job.get_task(&task_id)?.code().clone();
         let job_code = job.code().clone();
@@ -617,7 +447,7 @@ impl Worker {
             Ok(()) => {}
             Err(JobError::TaskWorkerMismatch) => {
                 self.metrics.record_task_stolen(&job_code, &task_code, "pick_start_local");
-                return Ok(true);
+                return Ok(TaskStart::LostToAnotherWorker);
             }
             Err(e) => return Err(InternalError::from(e)),
         }
@@ -659,43 +489,81 @@ impl Worker {
 
         if outcome == SaveOutcome::TaskStolen {
             info!("Task was stolen");
-            return Ok(true);
+            return Ok(TaskStart::LostToAnotherWorker);
         }
 
         info!("Started processing task '{}' (job iter: {})", task_id, job.iter_num());
 
-        self.execute_task(job, &task_id, cancel_token.clone()).await?;
-
-        Ok(true)
+        Ok(TaskStart::Started {
+            // A walk over the state the write returned: a merge may have brought in tasks the pick
+            // never saw, and a deadline or a retry pause may have run out while the write was in flight.
+            has_pickable_task_left: job.has_pickable_task(),
+            started_task: StartedTask { job, task_id },
+        })
     }
 
+    /// Executes a task whose start [`Self::start_task`] wrote, and saves the result it ended with.
+    /// `None` when the execution was cancelled or failed before it ended with a state; the failure
+    /// is logged here.
     #[allow(clippy::map_unwrap_or)]
     #[tracing::instrument(
-        skip(self, job, cancel_token),
+        skip(self, started_task, cancel_token),
         fields(
             worker_id = %self.id,
-            job_code = %job.code(),
-            job_id = %job.id(),
-            iter = job.iter_num(),
-            task_id = %task_id,
-            task_code = %job
-                .get_task(task_id)
+            job_code = %started_task.job.code(),
+            job_id = %started_task.job.id(),
+            iter = started_task.job.iter_num(),
+            task_id = %started_task.task_id,
+            task_code = %started_task
+                .job
+                .get_task(&started_task.task_id)
                 .map(|task| task.code().clone())
                 .unwrap_or_else(|_| TaskCode::new("unknown"))
         )
     )]
-    async fn execute_task(
+    pub(crate) async fn execute_task(
+        &self,
+        started_task: StartedTask,
+        cancel_token: &CancellationToken,
+    ) -> Option<ExecutionEnd> {
+        let StartedTask { job, task_id } = started_task;
+        let execution = async {
+            let ExecutorRun { mut job, result } = self.run_task_executor(job, task_id, cancel_token).await?;
+            match result {
+                ExecutorResult::Returned(outcome) => {
+                    let resolution = self.apply_executor_outcome(&mut job, task_id, outcome)?;
+                    self.save_task(job, task_id, resolution, cancel_token).await
+                }
+                // The state returned shows the task takeable: waiting for the poll interval before a
+                // takeover that is already due would only delay it.
+                ExecutorResult::ReleasedByDeadline => Ok(ExecutionEnd::TaskEnded {
+                    has_pickable_task_left: job.has_pickable_task(),
+                }),
+            }
+        };
+        match execution.await {
+            Ok(execution_end) => Some(execution_end),
+            Err(InternalError::Cancelled) => {
+                debug!("Task execution cancelled");
+                None
+            }
+            Err(e) => {
+                error!("Failed to execute task: {}", e);
+                None
+            }
+        }
+    }
+
+    /// Runs the executor of `task_id` until it returns, and takes back the state its job handle
+    /// held; [`InternalError::Cancelled`] when the pool's shutdown came while the executor ran.
+    async fn run_task_executor(
         &self,
         job: Job,
-        task_id: &Uuid,
-        cancel_token: CancellationToken,
-    ) -> Result<(), InternalError> {
-        let task_id = *task_id;
+        task_id: Uuid,
+        cancel_token: &CancellationToken,
+    ) -> Result<ExecutorRun, InternalError> {
         let task = job.get_task(&task_id)?;
-        let task_code = task.code().clone();
-        let job_code = job.code().clone();
-
-        let executor = self.job_registry.get_task_executor(job.code(), &task.code().clone())?;
+        let executor = self.job_registry.get_task_executor(job.code(), task.code())?;
 
         // The deadline is what the executor's cancellation is scheduled by, so it is read from the
         // domain state rather than from the view the executor itself is given. It already accounts
@@ -733,7 +601,7 @@ impl Worker {
             return Err(InternalError::Cancelled);
         }
 
-        let mut job = match Arc::try_unwrap(shared_state) {
+        let job = match Arc::try_unwrap(shared_state) {
             Ok(lock) => lock.into_inner().into_job(),
             // The executor moved the handle into a task that outlived its own call. The handle is
             // already closed, so the escaped copy can no longer mutate anything; copying the state
@@ -744,14 +612,33 @@ impl Worker {
             }
         };
 
-        // The reason the save is labelled with rides on the resolution succeeding: one that failed
-        // is recorded below as a refusal and labelled there instead.
-        let result: Result<&'static str, InternalError> = match outcome {
+        let end = match outcome {
+            // A shutdown was ruled out above, so the executor was released by its own deadline.
+            Ok(Ok(TaskOutcome::Cancelled)) if deadline_cancel_token.is_cancelled() => {
+                info!("Task '{}' execution cancelled by its deadline", task_id);
+                ExecutorResult::ReleasedByDeadline
+            }
+            outcome => ExecutorResult::Returned(outcome),
+        };
+        Ok(ExecutorRun { job, result: end })
+    }
+
+    /// Records on `task_id` what its executor returned: the task's resolution, or the failure of
+    /// its execution.
+    fn apply_executor_outcome(
+        &self,
+        job: &mut Job,
+        task_id: Uuid,
+        outcome: Result<TaskResult, Box<dyn Any + Send>>,
+    ) -> Result<TaskResolution, InternalError> {
+        // The resolution rides on the domain accepting it: one it refused is recorded below as a
+        // failure of the execution instead.
+        let result: Result<TaskResolution, InternalError> = match outcome {
             // The worker closes the task itself, so an executor cannot leave one hanging by
             // forgetting to.
             Ok(Ok(TaskOutcome::Completed(output))) => job
                 .complete_task(&task_id, output, self.id)
-                .map(|()| "save_completed_task")
+                .map(|()| TaskResolution::Completed)
                 .map_err(InternalError::from),
             // A refusal the executor ruled out repeating: recorded here rather than below, because
             // below is where a refusal that may be repeated is recorded.
@@ -759,25 +646,17 @@ impl Worker {
                 .fail_task(&task_id, &reason, TaskRetry::Never, self.id)
                 .map(|rolled_back_tasks| {
                     info!(rolled_back_tasks, "Task '{}' refused terminally: {}", task_id, reason);
-                    "save_failed_task"
+                    TaskResolution::Failed
                 })
                 .map_err(InternalError::from),
             Ok(Ok(TaskOutcome::SkippedBranch(reason))) => job
                 .skip_task_by_executor(&task_id, &reason, self.id)
-                .map(|()| "save_skipped_task")
+                .map(|()| TaskResolution::Skipped)
                 .map_err(InternalError::from),
             // The executor resolved the task through its handle; touching it again would fail, so
-            // the label is read off the state it left rather than decided here.
+            // the resolution is read off the state it left rather than decided here.
             Ok(Ok(TaskOutcome::Deferred)) => {
-                Self::check_task_resolution(&job, &task_id).and_then(|()| Self::describe_resolved_task(&job, &task_id))
-            }
-            // A shutdown was ruled out above, so the executor was released by its own deadline. The
-            // task stays as it is for another worker to take over, and the pass counts as work done:
-            // backing the poll interval off before a takeover that is already due would only delay
-            // it.
-            Ok(Ok(TaskOutcome::Cancelled)) if deadline_cancel_token.is_cancelled() => {
-                info!("Task '{}' execution cancelled by its deadline", task_id);
-                return Ok(());
+                Self::check_task_resolution(job, &task_id).and_then(|()| Self::find_task_resolution(job, &task_id))
             }
             // Neither the deadline nor a shutdown released this execution, so the outcome is a
             // broken contract rather than a cancellation - including when the executor cancelled
@@ -800,44 +679,60 @@ impl Worker {
             info!("Task '{}' exceeded deadline", task_id);
         }
 
-        // The two outcomes are told apart by what they record on the task and by the reason the save
-        // is labelled with; what follows is the same for both, because an execution that failed
-        // after its executor resolved its own task leaves a resolved task behind, and that result
-        // completes the iteration exactly like a successful one.
-        let save_reason = match result {
+        // The two outcomes are told apart by what they record on the task; what follows is the same
+        // for both, because an execution that failed after its executor resolved its own task
+        // leaves a resolved task behind, and that result completes the iteration exactly like a
+        // successful one.
+        let resolution = match result {
             Err(e) => {
                 let rolled_back_tasks =
                     job.record_task_execution_failure(&task_id, &e.to_string(), TaskRetry::WhileBudgetLasts, self.id)?;
                 info!(rolled_back_tasks, "Task '{}' execution failed: {}", task_id, e);
                 // The failure may have found the task already resolved by its own executor, in
                 // which case that resolution is what the save carries.
-                Self::describe_resolved_task(&job, &task_id)?
+                Self::find_task_resolution(job, &task_id)?
             }
-            Ok(resolved_save_reason) => {
+            Ok(resolution) => {
                 info!("Task '{}' handled successfully", task_id);
-                resolved_save_reason
+                resolution
             }
         };
+        Ok(resolution)
+    }
 
+    /// Saves the result of `task_id`, merged into the stored state on a conflict, in the write that
+    /// also closes the iteration when the result settles it.
+    async fn save_task(
+        &self,
+        mut job: Job,
+        task_id: Uuid,
+        resolution: TaskResolution,
+        cancel_token: &CancellationToken,
+    ) -> Result<ExecutionEnd, InternalError> {
+        let save_reason = match resolution {
+            TaskResolution::Completed => "save_completed_task",
+            TaskResolution::Failed => "save_failed_task",
+            TaskResolution::Skipped => "save_skipped_task",
+        };
         let worker_id = self.id;
         let task_id_clone = task_id;
         let metrics = self.metrics.clone();
-        let task_code_for_metrics = task_code.clone();
-        let job_code_for_metrics = job_code.clone();
+        let task_code_for_metrics = job.find_task(&task_id)?.code().clone();
+        let job_code_for_metrics = job.code().clone();
 
-        // The iteration is closed in the pass that saves the result of its last task; left to the
+        // The iteration is closed in the write that saves the result of its last task; left to the
         // next poll, the verdict would cost a write of its own.
         //
         // A verdict that cannot be reached must not cost the result: propagating the error with `?`
         // would drop the save, the work was done once, and a task this save does not carry stays
         // `Started` in storage for takeover after takeover to repeat it. An iteration nothing can
-        // move is left for a later pass to answer for.
+        // move is left for a later task start to answer for.
         if let Err(e) = job.try_settle_iteration(&worker_id) {
             error!("Job {} iteration {} left open: {}", job.code(), job.iter_num(), e);
         }
 
         let (job, outcome) = self
-            .save_processed_task(job, &task_id, &cancel_token, move |ctx| {
+            .save_processed_task(job, &task_id, cancel_token, move |ctx| {
                 let JobMergeContext {
                     current_job,
                     mut saved_job,
@@ -845,8 +740,8 @@ impl Worker {
                 match saved_job.merge_with_processed_task(current_job, &worker_id, &task_id_clone) {
                     Ok(()) => debug!("Retry to save processed task ({save_reason})"),
                     // The merge carried the result over and left the iteration open, which a later
-                    // pass answers for; costing the retry the result it carries would leave the
-                    // task `Started` in storage instead.
+                    // task start answers for; costing the retry the result it carries would leave
+                    // the task `Started` in storage instead.
                     Err(e @ JobError::IterationDeadlock { .. }) => error!(
                         "Job {} iteration {} left open after a merge: {e}",
                         saved_job.code(),
@@ -879,7 +774,16 @@ impl Worker {
             self.job_iteration_settled(&job);
         }
 
-        Ok(())
+        if outcome == SaveOutcome::Saved
+            && let IterationStatus::Closed(next_iteration_status) = job.find_iteration_status()
+        {
+            return Ok(ExecutionEnd::IterationClosed(next_iteration_status));
+        }
+        Ok(ExecutionEnd::TaskEnded {
+            // A walk of its own: the state saved is what the settling unblocked and what a merge
+            // brought in from another worker, and no walk before the save saw either.
+            has_pickable_task_left: job.has_pickable_task(),
+        })
     }
 
     async fn save_job_state<F>(
@@ -1015,7 +919,7 @@ impl Worker {
         &self,
         job: Job,
         cancel_token: &CancellationToken,
-    ) -> Result<bool, InternalError> {
+    ) -> Result<TaskStart, InternalError> {
         let (job, outcome) = self
             .save_job_state(job, cancel_token, |ctx| {
                 debug!("Job has concurrent modification when settling the iteration - skip");
@@ -1023,11 +927,18 @@ impl Worker {
             })
             .await?;
 
-        if outcome == SaveOutcome::Saved {
-            self.job_iteration_settled(&job);
+        if outcome != SaveOutcome::Saved {
+            return Ok(TaskStart::LostToAnotherWorker);
         }
-
-        Ok(true)
+        self.job_iteration_settled(&job);
+        match job.find_iteration_status() {
+            IterationStatus::InProgress => Err(InternalError::Other(format!(
+                "job '{}' iteration {} is open after the write that settled it",
+                job.code(),
+                job.iter_num()
+            ))),
+            IterationStatus::Closed(next_iteration_status) => Ok(TaskStart::IterationClosed(next_iteration_status)),
+        }
     }
 
     /// Reports an iteration the domain closed, under the verdict it actually carries.
@@ -1101,18 +1012,12 @@ impl Worker {
         execution.await
     }
 
-    /// The save label for a task its own executor resolved, which is the state that is about to be
+    /// The resolution of a task its own executor resolved, which is the state that is about to be
     /// stored rather than the outcome the executor returned.
-    fn describe_resolved_task(job: &Job, task_id: &Uuid) -> Result<&'static str, InternalError> {
-        let task = job.find_task(task_id)?;
-        if task.is_skipped() {
-            return Ok("save_skipped_task");
-        }
-        if task.is_failed() {
-            return Ok("save_failed_task");
-        }
-
-        Ok("save_completed_task")
+    fn find_task_resolution(job: &Job, task_id: &Uuid) -> Result<TaskResolution, InternalError> {
+        job.find_task(task_id)?
+            .resolution()
+            .ok_or_else(|| InternalError::Other(format!("task '{task_id}' is left unresolved")))
     }
 
     /// Checks that the task an executor returned [`TaskOutcome::Deferred`] for is no longer open.
@@ -1133,239 +1038,22 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::error::Error;
+    use crate::core::job::{JobDefinition, JobDefinitionId, JobStatus, TaskLimits};
+    use crate::core::task::{TaskAvailability, TaskDefinition, TaskRef, TaskStatus};
+    use crate::execution::executor::{TaskExecutor, task_fn};
+    use crate::execution::outcome::JobProgress;
+    use crate::infra::metrics::NoopMetrics;
+    use crate::storage::in_memory::InMemoryStorage;
     use crate::tests::common::counting_metrics::CountingMetrics;
-    use crate::tests::common::storage_wrapper::{DeadlockPlantingStorage, SaveRefusingStorage};
-    use crate::{
-        InMemoryStorage, JobDefinition, JobDefinitionId, JobStatus, NoopMetrics, TaskDefinition, TaskExecutor,
-        TaskLimits, TaskStatus, task_fn,
-    };
+    use crate::tests::common::storage_wrapper::{ContendingStorage, DeadlockPlantingStorage, SaveRefusingStorage};
 
-    /// How many draws a test takes when it asserts on the spread of the jitter rather than on a
-    /// single value. A range of milliseconds has millions of nanoseconds in it, so this many equal
-    /// draws does not happen for any reason other than a jitter that is not drawn at all.
-    const JITTER_DRAWS: usize = 50;
-
-    fn config_with_jitter(jitter: Duration) -> WorkerConfig {
-        config_polled_every(Duration::from_millis(100)).with_poll_jitter(jitter)
-    }
-
-    fn config_polled_every(interval: Duration) -> WorkerConfig {
-        WorkerConfig::new()
-            .with_poll_interval(interval)
-            .expect("a positive poll interval is accepted")
-    }
-
-    /// Turning the jitter off must leave the poll interval as it is - a worker that waits longer
-    /// than it was configured to polls storage at half the rate its settings promise.
-    #[test]
-    fn a_zero_jitter_leaves_the_poll_interval_alone() {
-        let config = config_with_jitter(Duration::ZERO);
-
-        assert_eq!(
-            Worker::calculate_jittered_wait(&config, Duration::from_millis(100)),
-            Duration::from_millis(100)
-        );
-    }
-
-    /// The bound of the jitter is a `Duration` the caller picks freely, so the three cases around
-    /// the millisecond it used to be counted in: below it, exactly it, and above it.
-    #[test]
-    fn a_sub_millisecond_jitter_stays_within_its_bound() {
-        assert_jitter_within_bound(Duration::from_micros(500));
-    }
-
-    #[test]
-    fn a_jitter_of_exactly_one_millisecond_stays_within_its_bound() {
-        assert_jitter_within_bound(Duration::from_millis(1));
-    }
-
-    #[test]
-    fn a_multi_millisecond_jitter_stays_within_its_bound() {
-        assert_jitter_within_bound(Duration::from_millis(5));
-    }
-
-    /// Draws repeatedly, because one draw says nothing about a bound: it asserts that every wait
-    /// lands in `[poll_interval, poll_interval + bound)` and that the jitter is really drawn.
-    fn assert_jitter_within_bound(bound: Duration) {
-        let poll_interval = Duration::from_millis(100);
-        let config = config_with_jitter(bound);
-
-        let waits: Vec<Duration> = (0..JITTER_DRAWS)
-            .map(|_| Worker::calculate_jittered_wait(&config, poll_interval))
-            .collect();
-
-        for wait in &waits {
-            assert!(
-                (poll_interval..poll_interval + bound).contains(wait),
-                "a wait of {wait:?} is outside the bound of {bound:?} on top of {poll_interval:?}"
-            );
-        }
-        assert!(
-            waits.iter().any(|wait| *wait != waits[0]),
-            "every draw returned {:?}, so no jitter was added",
-            waits[0]
-        );
-    }
-
-    #[test]
-    fn a_pass_without_work_doubles_the_poll_interval() {
-        let config = config_with_jitter(Duration::ZERO);
-
-        assert_eq!(
-            Worker::calculate_backed_off_poll_interval(&config, Duration::from_millis(100)),
-            Duration::from_millis(200)
-        );
-    }
-
-    /// The backoff is what the maximum poll interval is a ceiling for, so it must stop there
-    /// instead of doubling past it.
-    #[test]
-    fn the_backoff_stops_at_the_maximum_poll_interval() {
-        let config = config_with_jitter(Duration::ZERO)
-            .with_max_poll_interval(Duration::from_millis(300))
-            .expect("a ceiling above the base interval is accepted");
-
-        assert_eq!(
-            Worker::calculate_backed_off_poll_interval(&config, Duration::from_millis(200)),
-            Duration::from_millis(300)
-        );
-    }
-
-    /// A worker given a zero interval polls storage without ever pausing, which saturates a core
-    /// and bills for an unbounded number of requests.
-    #[test]
-    fn a_zero_poll_interval_is_rejected() {
-        let Err(error) = WorkerConfig::new().with_poll_interval(Duration::ZERO) else {
-            panic!("a zero poll interval must be rejected")
-        };
-
-        assert!(
-            error.to_string().contains("poll interval must be positive"),
-            "got: {error}"
-        );
-    }
-
-    /// The maximum is the ceiling the backoff climbs to, so a value below the base would turn the
-    /// backoff into a speed-up.
-    #[test]
-    fn a_maximum_poll_interval_below_the_poll_interval_is_rejected() {
-        let Err(error) =
-            config_polled_every(Duration::from_millis(200)).with_max_poll_interval(Duration::from_millis(100))
-        else {
-            panic!("a ceiling below the base interval must be rejected")
-        };
-
-        assert!(
-            error.to_string().contains("max poll interval must not be below"),
-            "got: {error}"
-        );
-    }
-
-    /// The same pair named in the other order: a config accepting it either way would depend on
-    /// which setting its caller happened to name first.
-    #[test]
-    fn a_poll_interval_above_a_named_maximum_is_rejected() {
-        let named_ceiling = config_polled_every(Duration::from_millis(50))
-            .with_max_poll_interval(Duration::from_millis(100))
-            .expect("a ceiling above the base interval is accepted");
-
-        let Err(error) = named_ceiling.with_poll_interval(Duration::from_millis(200)) else {
-            panic!("a base interval above the named ceiling must be rejected")
-        };
-
-        assert!(
-            error.to_string().contains("max poll interval must not be below"),
-            "got: {error}"
-        );
-    }
-
-    /// A ceiling equal to the base is what a job polled exactly as rarely as it backs off asks for,
-    /// so it has to pass rather than sit on the wrong side of the comparison.
-    #[test]
-    fn a_maximum_poll_interval_equal_to_the_poll_interval_is_accepted() {
-        let config = config_polled_every(Duration::from_secs(10))
-            .with_max_poll_interval(Duration::from_secs(10))
-            .expect("a ceiling equal to the base interval is accepted");
-
-        assert_eq!(config.max_poll_interval(), Duration::from_secs(10));
-    }
-
-    /// An unnamed ceiling is the poll interval multiplied, so a rarely polled pool still has room
-    /// to back off; a fixed ceiling would sit at or below such an interval and cancel the backoff.
-    #[test]
-    fn an_unnamed_maximum_poll_interval_scales_with_a_long_poll_interval() {
-        let config = config_polled_every(Duration::from_secs(5));
-
-        assert_eq!(config.max_poll_interval(), Duration::from_secs(50));
-    }
-
-    /// The same rule at the other end of the range: a frequently polled pool gets a ceiling as
-    /// close as its interval is, rather than one named for a pool polled at another rate.
-    #[test]
-    fn an_unnamed_maximum_poll_interval_scales_with_a_short_poll_interval() {
-        let config = config_polled_every(Duration::from_millis(10));
-
-        assert_eq!(config.max_poll_interval(), Duration::from_millis(100));
-    }
-
-    /// The scheduler multiplies, doubles and adds intervals to an `Instant`, and every one of those
-    /// panics on overflow - so an interval it cannot compute with is refused at the boundary rather
-    /// than taken down the pass that crashes the worker.
-    #[test]
-    fn a_poll_interval_above_the_longest_accepted_one_is_rejected() {
-        let Err(error) = WorkerConfig::new().with_poll_interval(Duration::MAX) else {
-            panic!("a poll interval past the accepted range must be rejected")
-        };
-
-        assert!(
-            error.to_string().contains("poll interval must not exceed"),
-            "got: {error}"
-        );
-    }
-
-    /// The ceiling is an interval the scheduler computes with just as the base one is, so it is
-    /// held to the same range - naming it is not a way around the bound.
-    #[test]
-    fn a_maximum_poll_interval_above_the_longest_accepted_one_is_rejected() {
-        let Err(error) = WorkerConfig::new().with_max_poll_interval(Duration::MAX) else {
-            panic!("a ceiling past the accepted range must be rejected")
-        };
-
-        assert!(
-            error.to_string().contains("max poll interval must not exceed"),
-            "got: {error}"
-        );
-    }
-
-    /// The accepted range and the default factor are two halves of one rule: the ceiling derived
-    /// from the longest accepted interval is doubled again by the backoff, and neither step may
-    /// leave `Duration` behind. Raising either constant without the other panics here.
-    #[test]
-    fn the_longest_accepted_poll_interval_survives_the_backoff_arithmetic() {
-        let config = config_polled_every(WorkerConfig::LONGEST_ACCEPTED_POLL_INTERVAL);
-        let ceiling = config.max_poll_interval();
-
-        assert_eq!(Worker::calculate_backed_off_poll_interval(&config, ceiling), ceiling);
-    }
-
-    /// Regression: with a fixed default ceiling, a pool polled less often than that ceiling had
-    /// `min(interval * 2, ceiling)` collapse to the interval itself - the backoff never grew at all.
-    #[test]
-    fn a_backoff_grows_at_a_poll_interval_above_the_old_default() {
-        let config = config_polled_every(Duration::from_secs(5));
-
-        assert_eq!(
-            Worker::calculate_backed_off_poll_interval(&config, Duration::from_secs(5)),
-            Duration::from_secs(10)
-        );
-    }
-
-    /// Deadline of the task the pass below runs, and so how long its executor waits for the token.
+    /// Deadline of the task the tests below run, and so how long its executor waits for the token.
     const CANCELLED_TASK_TIMEOUT: Duration = Duration::from_millis(50);
 
-    /// Longest the pass below may take: two orders of magnitude above the task's deadline, so a
-    /// loaded machine does not fail the test, while a cancellation that never arrives does - with a
-    /// diagnostic rather than a hung run.
+    /// Longest a task start or an execution below may take: two orders of magnitude above the
+    /// task's deadline, so a loaded machine does not fail the test, while a cancellation that never
+    /// arrives does - with a diagnostic rather than a hung run.
     const PROGRESS_TIMEOUT: Duration = Duration::from_secs(5);
 
     /// Sink for a worker whose iterations nobody waits for.
@@ -1375,27 +1063,54 @@ mod tests {
         fn record_finished_iteration(&self, _job_code: &JobCode, _iter_num: u64) {}
     }
 
+    /// Whether `progress` names a task another worker may start at once.
+    fn is_task_pickable_now(progress: JobProgress) -> bool {
+        matches!(progress, JobProgress::TaskPickable)
+    }
+
     fn worker_running(job_def: JobDefinition, storage: Arc<dyn Storage>) -> Result<Worker, Error> {
         worker_measured_by(job_def, storage, Arc::new(NoopMetrics))
     }
 
-    /// The same worker recording into `metrics`, for a pass whose measurement is what is asserted.
+    /// The same worker recording into `metrics`, for a test whose measurement is what is asserted.
     fn worker_measured_by(
         job_def: JobDefinition,
         storage: Arc<dyn Storage>,
         metrics: Arc<dyn MetricsSink>,
     ) -> Result<Worker, Error> {
         Ok(Worker::new(
-            Arc::new(JobRegistry::new(vec![job_def])?),
-            storage,
-            config_polled_every(Duration::from_millis(10)),
-            metrics,
-            None,
-            Arc::new(IgnoredIterations),
+            Uuid::new_v4(),
+            RetrierConfig::default(),
+            WorkerContext {
+                job_registry: Arc::new(JobRegistry::new(vec![job_def])?),
+                storage,
+                metrics,
+                iteration_notifier: None,
+                finished_iterations: Arc::new(IgnoredIterations),
+            },
         ))
     }
 
-    /// A description of one task running `executor`, for the two passes below.
+    /// One task start of `worker` on `job_code`, bounded so a start that never ends fails the test.
+    async fn start_task_of(worker: &Worker, job_code: &JobCode, cancel_token: &CancellationToken) -> TaskStart {
+        tokio::time::timeout(PROGRESS_TIMEOUT, worker.start_task(job_code, cancel_token))
+            .await
+            .expect("the task start must finish")
+    }
+
+    /// The execution of the task `task_start` started, bounded the same way, as the schedule reads
+    /// its end.
+    async fn execute_task_of(worker: &Worker, task_start: TaskStart, cancel_token: &CancellationToken) -> JobProgress {
+        let TaskStart::Started { started_task, .. } = task_start else {
+            panic!("the task start must have started a task");
+        };
+        let execution_end = tokio::time::timeout(PROGRESS_TIMEOUT, worker.execute_task(started_task, cancel_token))
+            .await
+            .expect("the execution must finish");
+        JobProgress::from_job_execution(execution_end)
+    }
+
+    /// A description of one task running `executor`, for the tests below.
     fn job_running(job_code: &str, timeout: Duration, executor: Arc<dyn TaskExecutor>) -> JobDefinition {
         JobDefinition::new(
             JobDefinitionId::new(),
@@ -1411,10 +1126,10 @@ mod tests {
     /// The label a save of a `Deferred` outcome carries names the state the executor left, not the
     /// outcome it returned: an executor that gave up on its branch through the handle stores a
     /// skipped task, and a save labelled as a completion would send every conflict and every
-    /// takeover of that pass into the metrics under the wrong phase.
+    /// takeover of that execution into the metrics under the wrong phase.
     ///
-    /// The break that proves it: returning a fixed `"save_completed_task"` from
-    /// `Worker::describe_resolved_task`.
+    /// The break that proves it: returning a fixed `TaskResolution::Completed` from
+    /// `Worker::find_task_resolution`.
     #[test]
     fn a_task_its_executor_resolved_is_labelled_by_the_state_it_left() {
         let job_def = job_running(
@@ -1424,49 +1139,45 @@ mod tests {
         );
         let worker_id = Uuid::from_u128(1);
 
-        for (resolve, expected) in [
-            (Resolution::Completed, "save_completed_task"),
-            (Resolution::Failed, "save_failed_task"),
-            (Resolution::Skipped, "save_skipped_task"),
+        for resolution in [
+            TaskResolution::Completed,
+            TaskResolution::Failed,
+            TaskResolution::Skipped,
         ] {
             let mut job = Job::new(&job_def, HashMap::new(), worker_id).expect("the description must build a job");
             let task_id = *job.tasks_as_iter().next().expect("the description declares one task").id();
             job.start_work(&worker_id).expect("a new job starts running");
             job.start_task(&task_id, worker_id).expect("a todo task must start");
-            match resolve {
-                Resolution::Completed => job
+            match resolution {
+                TaskResolution::Completed => job
                     .complete_task(&task_id, Vec::new(), worker_id)
                     .expect("a started task completes"),
-                Resolution::Failed => {
+                TaskResolution::Failed => {
                     job.fail_task(&task_id, "refused", TaskRetry::WhileBudgetLasts, worker_id)
                         .map(|_| ())
                         .expect("a started task fails");
                 }
-                Resolution::Skipped => job
+                TaskResolution::Skipped => job
                     .skip_task_by_executor(&task_id, "pointless", worker_id)
                     .expect("a started task is skipped"),
             }
 
             assert_eq!(
-                Worker::describe_resolved_task(&job, &task_id).expect("the task is part of the job"),
-                expected
+                Worker::find_task_resolution(&job, &task_id).expect("the task is resolved"),
+                resolution
             );
         }
     }
 
-    /// How the fixture above resolves the task before the label is read.
-    enum Resolution {
-        Completed,
-        Failed,
-        Skipped,
-    }
-
     /// A cancellation the executor reports after its own deadline passed is not the pool shutting
-    /// down - the shutdown is ruled out before the outcome is read. The pass picked, started and
-    /// persisted the task, and the task is due to be taken over, so it counts as work done: treated
-    /// as a shutdown it would instead double the wait before the next poll.
+    /// down - the shutdown is ruled out before the outcome is read. The task stays `Started` past
+    /// its deadline, which another worker takes over at once: reported as nothing to take, the
+    /// takeover would wait for the poll interval.
+    ///
+    /// Checked by returning `JobProgress::NothingPickable` for every execution that ended without
+    /// an error.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_pass_whose_executor_was_cancelled_by_the_deadline_counts_as_work_done() {
+    async fn an_execution_released_by_its_deadline_leaves_its_task_pickable_at_once() {
         let executor = task_fn(|ctx| async move {
             ctx.cancel_token().cancelled().await;
             Ok(TaskOutcome::Cancelled)
@@ -1475,18 +1186,18 @@ mod tests {
         let job_code = job_def.code().clone();
         let worker =
             worker_running(job_def, Arc::new(InMemoryStorage::new())).expect("the test worker must be constructible");
+        let cancel_token = CancellationToken::new();
 
-        let outcome = tokio::time::timeout(
-            PROGRESS_TIMEOUT,
-            worker.process_job(&job_code, &CancellationToken::new()),
-        )
-        .await
-        .expect("the deadline must release the executor and let the pass finish");
+        let task_start = start_task_of(&worker, &job_code, &cancel_token).await;
+        assert!(
+            matches!(task_start, TaskStart::Started { .. }),
+            "the task start must start the task"
+        );
+        let execution_end = execute_task_of(&worker, task_start, &cancel_token).await;
 
-        assert_eq!(
-            outcome,
-            JobPassOutcome::Processed,
-            "a pass released by the task's own deadline must count as progress, not as a stall"
+        assert!(
+            is_task_pickable_now(execution_end),
+            "a task released by its own deadline must be takeable at once, got {execution_end:?}"
         );
     }
 
@@ -1518,8 +1229,8 @@ mod tests {
         assert_task_failed_by("self_cancelled_job", executor).await;
     }
 
-    /// Stores `job_def`'s first iteration already finished, which is the state a pass reads as
-    /// "start the next one": built through the production API, so no state a legal run cannot
+    /// Stores `job_def`'s first iteration already finished, which is the state a task start reads
+    /// as "start the next one": built through the production API, so no state a legal run cannot
     /// reach is persisted.
     async fn store_with_a_finished_iteration(
         job_def: &JobDefinition,
@@ -1540,11 +1251,11 @@ mod tests {
         Ok(storage)
     }
 
-    /// A pass whose write of the new iteration was refused moved nothing, so it has to back off
-    /// like any other empty pass. Counted as work done - which is what it used to be - the worker
-    /// would keep the base interval and repeat the same refused write at full rate.
+    /// A task start whose write of the new iteration was refused moved nothing, so it has to back
+    /// off like any other that moved nothing. Counted as work done - which is what it used to be -
+    /// the worker would keep the base interval and repeat the same refused write at full rate.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_pass_that_cannot_save_the_iteration_it_started_counts_as_stalled()
+    async fn a_task_start_that_cannot_save_the_iteration_it_started_counts_as_stalled()
     -> Result<(), Box<dyn std::error::Error>> {
         let job_def = job_running(
             "unsavable_iteration_job",
@@ -1558,19 +1269,18 @@ mod tests {
         let worker = worker_running(job_def, Arc::clone(&refusing_storage) as Arc<dyn Storage>)?;
         let cancel_token = CancellationToken::new();
 
-        let outcome = tokio::time::timeout(PROGRESS_TIMEOUT, worker.process_job(&job_code, &cancel_token))
+        let task_start = tokio::time::timeout(PROGRESS_TIMEOUT, worker.start_task(&job_code, &cancel_token))
             .await
-            .map_err(|_| "a refused save must fail the pass rather than be retried forever")?;
+            .map_err(|_| "a refused save must fail the task start rather than be retried forever")?;
 
         assert_eq!(
             refusing_storage.refused_saves(),
             1,
-            "the pass must have reached the write of the new iteration, and reached it once"
+            "the task start must have reached the write of the new iteration, and reached it once"
         );
-        assert_eq!(
-            outcome,
-            JobPassOutcome::Stalled,
-            "a pass that wrote nothing is not a pass that moved the job"
+        assert!(
+            matches!(task_start, TaskStart::Stalled),
+            "a task start that wrote nothing is not one that moved the job"
         );
         let stored = storage.get_job(&job_code, &cancel_token).await?;
         assert_eq!(stored.iter_num(), 1, "the refused iteration must not be stored");
@@ -1583,10 +1293,10 @@ mod tests {
     const RUNNING_TASK_CODE: &str = "cancelled";
 
     /// A merge that leaves the iteration unable to progress must not cost the result it carried: the
-    /// task the executor finished is written and the iteration is left open for a later pass to
-    /// answer for. Dropping the save instead would leave the task `Started` in storage, for takeover
-    /// after takeover to repeat work that was already done. The repeated write is measured like any
-    /// other retry after a conflict, since the write is repeated for the same reason.
+    /// task the executor finished is written and the iteration is left open for a later task start
+    /// to answer for. Dropping the save instead would leave the task `Started` in storage, for
+    /// takeover after takeover to repeat work that was already done. The repeated write is measured
+    /// like any other retry after a conflict, since the write is repeated for the same reason.
     ///
     /// Two breaks prove it: propagating the deadlock with `?` from the merge handler in
     /// `Worker::execute_task` loses the result, and recording the conflict retry in the `Ok(())` arm
@@ -1614,11 +1324,13 @@ mod tests {
         )?;
         let cancel_token = CancellationToken::new();
 
-        let outcome = tokio::time::timeout(PROGRESS_TIMEOUT, worker.process_job(&job_code, &cancel_token))
-            .await
-            .map_err(|_| "a deadlocked merge must be retried once, not forever")?;
+        let task_start = start_task_of(&worker, &job_code, &cancel_token).await;
+        assert!(
+            matches!(task_start, TaskStart::Started { .. }),
+            "the task start must start the task"
+        );
+        execute_task_of(&worker, task_start, &cancel_token).await;
 
-        assert_eq!(outcome, JobPassOutcome::Processed);
         assert_eq!(
             storage.interferences(),
             1,
@@ -1654,439 +1366,8 @@ mod tests {
         Ok(())
     }
 
-    /// Base interval every scheduling test below measures against.
-    const BASE_POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-    /// Slack allowed when comparing a scheduled moment: the moment is taken before the assertion,
-    /// so the delay measured is always a little shorter than the interval it was set from.
-    const SCHEDULING_SLACK: Duration = Duration::from_millis(50);
-
-    /// A legal one-task description whose code is all the scheduling tests below need: they call
-    /// the scheduler directly and never let a worker reach storage.
-    fn idle_job(job_code: &str) -> JobDefinition {
-        job_running(
-            job_code,
-            UNCANCELLED_TASK_TIMEOUT,
-            task_fn(|_ctx| async { Ok(TaskOutcome::empty()) }),
-        )
-    }
-
-    /// Jitter is off here: it has tests of its own, and a random addend would make every scheduled
-    /// moment below a range rather than a value.
-    fn worker_over_jobs(job_defs: Vec<JobDefinition>, storage: Arc<dyn Storage>) -> Worker {
-        worker_over_jobs_with_config(
-            job_defs,
-            storage,
-            config_polled_every(BASE_POLL_INTERVAL).with_poll_jitter(Duration::ZERO),
-        )
-    }
-
-    /// The same worker built with settings the test names itself, for the two rules whose oracle is
-    /// a setting: a ceiling or a jitter read back out of the config is the value the scheduler takes
-    /// it from, so the comparison would hold whatever that value became.
-    fn worker_over_jobs_with_config(
-        job_defs: Vec<JobDefinition>,
-        storage: Arc<dyn Storage>,
-        config: WorkerConfig,
-    ) -> Worker {
-        Worker::new(
-            Arc::new(JobRegistry::new(job_defs).expect("the test registry must build")),
-            storage,
-            config,
-            Arc::new(NoopMetrics),
-            None,
-            Arc::new(IgnoredIterations),
-        )
-    }
-
-    /// How long from now the worker will wait before polling `job_code` again.
-    fn scheduled_delay(worker: &Worker, job_code: &JobCode) -> Duration {
-        worker
-            .job_cache
-            .read()
-            .get(job_code)
-            .expect("the job must have been scheduled")
-            .next_poll
-            .saturating_duration_since(std::time::Instant::now())
-    }
-
-    fn assert_delay_near(actual: Duration, expected: Duration, what: &str) {
-        assert!(
-            actual <= expected && actual + SCHEDULING_SLACK >= expected,
-            "{what}: got {actual:?}, expected about {expected:?}"
-        );
-    }
-
-    #[test]
-    fn a_pass_with_work_schedules_the_next_poll_at_the_base_interval() {
-        let job_def = idle_job("worked_job");
-        let job_code = job_def.code().clone();
-        let worker = worker_over_jobs(vec![job_def], Arc::new(InMemoryStorage::new()));
-
-        worker.schedule_next_poll(&job_code, JobPassOutcome::Stalled);
-        worker.schedule_next_poll(&job_code, JobPassOutcome::Processed);
-
-        assert_delay_near(
-            scheduled_delay(&worker, &job_code),
-            BASE_POLL_INTERVAL,
-            "a pass that moved the job must schedule the next poll at the base interval",
-        );
-    }
-
-    /// The backoff step a job carries is dropped back to the base interval by a pass that moved it,
-    /// and only the next stalled pass reads that step: without the reset, a job that was idle for a
-    /// while would go on backing off from where it left off, however much work it has since done.
-    #[test]
-    fn a_pass_with_work_resets_the_backoff_step_of_its_job() {
-        let job_def = idle_job("resumed_job");
-        let job_code = job_def.code().clone();
-        let worker = worker_over_jobs(vec![job_def], Arc::new(InMemoryStorage::new()));
-
-        worker.schedule_next_poll(&job_code, JobPassOutcome::Stalled);
-        worker.schedule_next_poll(&job_code, JobPassOutcome::Stalled);
-        worker.schedule_next_poll(&job_code, JobPassOutcome::Processed);
-        worker.schedule_next_poll(&job_code, JobPassOutcome::Stalled);
-
-        assert_delay_near(
-            scheduled_delay(&worker, &job_code),
-            BASE_POLL_INTERVAL * 2,
-            "the stalled pass must back off from the base interval the pass with work restored",
-        );
-    }
-
-    #[test]
-    fn a_stalled_pass_doubles_the_interval_of_that_job() {
-        let job_def = idle_job("idle_job");
-        let job_code = job_def.code().clone();
-        let worker = worker_over_jobs(vec![job_def], Arc::new(InMemoryStorage::new()));
-
-        worker.schedule_next_poll(&job_code, JobPassOutcome::Stalled);
-
-        assert_delay_near(
-            scheduled_delay(&worker, &job_code),
-            BASE_POLL_INTERVAL * 2,
-            "a stalled pass must back the job's own interval off",
-        );
-    }
-
-    /// Ceiling the two tests below name for themselves, so what they compare against is a value of
-    /// the test rather than one the scheduler derives from the same config it reads. Three times
-    /// [`BASE_POLL_INTERVAL`], so the second stalled pass is already held down to it.
-    const NAMED_CEILING: Duration = Duration::from_millis(300);
-
-    /// Settings whose backoff stops at [`NAMED_CEILING`].
-    fn config_capped_at_the_named_ceiling() -> WorkerConfig {
-        config_polled_every(BASE_POLL_INTERVAL)
-            .with_max_poll_interval(NAMED_CEILING)
-            .expect("a ceiling above the base interval is accepted")
-            .with_poll_jitter(Duration::ZERO)
-    }
-
-    /// The ceiling bounds the job's own step, not just the formula: a scheduler that doubled the
-    /// step itself would push a quiet job past the rate its pool was configured to poll at.
-    #[test]
-    fn the_backoff_step_stops_at_the_ceiling_the_config_names() {
-        let job_def = idle_job("capped_job");
-        let job_code = job_def.code().clone();
-        let worker = worker_over_jobs_with_config(
-            vec![job_def],
-            Arc::new(InMemoryStorage::new()),
-            config_capped_at_the_named_ceiling(),
-        );
-
-        // Four passes: the step reaches the ceiling on the second and has to stay there for the
-        // two after it.
-        for _ in 0..4 {
-            worker.schedule_next_poll(&job_code, JobPassOutcome::Stalled);
-        }
-
-        assert_delay_near(
-            scheduled_delay(&worker, &job_code),
-            NAMED_CEILING,
-            "the backoff must stop at the ceiling the config was given",
-        );
-    }
-
-    /// The backoff of one job must not reach another: a pool running a busy job beside an idle one
-    /// used to hold both at the base interval, and holding both at the ceiling would be the same
-    /// mistake mirrored.
-    #[test]
-    fn the_backoff_of_an_idle_job_does_not_reach_a_busy_one() {
-        let idle = idle_job("idle_neighbour");
-        let busy = idle_job("busy_neighbour");
-        let idle_code = idle.code().clone();
-        let busy_code = busy.code().clone();
-        let worker = worker_over_jobs(vec![idle, busy], Arc::new(InMemoryStorage::new()));
-
-        worker.schedule_next_poll(&idle_code, JobPassOutcome::Stalled);
-        worker.schedule_next_poll(&idle_code, JobPassOutcome::Stalled);
-        worker.schedule_next_poll(&busy_code, JobPassOutcome::Processed);
-
-        assert_delay_near(
-            scheduled_delay(&worker, &busy_code),
-            BASE_POLL_INTERVAL,
-            "the busy job keeps the base interval",
-        );
-        assert!(
-            scheduled_delay(&worker, &idle_code) > BASE_POLL_INTERVAL,
-            "the idle job must have backed off independently"
-        );
-    }
-
-    /// The whole point of the change: a completed job costs nothing until its next iteration is
-    /// allowed to begin.
-    #[test]
-    fn a_completed_job_is_polled_when_its_next_iteration_is_due() {
-        let job_def = idle_job("scheduled_job");
-        let job_code = job_def.code().clone();
-        let worker = worker_over_jobs(vec![job_def], Arc::new(InMemoryStorage::new()));
-
-        worker.schedule_next_poll(
-            &job_code,
-            JobPassOutcome::NextIterationDueAt(Utc::now() + chrono::Duration::seconds(30)),
-        );
-
-        assert_delay_near(
-            scheduled_delay(&worker, &job_code),
-            Duration::from_secs(30),
-            "a job due in thirty seconds must not be polled before then",
-        );
-    }
-
-    /// A moment already past is polled at once: the job is due, and the pass that starts its
-    /// iteration is the one thing that can move it.
-    #[test]
-    fn a_due_moment_in_the_past_schedules_an_immediate_poll() {
-        let job_def = idle_job("overdue_job");
-        let job_code = job_def.code().clone();
-        let worker = worker_over_jobs(vec![job_def], Arc::new(InMemoryStorage::new()));
-
-        worker.schedule_next_poll(
-            &job_code,
-            JobPassOutcome::NextIterationDueAt(Utc::now() - chrono::Duration::seconds(30)),
-        );
-
-        assert_eq!(
-            scheduled_delay(&worker, &job_code),
-            Duration::ZERO,
-            "an overdue job must not be made to wait"
-        );
-    }
-
-    /// Moment the job below is due at: inside the base interval, which is what the regression was
-    /// about, and far enough from it that the slack of the comparison cannot bridge the two.
-    const DUE_SOONER_THAN_BASE: Duration = Duration::from_millis(10);
-
-    /// Regression: the delay used to be raised to the base interval, so a job whose iterations come
-    /// round faster than the pool polls started every one of them late, by the difference.
-    #[test]
-    fn a_moment_due_sooner_than_the_base_interval_is_not_delayed_to_it() {
-        let job_def = idle_job("soon_due_job");
-        let job_code = job_def.code().clone();
-        let worker = worker_over_jobs(vec![job_def], Arc::new(InMemoryStorage::new()));
-
-        worker.schedule_next_poll(
-            &job_code,
-            JobPassOutcome::NextIterationDueAt(
-                Utc::now() + chrono::Duration::from_std(DUE_SOONER_THAN_BASE).expect("the test delay must convert"),
-            ),
-        );
-
-        assert_delay_near(
-            scheduled_delay(&worker, &job_code),
-            DUE_SOONER_THAN_BASE,
-            "a job due before the next base interval must be polled when it is due",
-        );
-    }
-
-    /// A moment an executor sets through `JobHandle::set_next_start_at` passes no boundary check,
-    /// unlike a configured interval, and the scheduler adds it to an `Instant`, which panics on
-    /// overflow. The furthest moment a `DateTime` can hold is therefore scheduled as the longest
-    /// interval a worker accepts.
-    #[test]
-    fn a_moment_beyond_the_longest_accepted_interval_is_scheduled_at_it() {
-        let job_def = idle_job("far_future_job");
-        let job_code = job_def.code().clone();
-        let worker = worker_over_jobs(vec![job_def], Arc::new(InMemoryStorage::new()));
-
-        worker.schedule_next_poll(&job_code, JobPassOutcome::NextIterationDueAt(DateTime::<Utc>::MAX_UTC));
-
-        assert_delay_near(
-            scheduled_delay(&worker, &job_code),
-            WorkerConfig::LONGEST_ACCEPTED_POLL_INTERVAL,
-            "a moment past the accepted range must be capped at it",
-        );
-    }
-
-    /// The counterpart of the reset a pass with work makes: a pass that found the next iteration
-    /// scheduled moved nothing either, but it learned exactly when the job is worth polling again,
-    /// so the step it carried into that pass has answered for nothing and must not survive it.
-    #[test]
-    fn a_pass_that_found_the_next_iteration_scheduled_resets_the_backoff_step() {
-        let job_def = idle_job("rescheduled_job");
-        let job_code = job_def.code().clone();
-        let worker = worker_over_jobs(vec![job_def], Arc::new(InMemoryStorage::new()));
-
-        worker.schedule_next_poll(&job_code, JobPassOutcome::Stalled);
-        worker.schedule_next_poll(&job_code, JobPassOutcome::Stalled);
-        worker.schedule_next_poll(
-            &job_code,
-            JobPassOutcome::NextIterationDueAt(Utc::now() + chrono::Duration::seconds(30)),
-        );
-        worker.schedule_next_poll(&job_code, JobPassOutcome::Stalled);
-
-        assert_delay_near(
-            scheduled_delay(&worker, &job_code),
-            BASE_POLL_INTERVAL * 2,
-            "the stalled pass must back off from the base interval the scheduled pass restored",
-        );
-    }
-
-    #[test]
-    fn an_exhausted_job_is_not_polled_again() {
-        let job_def = idle_job("exhausted_job");
-        let job_code = job_def.code().clone();
-        let worker = worker_over_jobs(vec![job_def], Arc::new(InMemoryStorage::new()));
-
-        worker.schedule_next_poll(&job_code, JobPassOutcome::IterationBudgetSpent);
-
-        assert!(
-            !worker.should_poll_job(&job_code),
-            "an exhausted job must not be polled"
-        );
-    }
-
-    /// The gate is what turns a scheduled moment into a pass that never reaches storage, so both
-    /// sides of the moment are asserted: a job scheduled ahead is skipped, one whose moment has
-    /// passed is polled.
-    #[test]
-    fn a_job_is_polled_only_once_its_scheduled_moment_has_passed() {
-        let job_def = idle_job("gated_job");
-        let job_code = job_def.code().clone();
-        let worker = worker_over_jobs(vec![job_def], Arc::new(InMemoryStorage::new()));
-
-        worker.schedule_next_poll(
-            &job_code,
-            JobPassOutcome::NextIterationDueAt(Utc::now() + chrono::Duration::seconds(30)),
-        );
-        assert!(
-            !worker.should_poll_job(&job_code),
-            "a job due in thirty seconds must not be polled yet"
-        );
-
-        worker.schedule_next_poll(
-            &job_code,
-            JobPassOutcome::NextIterationDueAt(Utc::now() - chrono::Duration::seconds(1)),
-        );
-        assert!(
-            worker.should_poll_job(&job_code),
-            "a job whose moment has passed must be polled"
-        );
-    }
-
-    /// The wait is what turns per-job scheduling into saved requests: a worker that kept waking on
-    /// a fixed interval would poll nothing and still burn a pass.
-    #[test]
-    fn the_wait_lasts_until_the_nearest_scheduled_poll() {
-        let near = idle_job("near_job");
-        let far = idle_job("far_job");
-        let near_code = near.code().clone();
-        let far_code = far.code().clone();
-        let worker = worker_over_jobs(vec![near, far], Arc::new(InMemoryStorage::new()));
-
-        worker.schedule_next_poll(
-            &far_code,
-            JobPassOutcome::NextIterationDueAt(Utc::now() + chrono::Duration::seconds(30)),
-        );
-        worker.schedule_next_poll(&near_code, JobPassOutcome::Processed);
-
-        assert_delay_near(
-            worker.calculate_wait_duration(),
-            BASE_POLL_INTERVAL,
-            "the wait must end when the nearest job is due",
-        );
-    }
-
-    /// A job the worker has not polled yet has no scheduled moment, so it must not be waited past.
-    #[test]
-    fn an_unpolled_job_keeps_the_base_wait() {
-        let scheduled = idle_job("scheduled_neighbour");
-        let unpolled = idle_job("unpolled_neighbour");
-        let scheduled_code = scheduled.code().clone();
-        let worker = worker_over_jobs(vec![scheduled, unpolled], Arc::new(InMemoryStorage::new()));
-
-        worker.schedule_next_poll(
-            &scheduled_code,
-            JobPassOutcome::NextIterationDueAt(Utc::now() + chrono::Duration::seconds(30)),
-        );
-
-        assert_delay_near(
-            worker.calculate_wait_duration(),
-            BASE_POLL_INTERVAL,
-            "a job that was never polled must be polled on the next step",
-        );
-    }
-
-    /// Jitter of the wait below: half the base interval, which is orders of magnitude above the
-    /// time the draws themselves take, so a wait that was not spread cannot pass for a spread one.
-    const WAIT_JITTER: Duration = Duration::from_millis(50);
-
-    /// The jitter is not cosmetic: it is the only thing that spreads the moment every worker of
-    /// every pool wakes to one scheduled job, and all but one of them pay a rejected write for
-    /// waking together (see [`WorkerConfig::poll_jitter`]).
-    ///
-    /// One job is left unpolled, which is what makes the wait the configured interval itself rather
-    /// than the remainder until a scheduled moment: the remainder is measured against the clock on
-    /// every call, so the draws would differ with no jitter at all.
-    #[test]
-    fn the_wait_between_passes_is_spread_by_the_jitter() {
-        let scheduled = idle_job("jittered_neighbour");
-        let unpolled = idle_job("unpolled_jittered_neighbour");
-        let scheduled_code = scheduled.code().clone();
-        let worker = worker_over_jobs_with_config(
-            vec![scheduled, unpolled],
-            Arc::new(InMemoryStorage::new()),
-            config_polled_every(BASE_POLL_INTERVAL).with_poll_jitter(WAIT_JITTER),
-        );
-        worker.schedule_next_poll(&scheduled_code, JobPassOutcome::Processed);
-
-        let waits: Vec<Duration> = (0..JITTER_DRAWS).map(|_| worker.calculate_wait_duration()).collect();
-
-        for wait in &waits {
-            assert!(
-                (BASE_POLL_INTERVAL..BASE_POLL_INTERVAL + WAIT_JITTER).contains(wait),
-                "a wait of {wait:?} is outside the jitter of {WAIT_JITTER:?} on top of \
-                 {BASE_POLL_INTERVAL:?}"
-            );
-        }
-        assert!(
-            waits.iter().any(|wait| *wait != waits[0]),
-            "every wait was {:?}, so the workers were not spread at all",
-            waits[0]
-        );
-    }
-
-    #[test]
-    fn a_worker_whose_jobs_are_all_exhausted_waits_the_ceiling() {
-        let job_def = idle_job("spent_job");
-        let job_code = job_def.code().clone();
-        let worker = worker_over_jobs_with_config(
-            vec![job_def],
-            Arc::new(InMemoryStorage::new()),
-            config_capped_at_the_named_ceiling(),
-        );
-
-        worker.schedule_next_poll(&job_code, JobPassOutcome::IterationBudgetSpent);
-
-        assert_delay_near(
-            worker.calculate_wait_duration(),
-            NAMED_CEILING,
-            "a worker with nothing to poll must wait the ceiling it was given",
-        );
-    }
-
-    /// Runs one pass of a worker over a job whose only task `executor` refuses, and asserts the
-    /// refusal was recorded as a failure rather than honoured as a cancellation.
+    /// Runs one task start and its execution on a job whose only task `executor` refuses, and
+    /// asserts the refusal was recorded as a failure rather than honoured as a cancellation.
     async fn assert_task_failed_by(job_code: &str, executor: Arc<dyn TaskExecutor>) {
         let job_def = job_running(job_code, UNCANCELLED_TASK_TIMEOUT, executor);
         let job_code = job_def.code().clone();
@@ -2095,15 +1376,13 @@ mod tests {
             .expect("the test worker must be constructible");
         let cancel_token = CancellationToken::new();
 
-        let outcome = tokio::time::timeout(PROGRESS_TIMEOUT, worker.process_job(&job_code, &cancel_token))
-            .await
-            .expect("the pass must finish without waiting for the deadline");
-
-        assert_eq!(
-            outcome,
-            JobPassOutcome::Processed,
-            "a pass that failed a task is not an idle one"
+        let task_start = start_task_of(&worker, &job_code, &cancel_token).await;
+        assert!(
+            matches!(task_start, TaskStart::Started { .. }),
+            "the task start must start the task"
         );
+        execute_task_of(&worker, task_start, &cancel_token).await;
+
         let job = storage
             .get_job(&job_code, &cancel_token)
             .await
@@ -2115,5 +1394,194 @@ mod tests {
             "got: {}",
             task.resolution_reason()
         );
+    }
+
+    /// A job of two tasks running `executor`; the second depends on the first when
+    /// `is_second_dependent` is set, and runs alongside it otherwise.
+    fn job_of_two_tasks(job_code: &str, is_second_dependent: bool, executor: Arc<dyn TaskExecutor>) -> JobDefinition {
+        let definition_id = JobDefinitionId::new();
+        let declared_dependencies = if is_second_dependent {
+            vec![(
+                TaskRef::initial(definition_id, 1),
+                vec![TaskRef::initial(definition_id, 0)],
+            )]
+        } else {
+            Vec::new()
+        };
+        JobDefinition::new(
+            definition_id,
+            JobCode::new(job_code),
+            vec![
+                (
+                    TaskDefinition::new(TaskCode::new("first"), UNCANCELLED_TASK_TIMEOUT),
+                    Arc::clone(&executor),
+                ),
+                (
+                    TaskDefinition::new(TaskCode::new("second"), UNCANCELLED_TASK_TIMEOUT),
+                    executor,
+                ),
+            ],
+            Vec::new(),
+            declared_dependencies,
+            TaskLimits::default(),
+        )
+        .expect("the test description must be legal")
+    }
+
+    /// What decides whether the second task of a fan-out waits for the poll interval. Checked by
+    /// reporting `JobProgress::NothingPickable` for every started task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn starting_one_of_two_tasks_reports_a_pickable_task_left() {
+        let job_def = job_of_two_tasks("fan_out_job", false, task_fn(|_ctx| async { Ok(TaskOutcome::empty()) }));
+        let job_code = job_def.code().clone();
+        let worker =
+            worker_running(job_def, Arc::new(InMemoryStorage::new())).expect("the test worker must be constructible");
+
+        let task_start = start_task_of(&worker, &job_code, &CancellationToken::new()).await;
+
+        assert!(matches!(task_start, TaskStart::Started { .. }));
+        let progress = JobProgress::from_task_start(&task_start);
+        assert!(is_task_pickable_now(progress), "got {progress:?}");
+    }
+
+    /// Checked by reporting `JobProgress::TaskPickable` for every started task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn starting_the_only_task_reports_nothing_pickable_left() {
+        let job_def = job_running(
+            "single_task_job",
+            UNCANCELLED_TASK_TIMEOUT,
+            task_fn(|_ctx| async { Ok(TaskOutcome::empty()) }),
+        );
+        let job_code = job_def.code().clone();
+        let worker =
+            worker_running(job_def, Arc::new(InMemoryStorage::new())).expect("the test worker must be constructible");
+
+        let task_start = start_task_of(&worker, &job_code, &CancellationToken::new()).await;
+
+        assert!(matches!(task_start, TaskStart::Started { .. }));
+        assert_eq!(JobProgress::from_task_start(&task_start), JobProgress::NothingPickable);
+    }
+
+    /// The save of a result settles the iteration first, which unblocks the dependent waiting for
+    /// it; reported as nothing to take, the dependent would wait for the poll interval.
+    ///
+    /// Checked by returning `JobProgress::NothingPickable` for every execution.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_execution_whose_result_unblocks_a_dependent_reports_it_pickable() {
+        let job_def = job_of_two_tasks(
+            "dependent_job",
+            true,
+            task_fn(|_ctx| async { Ok(TaskOutcome::empty()) }),
+        );
+        let job_code = job_def.code().clone();
+        let worker =
+            worker_running(job_def, Arc::new(InMemoryStorage::new())).expect("the test worker must be constructible");
+        let cancel_token = CancellationToken::new();
+
+        let task_start = start_task_of(&worker, &job_code, &cancel_token).await;
+        assert!(matches!(task_start, TaskStart::Started { .. }));
+        assert_eq!(
+            JobProgress::from_task_start(&task_start),
+            JobProgress::NothingPickable,
+            "the dependent must still be blocked when the first task starts"
+        );
+        let execution_end = execute_task_of(&worker, task_start, &cancel_token).await;
+
+        assert!(is_task_pickable_now(execution_end), "got {execution_end:?}");
+    }
+
+    /// A refusal is retried no sooner than `FAILED_TASK_RETRY_PAUSE`, so the failed task it leaves is not
+    /// work to take at once. Checked by dropping the pause from `Task::check_availability_at`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_execution_that_failed_its_task_with_attempts_left_reports_nothing_pickable() {
+        let job_def = job_running(
+            "refused_job",
+            UNCANCELLED_TASK_TIMEOUT,
+            task_fn(|_ctx| async { Err("refused".into()) }),
+        );
+        let job_code = job_def.code().clone();
+        let storage = Arc::new(InMemoryStorage::new());
+        let worker = worker_running(job_def, Arc::clone(&storage) as Arc<dyn Storage>)
+            .expect("the test worker must be constructible");
+        let cancel_token = CancellationToken::new();
+
+        let task_start = start_task_of(&worker, &job_code, &cancel_token).await;
+        let execution_end = execute_task_of(&worker, task_start, &cancel_token).await;
+
+        let stored = storage
+            .get_job(&job_code, &cancel_token)
+            .await
+            .expect("the refusal must have been persisted");
+        let task = stored.tasks_as_iter().next().expect("the iteration must still hold its task");
+        assert!(
+            matches!(
+                task.check_availability_at(Utc::now()),
+                TaskAvailability::AwaitingRetry { .. }
+            ),
+            "the fixture must leave a failed task that may still be retried, got status {}",
+            task.status()
+        );
+        assert_eq!(execution_end, JobProgress::NothingPickable);
+    }
+
+    /// Deadline and maximum lifetime of the task held elsewhere below, which the task start finds
+    /// outlived.
+    const OUTLIVED_TASK_LIFETIME: Duration = Duration::from_millis(50);
+
+    /// A task start whose write of the verdict lost to another worker learned nothing about a task
+    /// to take, so it must not make its job due at once - only certainty of a task to take polls a
+    /// job sooner than the base interval. The task start fails a task outlived elsewhere, closes the
+    /// iteration, and the double gets a write in ahead of it.
+    ///
+    /// Checked by mapping `TaskStart::LostToAnotherWorker` to `JobProgress::TaskPickable`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_task_start_that_lost_the_verdict_to_another_worker_does_not_make_its_job_due_at_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let job_def = JobDefinition::new(
+            JobDefinitionId::new(),
+            JobCode::new("lost_verdict_job"),
+            vec![(
+                TaskDefinition::new(TaskCode::new(RUNNING_TASK_CODE), OUTLIVED_TASK_LIFETIME)
+                    .with_max_lifetime(OUTLIVED_TASK_LIFETIME),
+                task_fn(|_ctx| async { Ok(TaskOutcome::empty()) }),
+            )],
+            Vec::new(),
+            Vec::new(),
+            TaskLimits::default(),
+        )?;
+        let job_code = job_def.code().clone();
+        let inner: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
+        let cancel_token = CancellationToken::new();
+        let foreign_worker_id = Uuid::from_u128(7_201);
+        let mut job = Job::new(&job_def, HashMap::new(), foreign_worker_id)?;
+        let TaskPickup::Ready(task_id) = job.pick_task_to_execute(&foreign_worker_id)? else {
+            return Err("the fixture must leave a task to hold".into());
+        };
+        job.start_task(&task_id, foreign_worker_id)?;
+        inner.save_job(&mut job, &cancel_token).await?;
+        let outlived_at = Utc::now() + chrono::Duration::from_std(OUTLIVED_TASK_LIFETIME * 2)?;
+        tokio::time::timeout(PROGRESS_TIMEOUT, async {
+            while Utc::now() < outlived_at {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| "the system clock must pass the lifetime of the held task")?;
+        let contending = Arc::new(ContendingStorage::new(Arc::clone(&inner)));
+        let worker = worker_running(job_def, Arc::clone(&contending) as Arc<dyn Storage>)?;
+
+        let task_start = start_task_of(&worker, &job_code, &cancel_token).await;
+
+        assert_eq!(
+            contending.interferences(),
+            1,
+            "the double must have got its write in ahead of the verdict"
+        );
+        assert!(
+            matches!(task_start, TaskStart::LostToAnotherWorker),
+            "the task start must have lost the verdict"
+        );
+        assert_eq!(JobProgress::from_task_start(&task_start), JobProgress::NothingPickable);
+        Ok(())
     }
 }

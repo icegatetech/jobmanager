@@ -10,10 +10,10 @@ use tokio::sync::Barrier;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::{
-    Job, JobCode, Task, TaskCode, TaskDefinition, TaskPickup, TaskStatus,
-    storage::{JobMeta, Storage, StorageError, StorageResult},
-};
+use crate::core::job::TaskPickup;
+use crate::core::job::{Job, JobCode};
+use crate::core::task::{Task, TaskCode, TaskDefinition, TaskStatus};
+use crate::storage::{JobMeta, Storage, StorageError, StorageResult};
 
 /// `CountingStorage` wraps Storage and tracks `save_job` calls.
 pub struct CountingStorage {
@@ -94,8 +94,9 @@ impl CountingStorage {
         self.deleted_iterations_total.load(Ordering::SeqCst)
     }
 
-    /// How many times the store was read for `job_code` - a listing, a conditional read or a fetch
-    /// by meta, which are the three ways a pass reaches it.
+    /// How many times the store was read for `job_code` - a read of the job, a listing, a
+    /// conditional read or a fetch by meta. A pool without the cache reads the job, one behind it
+    /// takes the other three, so the count is the same thing on either side of the cache.
     ///
     /// One pool holds one wrapper, so the totals above cannot tell a job's own requests from its
     /// neighbour's; this is what a test asserting about one job of several counts on.
@@ -111,6 +112,7 @@ impl CountingStorage {
 #[async_trait]
 impl Storage for CountingStorage {
     async fn get_job(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<Job> {
+        self.record_read_of(job_code);
         let result = self.inner.get_job(job_code, cancel_token).await;
         if result.is_ok() {
             self.list_and_get_successes.fetch_add(1, Ordering::SeqCst);
@@ -311,6 +313,149 @@ impl Storage for ContendingStorage {
             rival_store.save_job(&mut stored, cancel_token).await?;
             self.interferences.fetch_add(1, Ordering::SeqCst);
         }
+        self.inner.save_job(job, cancel_token).await
+    }
+
+    async fn list_job_outdated_iterations(
+        &self,
+        job_code: &JobCode,
+        retention_boundary: u64,
+        cancel_token: &CancellationToken,
+    ) -> StorageResult<Vec<u64>> {
+        self.inner
+            .list_job_outdated_iterations(job_code, retention_boundary, cancel_token)
+            .await
+    }
+
+    async fn delete_job_iterations(
+        &self,
+        job_code: &JobCode,
+        iter_nums: &[u64],
+        cancel_token: &CancellationToken,
+    ) -> StorageResult<()> {
+        self.inner.delete_job_iterations(job_code, iter_nums, cancel_token).await
+    }
+}
+
+/// Storage double whose first `get_job` panics, the way a defect inside a pass would; every later
+/// call reaches `inner`.
+pub struct FirstReadPanickingStorage {
+    inner: Arc<dyn Storage>,
+    has_panicked: AtomicBool,
+}
+
+impl FirstReadPanickingStorage {
+    pub fn new(inner: Arc<dyn Storage>) -> Self {
+        Self {
+            inner,
+            has_panicked: AtomicBool::new(false),
+        }
+    }
+
+    pub fn has_panicked(&self) -> bool {
+        self.has_panicked.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl Storage for FirstReadPanickingStorage {
+    async fn get_job(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<Job> {
+        assert!(
+            self.has_panicked.swap(true, Ordering::SeqCst),
+            "the first read of the pass panicked"
+        );
+        self.inner.get_job(job_code, cancel_token).await
+    }
+
+    async fn get_job_by_meta(&self, job_meta: &JobMeta, cancel_token: &CancellationToken) -> StorageResult<Job> {
+        self.inner.get_job_by_meta(job_meta, cancel_token).await
+    }
+
+    async fn find_job_meta(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<JobMeta> {
+        self.inner.find_job_meta(job_code, cancel_token).await
+    }
+
+    async fn get_changed_job(
+        &self,
+        job_meta: &JobMeta,
+        cancel_token: &CancellationToken,
+    ) -> StorageResult<Option<Job>> {
+        self.inner.get_changed_job(job_meta, cancel_token).await
+    }
+
+    async fn save_job(&self, job: &mut Job, cancel_token: &CancellationToken) -> StorageResult<()> {
+        self.inner.save_job(job, cancel_token).await
+    }
+
+    async fn list_job_outdated_iterations(
+        &self,
+        job_code: &JobCode,
+        retention_boundary: u64,
+        cancel_token: &CancellationToken,
+    ) -> StorageResult<Vec<u64>> {
+        self.inner
+            .list_job_outdated_iterations(job_code, retention_boundary, cancel_token)
+            .await
+    }
+
+    async fn delete_job_iterations(
+        &self,
+        job_code: &JobCode,
+        iter_nums: &[u64],
+        cancel_token: &CancellationToken,
+    ) -> StorageResult<()> {
+        self.inner.delete_job_iterations(job_code, iter_nums, cancel_token).await
+    }
+}
+
+/// Storage double whose first save carrying a completed task panics, the way a defect inside the
+/// save of an execution's result would; every other call reaches `inner`.
+pub struct FirstResultSavePanickingStorage {
+    inner: Arc<dyn Storage>,
+    has_panicked: AtomicBool,
+}
+
+impl FirstResultSavePanickingStorage {
+    pub fn new(inner: Arc<dyn Storage>) -> Self {
+        Self {
+            inner,
+            has_panicked: AtomicBool::new(false),
+        }
+    }
+
+    pub fn has_panicked(&self) -> bool {
+        self.has_panicked.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl Storage for FirstResultSavePanickingStorage {
+    async fn get_job(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<Job> {
+        self.inner.get_job(job_code, cancel_token).await
+    }
+
+    async fn get_job_by_meta(&self, job_meta: &JobMeta, cancel_token: &CancellationToken) -> StorageResult<Job> {
+        self.inner.get_job_by_meta(job_meta, cancel_token).await
+    }
+
+    async fn find_job_meta(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<JobMeta> {
+        self.inner.find_job_meta(job_code, cancel_token).await
+    }
+
+    async fn get_changed_job(
+        &self,
+        job_meta: &JobMeta,
+        cancel_token: &CancellationToken,
+    ) -> StorageResult<Option<Job>> {
+        self.inner.get_changed_job(job_meta, cancel_token).await
+    }
+
+    async fn save_job(&self, job: &mut Job, cancel_token: &CancellationToken) -> StorageResult<()> {
+        let is_result_save = job.tasks_as_iter().any(Task::is_completed);
+        assert!(
+            !is_result_save || self.has_panicked.swap(true, Ordering::SeqCst),
+            "the first save of a result panicked"
+        );
         self.inner.save_job(job, cancel_token).await
     }
 
@@ -641,7 +786,7 @@ pub struct DeadlockPlantingStorage {
 
 impl DeadlockPlantingStorage {
     /// Timeout the planted task carries. It never runs, so any legal value does.
-    const PLANTED_TASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    const PLANTED_TASK_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 
     pub fn new(inner: Arc<dyn Storage>, planted_task_code: TaskCode, processed_task_code: TaskCode) -> Self {
         Self {
@@ -897,6 +1042,94 @@ impl Storage for RendezvousReadStorage {
         cancel_token: &CancellationToken,
     ) -> StorageResult<Option<Job>> {
         self.rendezvous.wait().await;
+        self.inner.get_changed_job(job_meta, cancel_token).await
+    }
+
+    async fn save_job(&self, job: &mut Job, cancel_token: &CancellationToken) -> StorageResult<()> {
+        self.inner.save_job(job, cancel_token).await
+    }
+
+    async fn list_job_outdated_iterations(
+        &self,
+        job_code: &JobCode,
+        retention_boundary: u64,
+        cancel_token: &CancellationToken,
+    ) -> StorageResult<Vec<u64>> {
+        self.inner
+            .list_job_outdated_iterations(job_code, retention_boundary, cancel_token)
+            .await
+    }
+
+    async fn delete_job_iterations(
+        &self,
+        job_code: &JobCode,
+        iter_nums: &[u64],
+        cancel_token: &CancellationToken,
+    ) -> StorageResult<()> {
+        self.inner.delete_job_iterations(job_code, iter_nums, cancel_token).await
+    }
+}
+
+/// Storage double that holds every read of one job until the test lets them through, so a pass
+/// over that job stays in storage for as long as the test needs.
+pub struct ReadHoldingStorage {
+    inner: Arc<dyn Storage>,
+    held_job_code: JobCode,
+    is_read_held: AtomicBool,
+    reads_released: CancellationToken,
+}
+
+impl ReadHoldingStorage {
+    pub fn new(inner: Arc<dyn Storage>, held_job_code: JobCode) -> Self {
+        Self {
+            inner,
+            held_job_code,
+            is_read_held: AtomicBool::new(false),
+            reads_released: CancellationToken::new(),
+        }
+    }
+
+    /// Whether a read of the held job has reached this double and is waiting.
+    pub fn is_read_held(&self) -> bool {
+        self.is_read_held.load(Ordering::SeqCst)
+    }
+
+    /// Lets every held read through, and every later one at once.
+    pub fn release_reads(&self) {
+        self.reads_released.cancel();
+    }
+
+    async fn hold_read_of(&self, job_code: &JobCode) {
+        if *job_code != self.held_job_code {
+            return;
+        }
+        self.is_read_held.store(true, Ordering::SeqCst);
+        self.reads_released.cancelled().await;
+    }
+}
+
+#[async_trait]
+impl Storage for ReadHoldingStorage {
+    async fn get_job(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<Job> {
+        self.hold_read_of(job_code).await;
+        self.inner.get_job(job_code, cancel_token).await
+    }
+
+    async fn get_job_by_meta(&self, job_meta: &JobMeta, cancel_token: &CancellationToken) -> StorageResult<Job> {
+        self.inner.get_job_by_meta(job_meta, cancel_token).await
+    }
+
+    async fn find_job_meta(&self, job_code: &JobCode, cancel_token: &CancellationToken) -> StorageResult<JobMeta> {
+        self.hold_read_of(job_code).await;
+        self.inner.find_job_meta(job_code, cancel_token).await
+    }
+
+    async fn get_changed_job(
+        &self,
+        job_meta: &JobMeta,
+        cancel_token: &CancellationToken,
+    ) -> StorageResult<Option<Job>> {
+        self.hold_read_of(&job_meta.code).await;
         self.inner.get_changed_job(job_meta, cancel_token).await
     }
 

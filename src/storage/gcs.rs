@@ -4,6 +4,9 @@ use google_cloud_auth::credentials::Credentials;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+use crate::core::error::Error;
+use crate::infra::metrics::MetricsSink;
+use crate::infra::retrier::{Retrier, RetrierConfig, RetryStep};
 use crate::storage::backend::{
     Backend, ExpectedAnswer, ListedObject, ListedPage, ListingRequest, ListingStartBound, PutCondition, RequestOptions,
     send_request,
@@ -16,9 +19,7 @@ use crate::storage::gcs_error::{
 use crate::storage::object_storage::ObjectStorage;
 use crate::storage::paths::{DEFAULT_STATE_PREFIX, JobPaths};
 use crate::storage::state_codec::JobStateCodecKind;
-use crate::{
-    Error, JobDefinitionRegistry, MetricsSink, Retrier, RetrierConfig, RetryStep, StorageError, StorageResult,
-};
+use crate::storage::{JobDefinitionRegistry, StorageError, StorageResult};
 
 /// Timeout of a single Google Cloud Storage operation unless overridden. `reqwest` bounds neither
 /// the request as a whole nor the reading of its body, so without this a hung answer holds the
@@ -604,11 +605,13 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    use crate::core::job::JobCode;
+    use crate::infra::metrics::NoopMetrics;
+    use crate::storage::Storage;
     use crate::tests::common::UnusedJobRegistry;
     use crate::tests::common::counting_metrics::CountingMetrics;
     use crate::tests::common::scripted_endpoint::{ScriptedEndpoint, build_http_response};
     use crate::tests::common::silent_endpoint::{cancel_after_delay, start_silent_endpoint};
-    use crate::{JobCode, NoopMetrics, Storage};
 
     /// Timeout the cases against a local endpoint give a request. Long enough that no scheduling
     /// hiccup reaches it, short enough that a case which really waits it out still ends quickly.
@@ -1395,7 +1398,7 @@ mod tests {
 
         let _ = storage
             .get_changed_job(
-                &crate::JobMeta {
+                &crate::storage::JobMeta {
                     code: JobCode::new("job"),
                     iter_num: TESTED_ITER_NUM,
                     version: "41".to_string(),

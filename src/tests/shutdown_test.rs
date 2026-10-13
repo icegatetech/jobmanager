@@ -11,11 +11,13 @@ use tokio::{
     time::timeout,
 };
 
+use crate::core::job::{JobCode, JobDefinition, JobDefinitionId, TaskLimits};
+use crate::core::registry::JobRegistry;
+use crate::core::task::{TaskCode, TaskDefinition};
+use crate::execution::executor::{TaskOutcome, task_fn};
+use crate::execution::jobs_manager::{JobsManager, JobsManagerConfig};
+use crate::infra::metrics::NoopMetrics;
 use crate::storage::in_memory::InMemoryStorage;
-use crate::{
-    JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobsManager, JobsManagerConfig, NoopMetrics, TaskCode,
-    TaskDefinition, TaskLimits, TaskOutcome, WorkerConfig, task_fn,
-};
 
 #[test]
 fn start_returns_error_when_worker_count_is_zero() -> Result<(), Box<dyn std::error::Error>> {
@@ -41,7 +43,6 @@ fn start_returns_error_when_worker_count_is_zero() -> Result<(), Box<dyn std::er
         storage,
         JobsManagerConfig {
             worker_count: 0,
-            worker_config: WorkerConfig::default(),
             ..Default::default()
         },
         job_registry,
@@ -105,7 +106,7 @@ async fn test_shutdown_cancels_executor() -> Result<(), Box<dyn std::error::Erro
         storage,
         JobsManagerConfig {
             worker_count: 1,
-            worker_config: super::common::build_worker_config(Duration::from_millis(50), Duration::ZERO),
+            scheduler_config: super::common::build_poll_schedule_config(Duration::from_millis(50), Duration::ZERO),
             ..Default::default()
         },
         job_registry,

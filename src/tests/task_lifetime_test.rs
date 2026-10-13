@@ -13,12 +13,14 @@ use uuid::Uuid;
 use super::common::counting_metrics::CountingMetrics;
 use super::common::manager_env::ManagerEnv;
 use super::common::storage_wrapper::{ContendedSave, ContendingStorage, IterationSettlingStorage};
+use crate::core::job::{JobCode, JobDefinition, JobDefinitionId, JobStatus, TaskLimits};
+use crate::core::registry::JobRegistry;
+use crate::core::task::{DependencyTolerance, TaskCode, TaskDefinition, TaskRef, TaskStatus};
+use crate::execution::executor::{TaskOutcome, task_fn};
+use crate::execution::jobs_manager::{JobsManager, JobsManagerConfig};
+use crate::infra::metrics::MetricsSink;
+use crate::storage::Storage;
 use crate::storage::in_memory::InMemoryStorage;
-use crate::{
-    DependencyTolerance, JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStatus, JobsManager,
-    JobsManagerConfig, MetricsSink, Storage, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, TaskRef, TaskStatus,
-    task_fn,
-};
 
 const TASK_CODE: &str = "import";
 /// Task that declares it survives a dependency that failed for good, which is what makes the state
@@ -45,7 +47,7 @@ const OUTLIVING_TASK_TIMEOUT: Duration = Duration::from_millis(100);
 fn manager_config() -> JobsManagerConfig {
     JobsManagerConfig {
         worker_count: 1,
-        worker_config: super::common::build_worker_config(Duration::from_millis(20), Duration::ZERO)
+        scheduler_config: super::common::build_poll_schedule_config(Duration::from_millis(20), Duration::ZERO)
             .with_max_poll_interval(Duration::from_millis(50))
             .expect("a ceiling above the poll interval is accepted"),
         ..Default::default()
@@ -347,7 +349,7 @@ async fn a_dependent_merged_after_a_conflict_starts_on_a_failed_dependency() -> 
             let dependencies = ctx.job().get_tasks_by_code(&TaskCode::new(TASK_CODE))?;
             let dependency = dependencies
                 .first()
-                .ok_or_else(|| crate::Error::Other("the job must hold the dependency".to_string()))?;
+                .ok_or_else(|| crate::core::error::Error::Other("the job must hold the dependency".to_string()))?;
             let _ = reports.send((dependency.is_failed(), dependency.get_resolution_reason().to_string()));
 
             Ok(TaskOutcome::empty())

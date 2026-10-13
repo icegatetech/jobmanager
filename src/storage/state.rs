@@ -2,9 +2,8 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{
-    DependencyTolerance, Job, JobCode, JobStatus, RestoredTask, Task, TaskCode, TaskLimits, TaskRetry, TaskStatus,
-};
+use crate::core::job::{Job, JobCode, JobStatus, TaskLimits};
+use crate::core::task::{DependencyTolerance, RestoredTask, Task, TaskCode, TaskRetry, TaskStatus};
 
 /// A refusal nobody declared terminal is the ordinary one, so the common case costs no bytes.
 // By reference because that is the shape `skip_serializing_if` calls a predicate with; passing this
@@ -214,7 +213,7 @@ mod tests {
 
     use super::*;
     use crate::core::task::SkipCause;
-    use crate::{DEFAULT_MAX_ATTEMPTS, TaskDefinition};
+    use crate::core::task::{DEFAULT_MAX_ATTEMPTS, TaskDefinition};
 
     const TIMEOUT: Duration = Duration::seconds(5);
 
@@ -414,7 +413,7 @@ mod tests {
         let tolerant_id = job
             .add_task(
                 &TaskDefinition::new(TaskCode::new("tolerant"), TIMEOUT.to_std().expect("a positive timeout"))
-                    .with_dependencies(vec![crate::TaskRef::created(parent_id)])
+                    .with_dependencies(vec![crate::core::task::TaskRef::created(parent_id)])
                     .with_dependency_tolerance(tolerance),
                 Uuid::from_u128(3),
                 None,

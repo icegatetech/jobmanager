@@ -3,7 +3,8 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::{ImmutableTask, JobHandle, TaskCode};
+use crate::core::task::{ImmutableTask, TaskCode};
+use crate::execution::job_handle::JobHandle;
 
 /// Everything one task execution is given: the task itself, the job it runs in, and the
 /// cancellation signal of this execution.

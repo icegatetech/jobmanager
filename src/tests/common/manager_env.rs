@@ -1,9 +1,10 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use crate::{
-    JobCode, JobDefinition, JobRegistry, JobsManager, JobsManagerConfig, JobsManagerHandle, MetricsSink, NoopMetrics,
-    Storage,
-};
+use crate::core::job::{JobCode, JobDefinition};
+use crate::core::registry::JobRegistry;
+use crate::execution::jobs_manager::{JobsManager, JobsManagerConfig, JobsManagerHandle};
+use crate::infra::metrics::{MetricsSink, NoopMetrics};
+use crate::storage::Storage;
 
 /// `ManagerEnv` manages `JobsManager` lifecycle for integration tests
 pub struct ManagerEnv {

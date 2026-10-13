@@ -5,7 +5,9 @@ use opentelemetry::{
     metrics::{Counter, Histogram, Meter},
 };
 
-use crate::{IterationVerdict, JobCode, MetricsSink, TaskCode, TaskResolution};
+use crate::core::job::{IterationVerdict, JobCode};
+use crate::core::task::{TaskCode, TaskResolution};
+use crate::infra::metrics::MetricsSink;
 
 /// [`MetricsSink`] that records through `OpenTelemetry`.
 ///

@@ -10,11 +10,16 @@ use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
 use super::common::provider_harness::{ProviderHarness, ProviderStorageRequest};
+use crate::core::job::{JobCode, JobDefinition, JobDefinitionId, JobStatus, TaskLimits};
+use crate::core::registry::JobRegistry;
+use crate::core::task::{TaskCode, TaskDefinition};
+use crate::execution::executor::{TaskOutcome, task_fn};
+use crate::execution::jobs_manager::JobsManagerConfig;
+use crate::infra::metrics::NoopMetrics;
+use crate::storage::JobDefinitionRegistry;
 use crate::storage::Storage;
-use crate::{
-    CachedStorage, JobCode, JobDefinition, JobDefinitionId, JobDefinitionRegistry, JobRegistry, JobStateCodecKind,
-    JobStatus, JobsManagerConfig, NoopMetrics, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, task_fn,
-};
+use crate::storage::cached::CachedStorage;
+use crate::storage::state_codec::JobStateCodecKind;
 
 /// Storage timeout the case runs with, kept from the original S3 configuration: two jobs polled by
 /// two workers must not have a pass held up by a request the store is slow to answer.
@@ -112,7 +117,10 @@ async fn run_two_jobs_concurrent(harness: &dyn ProviderHarness) -> Result<(), Bo
 
     let config = JobsManagerConfig {
         worker_count: 2,
-        worker_config: super::common::build_worker_config(Duration::from_millis(100), Duration::from_millis(10)),
+        scheduler_config: super::common::build_poll_schedule_config(
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+        ),
         ..Default::default()
     };
 

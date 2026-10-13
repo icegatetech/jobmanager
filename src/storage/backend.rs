@@ -11,7 +11,7 @@
 //!
 //! What every backend has in common lives in [`send_request`]: the timeout and the
 //! cancellation around one request, the pair it is recorded under, and the point where a provider's
-//! failure becomes either the accepted answer or a [`StorageError`](crate::StorageError). Three
+//! failure becomes either the accepted answer or a [`StorageError`](crate::storage::StorageError). Three
 //! copies of that ordering were three chances to record one request under two pairs.
 //!
 //! What it never owns: which key an iteration lives under, what a write is conditioned on, which
@@ -27,7 +27,8 @@ use std::{
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::{MetricsSink, StorageError, StorageResult};
+use crate::infra::metrics::MetricsSink;
+use crate::storage::{StorageError, StorageResult};
 
 /// Status a request the store answered is recorded under.
 const SUCCESS_STATUS: &str = "OK";
@@ -123,7 +124,7 @@ pub(crate) trait Backend: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::ConcurrentModification`](crate::StorageError::ConcurrentModification)
+    /// Returns [`StorageError::ConcurrentModification`](crate::storage::StorageError::ConcurrentModification)
     /// when the store refused the condition. A store that accepted the write and named no version
     /// is a failure as well - there is nothing left to hold the next condition against, and an empty
     /// version would make the next save an unconditional one.

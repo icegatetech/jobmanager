@@ -10,10 +10,14 @@ use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
 use super::common::provider_harness::{ProviderHarness, ProviderStorageRequest};
-use crate::{
-    JobCode, JobDefinition, JobDefinitionId, JobDefinitionRegistry, JobRegistry, JobStateCodecKind, JobStatus,
-    JobsManagerConfig, NoopMetrics, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, task_fn,
-};
+use crate::core::job::{JobCode, JobDefinition, JobDefinitionId, JobStatus, TaskLimits};
+use crate::core::registry::JobRegistry;
+use crate::core::task::{TaskCode, TaskDefinition};
+use crate::execution::executor::{TaskOutcome, task_fn};
+use crate::execution::jobs_manager::JobsManagerConfig;
+use crate::infra::metrics::NoopMetrics;
+use crate::storage::JobDefinitionRegistry;
+use crate::storage::state_codec::JobStateCodecKind;
 
 /// An executor can create new tasks dynamically, and the dependencies it declares between them
 /// survive a round-trip through the object store.
@@ -86,7 +90,10 @@ async fn run_dynamic_task_creation(harness: &dyn ProviderHarness) -> Result<(), 
 
     let config = JobsManagerConfig {
         worker_count: 1,
-        worker_config: super::common::build_worker_config(Duration::from_millis(100), Duration::from_millis(10)),
+        scheduler_config: super::common::build_poll_schedule_config(
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+        ),
         ..Default::default()
     };
 

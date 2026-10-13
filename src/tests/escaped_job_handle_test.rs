@@ -4,11 +4,13 @@ use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
+use crate::core::job::{JobCode, JobDefinition, JobDefinitionId, JobStatus, TaskLimits};
+use crate::core::registry::JobRegistry;
+use crate::core::task::{TaskCode, TaskDefinition};
+use crate::execution::executor::{TaskOutcome, task_fn};
+use crate::execution::jobs_manager::JobsManagerConfig;
+use crate::storage::Storage;
 use crate::storage::in_memory::InMemoryStorage;
-use crate::{
-    JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStatus, JobsManagerConfig, Storage, TaskCode,
-    TaskDefinition, TaskLimits, TaskOutcome, task_fn,
-};
 
 /// Bound on every wait here: a background task that never reports must fail the test rather than
 /// hang the suite.
@@ -61,7 +63,7 @@ async fn a_handle_kept_by_a_background_task_leaves_the_job_saved_and_refuses_the
         Arc::new(InMemoryStorage::new()) as Arc<dyn Storage>,
         JobsManagerConfig {
             worker_count: 1,
-            worker_config: super::common::build_worker_config(Duration::from_millis(20), Duration::ZERO),
+            scheduler_config: super::common::build_poll_schedule_config(Duration::from_millis(20), Duration::ZERO),
             ..Default::default()
         },
         Arc::clone(&job_registry),

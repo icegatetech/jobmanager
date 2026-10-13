@@ -8,7 +8,7 @@
 use azure_core::error::ErrorKind;
 use azure_storage_blob::models::StorageErrorCode;
 
-use crate::StorageError;
+use crate::storage::StorageError;
 use crate::storage::backend::{ProviderError, RequestStatus};
 use crate::storage::http_error::{HttpOutcome, classify_http_status};
 

@@ -6,10 +6,15 @@ use uuid::Uuid;
 
 use super::common::provider_harness::{ProviderHarness, ProviderStorageRequest};
 use super::common::{manager_env::ManagerEnv, storage_wrapper::CountingStorage};
-use crate::{
-    CachedStorage, JobCode, JobDefinition, JobDefinitionId, JobDefinitionRegistry, JobRegistry, JobStateCodecKind,
-    JobStatus, JobsManagerConfig, NoopMetrics, Storage, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, task_fn,
-};
+use crate::core::job::{JobCode, JobDefinition, JobDefinitionId, JobStatus, TaskLimits};
+use crate::core::registry::JobRegistry;
+use crate::core::task::{TaskCode, TaskDefinition};
+use crate::execution::executor::{TaskOutcome, task_fn};
+use crate::execution::jobs_manager::JobsManagerConfig;
+use crate::infra::metrics::NoopMetrics;
+use crate::storage::cached::CachedStorage;
+use crate::storage::state_codec::JobStateCodecKind;
+use crate::storage::{JobDefinitionRegistry, Storage};
 
 // TODO(med): Add a check for the absence of errors in the logs. It won't be easy to do this, because when subscribing to errors and parallel tests, we catch errors from all tests and it's difficult to account for errors only in a specific test.
 
@@ -100,7 +105,10 @@ async fn run_concurrent_workers_test(
 
     let config = JobsManagerConfig {
         worker_count: workers_cnt,
-        worker_config: super::common::build_worker_config(Duration::from_millis(20), Duration::from_millis(10)),
+        scheduler_config: super::common::build_poll_schedule_config(
+            Duration::from_millis(20),
+            Duration::from_millis(10),
+        ),
         ..Default::default()
     };
 

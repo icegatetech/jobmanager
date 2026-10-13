@@ -1,4 +1,4 @@
-.PHONY: test quota check fmt fmt-fix clippy clippy-fix audit install ci \
+.PHONY: test quota check fmt fmt-fix clippy clippy-fix clippy-toolchain audit install ci \
         examples-infra-up examples-infra-down clean
 
 # Integration tests start a provider container (RustFS, Azurite, storage-testbench) via
@@ -19,18 +19,32 @@ check:
 	cargo check --all-targets --all-features
 
 # rustfmt.toml uses nightly-only options, hence +nightly.
+# The grep holds the import rule of docs/RUST.md that no formatter or lint can express: crate code
+# never imports through a public re-export of lib.rs. Modules are lowercase, so `crate::` followed
+# by an uppercase name - or by `task_fn`, the one lowercase re-export - is such a path.
 fmt:
 	cargo +nightly fmt -- --check
+	@! grep -rnE 'crate::([A-Z]|task_fn([^[:alnum:]_]|$$))' src --exclude=lib.rs \
+		| grep -vE '^[^:]+:[0-9]+:[[:space:]]*//[/!]' \
+		|| { echo "import by the owner module's path, not through lib.rs - see docs/RUST.md"; exit 1; }
 
 fmt-fix:
 	cargo +nightly fmt
 
+# Pinned deliberately: pedantic and nursery are denied crate-wide, so every new clippy release can
+# fail the lint gate on code nobody touched. This line is the only copy of the version - CI reads it
+# through `clippy-toolchain`. Bump it in its own commit and fix the new lints there.
+CLIPPY_TOOLCHAIN := 1.97.0
+
+clippy-toolchain:
+	@echo $(CLIPPY_TOOLCHAIN)
+
 # Every feature: a lint gate that does not compile a module does not gate it.
 clippy:
-	cargo clippy --all-targets --all-features -- -D warnings
+	cargo +$(CLIPPY_TOOLCHAIN) clippy --all-targets --all-features -- -D warnings
 
 clippy-fix:
-	cargo clippy --all-targets --all-features --fix --allow-dirty
+	cargo +$(CLIPPY_TOOLCHAIN) clippy --all-targets --all-features --fix --allow-dirty
 
 audit:
 	cargo audit

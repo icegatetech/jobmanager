@@ -10,11 +10,16 @@ use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
 use super::common::provider_harness::{ProviderHarness, ProviderStorageRequest};
+use crate::core::job::{JobCode, JobDefinition, JobDefinitionId, JobStatus, TaskLimits};
+use crate::core::registry::JobRegistry;
+use crate::core::task::{TaskCode, TaskDefinition};
+use crate::execution::executor::{TaskOutcome, task_fn};
+use crate::execution::jobs_manager::JobsManagerConfig;
+use crate::infra::metrics::NoopMetrics;
+use crate::storage::JobDefinitionRegistry;
 use crate::storage::Storage;
-use crate::{
-    CachedStorage, JobCode, JobDefinition, JobDefinitionId, JobDefinitionRegistry, JobRegistry, JobStateCodecKind,
-    JobStatus, JobsManagerConfig, NoopMetrics, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, task_fn,
-};
+use crate::storage::cached::CachedStorage;
+use crate::storage::state_codec::JobStateCodecKind;
 
 /// Storage timeout the case runs with: a request that outlived the deadline it is racing would let
 /// a takeover be decided by the store rather than by the deadline.
@@ -80,7 +85,7 @@ async fn run_task_deadline_expiry(harness: &dyn ProviderHarness) -> Result<(), B
 
     let config = JobsManagerConfig {
         worker_count: 3, // need more concurrency for small resources system
-        worker_config: super::common::build_worker_config(Duration::from_millis(10), Duration::ZERO),
+        scheduler_config: super::common::build_poll_schedule_config(Duration::from_millis(10), Duration::ZERO),
         ..Default::default()
     };
 

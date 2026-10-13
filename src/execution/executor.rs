@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::{TaskContext, TaskError};
+use crate::core::error::TaskError;
+use crate::execution::task_context::TaskContext;
 
 /// What an executor did with its task.
 ///
@@ -127,8 +128,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::core::job::{Job, JobCode, JobDefinition, JobDefinitionId, TaskLimits};
+    use crate::core::task::{TaskCode, TaskDefinition};
+    use crate::execution::job_handle::JobHandle;
     use crate::execution::job_handle::{JobHandleImpl, JobHandleState};
-    use crate::{Job, JobCode, JobDefinition, JobDefinitionId, JobHandle, TaskCode, TaskDefinition, TaskLimits};
 
     struct StructExecutor;
 

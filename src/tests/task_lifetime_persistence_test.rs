@@ -4,10 +4,14 @@ use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
 use super::common::provider_harness::{ProviderHarness, ProviderStorageRequest};
-use crate::{
-    JobCode, JobDefinition, JobDefinitionId, JobDefinitionRegistry, JobRegistry, JobStateCodecKind, JobStatus,
-    JobsManagerConfig, NoopMetrics, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, task_fn,
-};
+use crate::core::job::{JobCode, JobDefinition, JobDefinitionId, JobStatus, TaskLimits};
+use crate::core::registry::JobRegistry;
+use crate::core::task::{TaskCode, TaskDefinition};
+use crate::execution::executor::{TaskOutcome, task_fn};
+use crate::execution::jobs_manager::JobsManagerConfig;
+use crate::infra::metrics::NoopMetrics;
+use crate::storage::JobDefinitionRegistry;
+use crate::storage::state_codec::JobStateCodecKind;
 
 const PLAN_TASK_CODE: &str = "plan";
 const PLANNED_TASK_CODE: &str = "planned";
@@ -65,7 +69,7 @@ async fn run_task_lifetime_round_trip(
 
     let config = JobsManagerConfig {
         worker_count: 1,
-        worker_config: super::common::build_worker_config(Duration::from_millis(20), Duration::ZERO),
+        scheduler_config: super::common::build_poll_schedule_config(Duration::from_millis(20), Duration::ZERO),
         ..Default::default()
     };
     let mut manager_env = ManagerEnv::new(Arc::clone(&storage), config, Arc::clone(&job_registry), vec![job_def])?;

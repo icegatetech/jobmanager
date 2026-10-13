@@ -1,6 +1,7 @@
 use std::time::Duration;
 
-use crate::{IterationVerdict, JobCode, TaskCode, TaskResolution};
+use crate::core::job::{IterationVerdict, JobCode};
+use crate::core::task::{TaskCode, TaskResolution};
 
 /// Where the crate writes its operational measurements.
 ///

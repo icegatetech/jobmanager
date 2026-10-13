@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::{JobCode, JobStatus, Storage};
+use crate::core::job::{JobCode, JobStatus};
+use crate::storage::Storage;
 
 /// Bound on every wait here, so a fixture that never reaches its condition fails with a diagnostic
 /// instead of hanging.

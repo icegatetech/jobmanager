@@ -1,16 +1,24 @@
 use std::{sync::Arc, time::Duration};
 
+use crate::core::error::Error;
+use crate::core::job::{JobCode, JobDefinition, JobDefinitionId, TaskLimits};
+use crate::core::registry::JobRegistry;
+use crate::core::task::{TaskCode, TaskDefinition, TaskRef};
+use crate::execution::executor::TaskExecutor;
+use crate::execution::job_cleaner::JobCleanerConfig;
+use crate::execution::jobs_manager::{JobsManager, JobsManagerConfig};
+use crate::execution::scheduler::PollSchedulerConfig;
+use crate::infra::metrics::{MetricsSink, NoopMetrics};
+use crate::infra::retrier::RetrierConfig;
 #[cfg(feature = "storage-azure")]
-use crate::{AzureBackend, AzureConfig};
-use crate::{
-    CachedStorage, Error, InMemoryStorage, JobCleanerConfig, JobCode, JobDefinition, JobDefinitionId,
-    JobDefinitionRegistry, JobRegistry, JobsManager, JobsManagerConfig, MetricsSink, NoopMetrics, RetrierConfig,
-    Storage, TaskCode, TaskDefinition, TaskExecutor, TaskLimits, TaskRef, WorkerConfig,
-};
+use crate::storage::azure::{AzureBackend, AzureConfig};
+use crate::storage::cached::CachedStorage;
 #[cfg(feature = "storage-gcs")]
-use crate::{GcsBackend, GcsConfig};
+use crate::storage::gcs::{GcsBackend, GcsConfig};
+use crate::storage::in_memory::InMemoryStorage;
 #[cfg(feature = "storage-s3")]
-use crate::{S3Backend, S3Config};
+use crate::storage::s3::{S3Backend, S3Config};
+use crate::storage::{JobDefinitionRegistry, Storage};
 
 /// Describes one job: its schedule, its initial tasks, and every executor it may run.
 ///
@@ -160,8 +168,8 @@ pub struct JobsManagerBuilder {
     jobs: Vec<JobBuilder>,
     worker_count: usize,
     /// Polling settings as they were named, each `None` until its setter is called: they become a
-    /// [`WorkerConfig`] - and are checked - only in [`Self::build`], because the setters are `const`
-    /// and cannot report a rejection.
+    /// [`PollSchedulerConfig`] - and are checked - only in [`Self::build`], because the setters are
+    /// `const` and cannot report a rejection.
     poll_interval: Option<Duration>,
     poll_jitter: Option<Duration>,
     max_poll_interval: Option<Duration>,
@@ -196,7 +204,7 @@ impl JobsManagerBuilder {
 
     /// Persists job state to an S3-compatible store, behind the read cache.
     ///
-    /// The cache is on by default because a worker re-reads the same job on every poll; drop it
+    /// The cache is on by default because the pool re-reads the same job on every poll; drop it
     /// with [`Self::no_cache`].
     #[must_use]
     #[cfg(feature = "storage-s3")]
@@ -207,7 +215,7 @@ impl JobsManagerBuilder {
 
     /// Persists job state to an Azure Blob Storage container, behind the read cache.
     ///
-    /// The cache is on by default because a worker re-reads the same job on every poll; drop it
+    /// The cache is on by default because the pool re-reads the same job on every poll; drop it
     /// with [`Self::no_cache`].
     #[must_use]
     #[cfg(feature = "storage-azure")]
@@ -218,7 +226,7 @@ impl JobsManagerBuilder {
 
     /// Persists job state to a Google Cloud Storage bucket, behind the read cache.
     ///
-    /// The cache is on by default because a worker re-reads the same job on every poll; drop it
+    /// The cache is on by default because the pool re-reads the same job on every poll; drop it
     /// with [`Self::no_cache`].
     #[must_use]
     #[cfg(feature = "storage-gcs")]
@@ -261,10 +269,12 @@ impl JobsManagerBuilder {
         self
     }
 
-    /// Base delay between storage polls of a worker that found work last time.
+    /// Interval the pool polls a job at after a task start that moved it.
     ///
-    /// Applies per job: a job with nothing to wait for is polled at this interval, while one whose
-    /// next iteration is not due yet is not polled until it is.
+    /// Applies per job: a job with nothing to wait for is polled at this interval, one whose next
+    /// task can be started right away is polled as soon as a worker is free, one whose next
+    /// iteration is not due yet is not polled until it is, and one a task start found nothing to do in
+    /// backs off from this interval towards [`Self::max_poll_interval`].
     ///
     /// An unnamed backoff ceiling is ten times this interval, so a job that iterates once in
     /// minutes needs this setting alone; see [`Self::max_poll_interval`].
@@ -277,13 +287,12 @@ impl JobsManagerBuilder {
         self
     }
 
-    /// Upper bound of the random delay added to each poll, which keeps workers from polling in
-    /// lockstep.
+    /// Upper bound of the random delay drawn once for each poll scheduled later than now.
     ///
-    /// Also spreads the moment jobs sharing a schedule are picked up: without it every worker of
-    /// every pool wakes at the same instant when an interval-scheduled job becomes due, and all but
-    /// one pay a rejected write. A fleet of many workers on interval-scheduled jobs wants this
-    /// raised.
+    /// A job whose next task can be started right away is polled without it. What it spreads is the
+    /// pools of different processes polling one job: without it every pool wakes at the same
+    /// instant when an interval-scheduled job becomes due, and all but one pay a rejected write. A
+    /// fleet of many pools on interval-scheduled jobs wants this raised.
     #[must_use]
     pub const fn poll_jitter(mut self, jitter: Duration) -> Self {
         self.poll_jitter = Some(jitter);
@@ -370,41 +379,38 @@ impl JobsManagerBuilder {
 
         let config = JobsManagerConfig {
             worker_count: self.worker_count,
-            worker_config: build_worker_config(
+            scheduler_config: Self::build_poll_schedule_config(
                 self.poll_interval,
                 self.poll_jitter,
                 self.max_poll_interval,
-                self.retrier_config,
             )?,
+            retrier_config: self.retrier_config.unwrap_or_default(),
             cleaner_config: self.cleaner_config,
         };
         JobsManager::new(storage, config, registry, self.metrics)
     }
-}
 
-/// Hands the polling settings a caller named to [`WorkerConfig`], which is where each of them is
-/// checked. A setting nobody named is left out, so the config keeps its own default for it.
-fn build_worker_config(
-    poll_interval: Option<Duration>,
-    poll_jitter: Option<Duration>,
-    max_poll_interval: Option<Duration>,
-    retrier_config: Option<RetrierConfig>,
-) -> Result<WorkerConfig, Error> {
-    let mut config = WorkerConfig::new();
-    if let Some(interval) = poll_interval {
-        config = config.with_poll_interval(interval)?;
-    }
-    if let Some(ceiling) = max_poll_interval {
-        config = config.with_max_poll_interval(ceiling)?;
-    }
-    if let Some(jitter) = poll_jitter {
-        config = config.with_poll_jitter(jitter);
-    }
-    if let Some(retrier_config) = retrier_config {
-        config = config.with_retrier(retrier_config);
-    }
+    /// Hands the polling settings a caller named to [`PollSchedulerConfig`], which is where each of
+    /// them is checked. A setting nobody named is left out, so the config keeps its own default for
+    /// it.
+    fn build_poll_schedule_config(
+        poll_interval: Option<Duration>,
+        poll_jitter: Option<Duration>,
+        max_poll_interval: Option<Duration>,
+    ) -> Result<PollSchedulerConfig, Error> {
+        let mut config = PollSchedulerConfig::new();
+        if let Some(interval) = poll_interval {
+            config = config.with_poll_interval(interval)?;
+        }
+        if let Some(ceiling) = max_poll_interval {
+            config = config.with_max_poll_interval(ceiling)?;
+        }
+        if let Some(jitter) = poll_jitter {
+            config = config.with_poll_jitter(jitter);
+        }
 
-    Ok(config)
+        Ok(config)
+    }
 }
 
 /// Constructs the chosen backend, wrapping it in the read cache where that was asked for.
@@ -475,7 +481,7 @@ mod tests {
     use std::sync::LazyLock;
 
     use super::*;
-    use crate::{TaskOutcome, task_fn};
+    use crate::execution::executor::{TaskOutcome, task_fn};
 
     fn noop_executor() -> Arc<dyn TaskExecutor> {
         task_fn(|_ctx| async { Ok(TaskOutcome::empty()) })
@@ -855,7 +861,7 @@ mod tests {
 
     /// The polling setters store their argument and nothing else, so the defect they are exposed to
     /// is one landing on the setting of a neighbour - which is how a jitter came to be applied as a
-    /// poll interval. What each setting then does to a worker is asserted in [`crate::Worker`]'s own
+    /// poll interval. What each setting then does to a worker is asserted in [`crate::execution::worker::Worker`]'s own
     /// tests.
     #[test]
     fn the_polling_setters_record_the_settings_they_name() {

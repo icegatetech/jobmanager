@@ -10,11 +10,14 @@ use tokio::{sync::Notify, time::timeout};
 use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
+use crate::core::error::Error;
+use crate::core::job::{JobCode, JobDefinition, JobDefinitionId, JobStatus, TaskLimits};
+use crate::core::registry::JobRegistry;
+use crate::core::task::{TaskCode, TaskDefinition};
+use crate::execution::executor::{TaskExecutor, TaskOutcome, task_fn};
+use crate::execution::jobs_manager::JobsManagerConfig;
+use crate::storage::Storage;
 use crate::storage::in_memory::InMemoryStorage;
-use crate::{
-    Error, JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStatus, JobsManagerConfig, Storage, TaskCode,
-    TaskDefinition, TaskExecutor, TaskLimits, TaskOutcome, task_fn,
-};
 
 const TASK_CODE: &str = "long_running";
 /// Deadline of the task, and so how long its executor runs before its token is cancelled.
@@ -28,7 +31,7 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 fn manager_config(worker_count: usize) -> JobsManagerConfig {
     JobsManagerConfig {
         worker_count,
-        worker_config: super::common::build_worker_config(Duration::from_millis(20), Duration::ZERO)
+        scheduler_config: super::common::build_poll_schedule_config(Duration::from_millis(20), Duration::ZERO)
             .with_max_poll_interval(Duration::from_millis(50))
             .expect("a ceiling above the poll interval is accepted"),
         ..Default::default()
@@ -39,7 +42,7 @@ async fn run_until_completed(
     job_code: &JobCode,
     executor: Arc<dyn TaskExecutor>,
     worker_count: usize,
-) -> Result<crate::Job, Box<dyn std::error::Error>> {
+) -> Result<crate::core::job::Job, Box<dyn std::error::Error>> {
     let task_def = TaskDefinition::new(TaskCode::new(TASK_CODE), TASK_TIMEOUT);
     let job_def = JobDefinition::new(
         JobDefinitionId::new(),

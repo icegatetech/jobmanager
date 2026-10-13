@@ -15,17 +15,18 @@ use aws_sdk_s3::{
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+use crate::core::error::Error;
+use crate::infra::metrics::MetricsSink;
+use crate::infra::retrier::{Retrier, RetrierConfig, RetryStep};
 use crate::storage::backend::{
     Backend, ExpectedAnswer, ListedObject, ListedPage, ListingRequest, ListingStartBound, PutCondition, RequestOptions,
     normalize_etag, send_request,
 };
 use crate::storage::object_storage::ObjectStorage;
 use crate::storage::paths::{DEFAULT_STATE_PREFIX, JobPaths};
+use crate::storage::s3_error::{S3Failure, classify_delete_failures, map_s3_error};
 use crate::storage::state_codec::JobStateCodecKind;
-use crate::{
-    Error, JobDefinitionRegistry, MetricsSink, Retrier, RetrierConfig, RetryStep, StorageError, StorageResult,
-    storage::s3_error::{S3Failure, classify_delete_failures, map_s3_error},
-};
+use crate::storage::{JobDefinitionRegistry, StorageError, StorageResult};
 
 // TODO(high): add test s3 storage with Toxiproxy for testing network problems (chaos test))
 
@@ -616,11 +617,12 @@ mod tests {
     };
 
     use super::*;
+    use crate::core::job::JobCode;
+    use crate::storage::{JobMeta, Storage};
     use crate::tests::common::UnusedJobRegistry;
     use crate::tests::common::counting_metrics::CountingMetrics;
     use crate::tests::common::scripted_endpoint::{ScriptedEndpoint, build_http_response};
     use crate::tests::common::silent_endpoint::{cancel_after_delay, start_silent_endpoint};
-    use crate::{JobCode, JobMeta, Storage};
 
     /// Timeout the cases against a local endpoint give a request. Long enough that no scheduling
     /// hiccup reaches it, short enough that a case which really waits it out still ends quickly.
@@ -734,7 +736,7 @@ mod tests {
 
     /// Builds a store whose S3 client answers with `response` and whose requests nobody counts.
     fn build_store_answering(response: http::Response<SdkBody>) -> S3Backend {
-        build_store_recording(response, Arc::new(crate::NoopMetrics))
+        build_store_recording(response, Arc::new(crate::infra::metrics::NoopMetrics))
     }
 
     /// The storage a case reaching `Storage` goes through, over `store`.
@@ -1049,7 +1051,12 @@ mod tests {
         let config = S3Config::new(endpoint.endpoint(), "key", "secret", "jobs", "us-east-1")
             .with_request_timeout(LOCAL_ENDPOINT_TIMEOUT);
 
-        let storage = S3Backend::build(config, Arc::new(UnusedJobRegistry), Arc::new(crate::NoopMetrics)).await;
+        let storage = S3Backend::build(
+            config,
+            Arc::new(UnusedJobRegistry),
+            Arc::new(crate::infra::metrics::NoopMetrics),
+        )
+        .await;
 
         storage.expect("a bucket somebody else created first is the outcome this pool wanted");
         let requested_targets = endpoint.requested_targets();
@@ -1113,7 +1120,10 @@ mod tests {
     #[tokio::test]
     async fn a_cleanup_listing_asks_the_store_to_start_after_the_oldest_kept_key() {
         let endpoint = ScriptedEndpoint::start(vec![build_http_response(500, &[], "")]).await;
-        let storage = build_storage_over(build_store_against(endpoint.endpoint(), Arc::new(crate::NoopMetrics)));
+        let storage = build_storage_over(build_store_against(
+            endpoint.endpoint(),
+            Arc::new(crate::infra::metrics::NoopMetrics),
+        ));
 
         let listing_result = storage
             .list_job_outdated_iterations(
@@ -1148,7 +1158,10 @@ mod tests {
     #[tokio::test]
     async fn a_cancelled_token_drops_a_conditional_read_in_flight() {
         let (endpoint, accepting) = start_silent_endpoint().await;
-        let storage = build_storage_over(build_store_against(&endpoint, Arc::new(crate::NoopMetrics)));
+        let storage = build_storage_over(build_store_against(
+            &endpoint,
+            Arc::new(crate::infra::metrics::NoopMetrics),
+        ));
         let cancel_token = CancellationToken::new();
         cancel_after_delay(&cancel_token);
 
@@ -1257,7 +1270,7 @@ mod tests {
     #[tokio::test]
     async fn a_read_whose_body_never_arrives_ends_on_the_request_timeout() {
         let (endpoint, accepting) = start_headed_endpoint().await;
-        let store = build_store_against(&endpoint, Arc::new(crate::NoopMetrics));
+        let store = build_store_against(&endpoint, Arc::new(crate::infra::metrics::NoopMetrics));
 
         let started = Instant::now();
         let read_result = store

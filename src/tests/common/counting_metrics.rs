@@ -1,7 +1,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::{IterationVerdict, JobCode, MetricsSink, TaskCode, TaskResolution};
+use crate::core::job::{IterationVerdict, JobCode};
+use crate::core::task::{TaskCode, TaskResolution};
+use crate::infra::metrics::MetricsSink;
 
 /// `MetricsSink` that counts what it was told, split by the final status where the measurement
 /// carries one.

@@ -6,7 +6,9 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
-use crate::{Job, JobCode, JobMeta, MetricsSink, Storage, StorageError, StorageResult};
+use crate::core::job::{Job, JobCode};
+use crate::infra::metrics::MetricsSink;
+use crate::storage::{JobMeta, Storage, StorageError, StorageResult};
 
 // Internal structure to hold the job state
 #[derive(Clone)]
@@ -337,7 +339,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::{JobStatus, TaskLimits};
+    use crate::core::job::{JobStatus, TaskLimits};
 
     /// A job state carrying the iteration and version the comparison under test reads, and nothing
     /// else it looks at.

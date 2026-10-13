@@ -11,12 +11,16 @@ use tokio_util::sync::CancellationToken;
 use super::common::counting_metrics::CountingMetrics;
 use super::common::manager_env::ManagerEnv;
 use super::common::storage_wrapper::{ContendedSave, ContendingStorage};
+use crate::core::error::Error;
+use crate::core::job::{JobCode, JobDefinition, JobDefinitionId, JobStatus, TaskLimits};
+use crate::core::registry::JobRegistry;
+use crate::core::task::{TaskCode, TaskDefinition, TaskRef, TaskRetry, TaskStatus};
+use crate::execution::executor::{TaskExecutor, TaskOutcome, task_fn};
+use crate::execution::jobs_manager::JobsManagerConfig;
+use crate::execution::task_context::TaskContext;
+use crate::infra::metrics::{MetricsSink, NoopMetrics};
+use crate::storage::Storage;
 use crate::storage::in_memory::InMemoryStorage;
-use crate::{
-    Error, JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStatus, JobsManagerConfig, MetricsSink,
-    NoopMetrics, Storage, TaskCode, TaskContext, TaskDefinition, TaskExecutor, TaskLimits, TaskOutcome, TaskRef,
-    TaskRetry, TaskStatus, task_fn,
-};
 
 const PLAN_TASK_CODE: &str = "plan";
 const PLANNED_TASK_CODE: &str = "planned";
@@ -29,7 +33,7 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 fn manager_config() -> JobsManagerConfig {
     JobsManagerConfig {
         worker_count: 1,
-        worker_config: super::common::build_worker_config(Duration::from_millis(20), Duration::ZERO)
+        scheduler_config: super::common::build_poll_schedule_config(Duration::from_millis(20), Duration::ZERO)
             .with_max_poll_interval(Duration::from_millis(50))
             .expect("a ceiling above the poll interval is accepted"),
         ..Default::default()
@@ -192,7 +196,7 @@ async fn run_job(
     plan_executor: Arc<dyn TaskExecutor>,
     max_attempts: u32,
     storage: Arc<dyn Storage>,
-) -> Result<crate::Job, Box<dyn std::error::Error>> {
+) -> Result<crate::core::job::Job, Box<dyn std::error::Error>> {
     run_job_measured(job_code, plan_executor, max_attempts, storage, Arc::new(NoopMetrics)).await
 }
 
@@ -204,7 +208,7 @@ async fn run_job_measured(
     max_attempts: u32,
     storage: Arc<dyn Storage>,
     metrics: Arc<dyn MetricsSink>,
-) -> Result<crate::Job, Box<dyn std::error::Error>> {
+) -> Result<crate::core::job::Job, Box<dyn std::error::Error>> {
     let plan_def = TaskDefinition::new(TaskCode::new(PLAN_TASK_CODE), TASK_TIMEOUT).with_max_attempts(max_attempts);
     let planned_executor = task_fn(|_ctx| async { Ok(TaskOutcome::empty()) });
     let job_def = JobDefinition::new(

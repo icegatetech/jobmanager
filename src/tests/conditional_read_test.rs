@@ -5,10 +5,12 @@ use uuid::Uuid;
 
 use super::common::meta_of;
 use super::common::provider_harness::{ProviderHarness, ProviderStorageRequest};
-use crate::{
-    Job, JobCode, JobDefinition, JobDefinitionId, JobStateCodecKind, JobStatus, NoopMetrics, Storage, StorageError,
-    TaskCode, TaskDefinition, TaskLimits, TaskOutcome, task_fn,
-};
+use crate::core::job::{Job, JobCode, JobDefinition, JobDefinitionId, JobStatus, TaskLimits};
+use crate::core::task::{TaskCode, TaskDefinition};
+use crate::execution::executor::{TaskOutcome, task_fn};
+use crate::infra::metrics::NoopMetrics;
+use crate::storage::state_codec::JobStateCodecKind;
+use crate::storage::{Storage, StorageError};
 
 /// Registry the backend rebuilds job settings from; the description carries one task so that the
 /// state under test is a legal one.
@@ -16,13 +18,13 @@ struct SingleJobRegistry {
     job_def: JobDefinition,
 }
 
-impl crate::JobDefinitionRegistry for SingleJobRegistry {
-    fn get_job(&self, _code: &JobCode) -> Result<JobDefinition, crate::Error> {
+impl crate::storage::JobDefinitionRegistry for SingleJobRegistry {
+    fn get_job(&self, _code: &JobCode) -> Result<JobDefinition, crate::core::error::Error> {
         Ok(self.job_def.clone())
     }
 }
 
-fn job_definition(job_code: &JobCode) -> Result<JobDefinition, crate::Error> {
+fn job_definition(job_code: &JobCode) -> Result<JobDefinition, crate::core::error::Error> {
     JobDefinition::new(
         JobDefinitionId::new(),
         job_code.clone(),

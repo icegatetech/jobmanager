@@ -11,9 +11,13 @@ S3-compatible one), Azure Blob Storage, or Google Cloud Storage — you have eve
 A **job** is a named unit of work made of one or more **tasks**. A **worker** polls storage for
 jobs that have runnable tasks, executes one task at a time, and writes the updated job back.
 
-Each job is polled on its own schedule: `JobsManagerBuilder::poll_interval` sets the interval a job
-with work to do is polled at, and a job waiting for its next iteration is not polled until the
-moment that iteration is due — set per job with `JobBuilder::every` or moved by an executor.
+A worker pool polls on one schedule shared by all of its workers. A free worker takes the job whose poll
+is due earliest and claims it for the length of one task start — the read of the job and the start of a
+task; the task itself runs after the claim is released, so other workers can start further tasks
+of the same job meanwhile. While every worker is busy nobody polls, and what an idle pool costs
+the store does not depend on `JobsManagerBuilder::workers`.
+
+Each job is polled on its own moment; the rules are documented on `JobsManagerBuilder::poll_interval`.
 
 ```
 JobsManager ──┬── Worker ──┐

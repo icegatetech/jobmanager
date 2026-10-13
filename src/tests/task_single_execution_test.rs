@@ -8,11 +8,13 @@ use super::common::{
     manager_env::ManagerEnv,
     storage_wrapper::{CountingStorage, SiblingCompletingStorage},
 };
+use crate::core::job::{JobCode, JobDefinition, JobDefinitionId, JobStatus, TaskLimits};
+use crate::core::registry::JobRegistry;
+use crate::core::task::{TaskCode, TaskDefinition, TaskStatus};
+use crate::execution::executor::{TaskOutcome, task_fn};
+use crate::execution::jobs_manager::JobsManagerConfig;
+use crate::storage::Storage;
 use crate::storage::in_memory::InMemoryStorage;
-use crate::{
-    JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStatus, JobsManagerConfig, Storage, TaskCode,
-    TaskDefinition, TaskLimits, TaskOutcome, TaskStatus, task_fn,
-};
 
 /// Bound on the only wait in this file: a job that never finishes fails the test with a diagnostic
 /// instead of hanging the suite.
@@ -95,7 +97,7 @@ async fn a_task_completed_by_a_rival_is_not_resurrected_by_its_creator() -> Resu
     // outcome depends on which worker got somewhere first.
     let config = JobsManagerConfig {
         worker_count: 1,
-        worker_config: super::common::build_worker_config(Duration::from_millis(10), Duration::ZERO),
+        scheduler_config: super::common::build_poll_schedule_config(Duration::from_millis(10), Duration::ZERO),
         ..Default::default()
     };
     let mut manager_env = ManagerEnv::new(

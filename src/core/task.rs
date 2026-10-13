@@ -2,7 +2,8 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{JobDefinitionId, JobError, TaskLimits};
+use crate::core::error::JobError;
+use crate::core::job::{JobDefinitionId, TaskLimits};
 
 /// Number of execution attempts a task gets before it is terminally failed.
 ///
@@ -20,6 +21,12 @@ pub const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 /// lifetime is a second, independent limit: it runs from the first start, so retries that are slow
 /// or start late can run out of it while attempts are still left.
 pub const DEFAULT_LIFETIME_MULTIPLIER: u32 = 5;
+
+/// How long a task its executor refused waits after the refusal before it may be started again.
+///
+/// Without it a refusal is repeated as soon as a worker is free, and a transient failure shorter
+/// than the pause spends the attempt budget in a row.
+pub const FAILED_TASK_RETRY_PAUSE: Duration = Duration::seconds(1);
 
 /// Task identifier used in job definitions and execution.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -569,6 +576,12 @@ pub(crate) enum TaskAvailability {
     /// The task may be started. For one already `Started` past its deadline that start is a
     /// takeover, which spends no attempt.
     Pickable,
+    /// The task failed with attempts and lifetime to spare, and may be started again no earlier
+    /// than `retry_at`.
+    AwaitingRetry {
+        /// The end of the [`FAILED_TASK_RETRY_PAUSE`] counted from the refusal.
+        retry_at: DateTime<Utc>,
+    },
     /// The task has outlived its maximum lifetime, so it is to be failed rather than taken over.
     ExpiredPastLifetime,
     /// Nothing to do with it: running within its deadline, blocked, completed, skipped, or
@@ -882,10 +895,16 @@ impl Task {
             TaskStatus::Blocked | TaskStatus::Completed | TaskStatus::Skipped(_) => TaskAvailability::Unavailable,
             TaskStatus::Failed => {
                 if self.is_terminally_failed_at(now) {
-                    TaskAvailability::Unavailable
-                } else {
-                    TaskAvailability::Pickable
+                    return TaskAvailability::Unavailable;
                 }
+                // `completed_at` is the moment of the refusal. A failure that recorded none, or a
+                // pause carrying it past the range of dates, holds the retry back for nothing.
+                self.completed_at
+                    .and_then(|failed_at| failed_at.checked_add_signed(FAILED_TASK_RETRY_PAUSE))
+                    .filter(|retry_at| now < *retry_at)
+                    .map_or(TaskAvailability::Pickable, |retry_at| TaskAvailability::AwaitingRetry {
+                        retry_at,
+                    })
             }
             TaskStatus::Started => {
                 if self.is_lifetime_expired_at(now) {
@@ -951,12 +970,21 @@ impl Task {
     /// # Errors
     ///
     /// Returns [`JobError::TaskWorkerMismatch`] if another worker holds the task, or
-    /// [`JobError::Other`] if the task cannot be started right now or if either moment falls outside
-    /// the range of dates. The task is left as it was in every error case: both moments are computed
-    /// before anything is assigned.
+    /// [`JobError::Other`] if the task cannot be started right now - a failed one still within
+    /// [`FAILED_TASK_RETRY_PAUSE`] included - or if either moment falls outside the range of dates. The task is
+    /// left as it was in every error case: both moments are computed before anything is assigned.
     pub(crate) fn start(&mut self, worker_id: Uuid) -> Result<(), JobError> {
         let now = Utc::now();
-        if !self.can_be_picked_up_at(now) {
+        let availability = self.check_availability_at(now);
+        // Answered before the owner: `Self::fail` leaves the refusing worker as the owner, so any
+        // other worker would otherwise read a pause as a lost task.
+        if let TaskAvailability::AwaitingRetry { retry_at } = availability {
+            return Err(JobError::Other(format!(
+                "cannot start task (id: {}; code: {}): it awaits its retry until {retry_at}",
+                self.id, self.code
+            )));
+        }
+        if !matches!(availability, TaskAvailability::Pickable) {
             if self.processing_by_worker != Some(worker_id) {
                 return Err(JobError::TaskWorkerMismatch);
             }
@@ -1328,9 +1356,10 @@ mod tests {
         );
     }
 
-    /// The ordinary refusal keeps its behaviour: the task is picked up again while the budget lasts.
+    /// The ordinary refusal keeps its behaviour: the task is picked up again while the budget lasts,
+    /// once its retry pause has passed.
     #[test]
-    fn a_refusal_declared_retryable_leaves_the_task_pickable() {
+    fn a_refusal_declared_retryable_leaves_the_task_pickable_after_its_retry_pause() {
         let def = TaskDefinition::new("t", std::time::Duration::from_secs(5));
         let mut task = Task::new(Uuid::from_u128(2), Uuid::from_u128(1), None, &def, Vec::new());
         task.start(Uuid::from_u128(3)).unwrap();
@@ -1338,7 +1367,73 @@ mod tests {
         task.fail("flaky store", TaskRetry::WhileBudgetLasts).unwrap();
 
         assert!(!task.is_terminally_failed_at(Utc::now()));
-        assert_eq!(task.check_availability_at(Utc::now()), TaskAvailability::Pickable);
+        assert_eq!(
+            task.check_availability_at(Utc::now() + FAILED_TASK_RETRY_PAUSE),
+            TaskAvailability::Pickable
+        );
+    }
+
+    /// Which side of the end of the retry pause the instant itself falls on: the pause counts from
+    /// the refusal, and the moment it reaches is the first one the retry may start at.
+    #[test]
+    fn the_retry_pause_ends_at_the_moment_it_reaches() {
+        let refused_at = Utc::now();
+        let task = Task::restore(RestoredTask {
+            status: TaskStatus::Failed,
+            completed_at: Some(refused_at),
+            lifetime_deadline_at: Some(refused_at + Duration::seconds(600)),
+            attempt: 1,
+            ..restored_task_fields()
+        });
+        let retry_at = refused_at + FAILED_TASK_RETRY_PAUSE;
+
+        assert_eq!(
+            task.check_availability_at(retry_at - Duration::milliseconds(1)),
+            TaskAvailability::AwaitingRetry { retry_at }
+        );
+        assert_eq!(task.check_availability_at(retry_at), TaskAvailability::Pickable);
+        assert_eq!(
+            task.check_availability_at(retry_at + Duration::milliseconds(1)),
+            TaskAvailability::Pickable
+        );
+    }
+
+    /// The pause is checked where the start is written, not only where a task is selected: a start
+    /// within it is refused and changes nothing.
+    #[test]
+    fn a_start_of_a_failed_task_within_its_retry_pause_is_refused() {
+        let def = TaskDefinition::new("t", std::time::Duration::from_secs(5));
+        let mut task = Task::new(Uuid::from_u128(2), Uuid::from_u128(1), None, &def, Vec::new());
+        task.start(Uuid::from_u128(3)).unwrap();
+        task.fail("flaky store", TaskRetry::WhileBudgetLasts).unwrap();
+
+        let error = task
+            .start(Uuid::from_u128(3))
+            .expect_err("a start within the pause must be refused");
+
+        assert!(matches!(error, JobError::Other(_)), "got: {error:?}");
+        assert!(task.is_failed(), "a refused start must change nothing");
+        assert_eq!(task.attempt(), 1);
+    }
+
+    /// The refusing worker stays the owner of a failed task, so a start by any other worker within
+    /// the pause must be refused for the pause rather than read as a task lost to the owner.
+    /// Checked by answering the owner before the pause in `Task::start`.
+    #[test]
+    fn a_start_of_a_failed_task_within_its_retry_pause_by_another_worker_is_refused_for_the_pause() {
+        let def = TaskDefinition::new("t", std::time::Duration::from_secs(5));
+        let mut task = Task::new(Uuid::from_u128(2), Uuid::from_u128(1), None, &def, Vec::new());
+        task.start(Uuid::from_u128(3)).unwrap();
+        task.fail("flaky store", TaskRetry::WhileBudgetLasts).unwrap();
+
+        let error = task
+            .start(Uuid::from_u128(4))
+            .expect_err("a start within the pause must be refused");
+
+        assert!(matches!(error, JobError::Other(_)), "got: {error:?}");
+        assert!(task.is_failed(), "a refused start must change nothing");
+        assert_eq!(task.processing_by_worker(), Some(Uuid::from_u128(3)));
+        assert_eq!(task.attempt(), 1);
     }
 
     /// The executor's own decision about the task it is running.

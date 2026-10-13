@@ -12,10 +12,14 @@ use tokio_util::sync::CancellationToken;
 
 use super::common::persist_completed_iterations;
 use super::common::s3_container::S3TestContainer;
-use crate::{
-    JobCode, JobDefinition, JobDefinitionId, JobRegistry, JobStateCodecKind, NoopMetrics, S3Backend, S3Config, Storage,
-    TaskCode, TaskDefinition, TaskLimits, TaskOutcome, task_fn,
-};
+use crate::core::job::{JobCode, JobDefinition, JobDefinitionId, TaskLimits};
+use crate::core::registry::JobRegistry;
+use crate::core::task::{TaskCode, TaskDefinition};
+use crate::execution::executor::{TaskOutcome, task_fn};
+use crate::infra::metrics::NoopMetrics;
+use crate::storage::Storage;
+use crate::storage::s3::{S3Backend, S3Config};
+use crate::storage::state_codec::JobStateCodecKind;
 
 /// Prefix the cases here keep their state objects under.
 const STATE_PREFIX: &str = "jobs";

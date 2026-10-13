@@ -14,11 +14,13 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
+use crate::core::job::{Job, JobCode};
+use crate::infra::retrier::{Retrier, RetryStep};
 use crate::storage::backend::{Backend, ListingRequest, ListingStartBound, PutCondition};
 use crate::storage::paths::JobPaths;
 use crate::storage::state::StoredJob;
 use crate::storage::state_codec::JobStateCodec;
-use crate::{Job, JobCode, JobDefinitionRegistry, JobMeta, Retrier, RetryStep, Storage, StorageError, StorageResult};
+use crate::storage::{JobDefinitionRegistry, JobMeta, Storage, StorageError, StorageResult};
 
 /// `Backend` over the objects `B` keeps, holding everything a provider is not allowed to decide.
 pub(crate) struct ObjectStorage<B: Backend> {
@@ -358,7 +360,7 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::*;
-    use crate::RetrierConfig;
+    use crate::infra::retrier::RetrierConfig;
     use crate::storage::backend::{ListedObject, ListedPage};
     use crate::storage::paths::DEFAULT_STATE_PREFIX;
     use crate::storage::state_codec::JobStateCodecKind;

@@ -10,7 +10,11 @@ use parking_lot::Mutex;
 
 use super::common::counting_metrics::CountingMetrics;
 use super::common::provider_harness::ProviderHarness;
-use crate::{JobCode, JobsManager, MetricsSink, TaskDefinition, TaskLimits, TaskOutcome, task_fn};
+use crate::core::job::{JobCode, TaskLimits};
+use crate::core::task::TaskDefinition;
+use crate::execution::executor::{TaskOutcome, task_fn};
+use crate::execution::jobs_manager::JobsManager;
+use crate::infra::metrics::MetricsSink;
 
 /// Bound on the wait: a broken chain must fail the test rather than hang the suite.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(30);

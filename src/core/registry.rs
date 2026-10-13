@@ -1,6 +1,10 @@
 use std::{collections::HashMap, sync::Arc};
 
-use crate::{Error, JobCode, JobDefinition, JobDefinitionRegistry, TaskCode, TaskExecutor};
+use crate::core::error::Error;
+use crate::core::job::{JobCode, JobDefinition};
+use crate::core::task::TaskCode;
+use crate::execution::executor::TaskExecutor;
+use crate::storage::JobDefinitionRegistry;
 
 /// Immutable collection of job definitions and task executors.
 #[derive(Clone)]

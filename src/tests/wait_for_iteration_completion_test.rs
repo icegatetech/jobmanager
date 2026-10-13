@@ -7,7 +7,10 @@ use std::{
 };
 
 use super::common::provider_harness::ProviderHarness;
-use crate::{JobCode, JobsManager, TaskDefinition, TaskOutcome, task_fn};
+use crate::core::job::JobCode;
+use crate::core::task::TaskDefinition;
+use crate::execution::executor::{TaskOutcome, task_fn};
+use crate::execution::jobs_manager::JobsManager;
 
 /// Bound on every wait here: a broken wait must fail the test rather than hang the suite.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(30);

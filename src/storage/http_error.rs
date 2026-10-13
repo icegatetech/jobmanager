@@ -1,6 +1,6 @@
 //! HTTP response classification shared by object-store backends.
 
-use crate::StorageError;
+use crate::storage::StorageError;
 
 /// What a response status amounts to for the caller that issued the request.
 ///

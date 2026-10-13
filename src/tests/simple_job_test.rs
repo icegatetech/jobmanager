@@ -10,11 +10,15 @@ use tokio_util::sync::CancellationToken;
 
 use super::common::manager_env::ManagerEnv;
 use super::common::provider_harness::{ProviderHarness, ProviderStorageRequest};
+use crate::core::job::{JobCode, JobDefinition, JobDefinitionId, JobStatus, TaskLimits};
+use crate::core::registry::JobRegistry;
+use crate::core::task::{TaskCode, TaskDefinition};
+use crate::execution::executor::{TaskOutcome, task_fn};
+use crate::execution::jobs_manager::JobsManagerConfig;
+use crate::infra::metrics::NoopMetrics;
 use crate::storage::in_memory::InMemoryStorage;
-use crate::{
-    JobCode, JobDefinition, JobDefinitionId, JobDefinitionRegistry, JobRegistry, JobStateCodecKind, JobStatus,
-    JobsManagerConfig, NoopMetrics, Storage, TaskCode, TaskDefinition, TaskLimits, TaskOutcome, task_fn,
-};
+use crate::storage::state_codec::JobStateCodecKind;
+use crate::storage::{JobDefinitionRegistry, Storage};
 
 /// One task runs, receives the input its definition carried, and the finished iteration is the one
 /// the store holds afterwards. Run under both codecs, because the stored format is what the
@@ -69,7 +73,10 @@ async fn run_simple_job_execution(
 
     let config = JobsManagerConfig {
         worker_count: 1,
-        worker_config: super::common::build_worker_config(Duration::from_millis(100), Duration::from_millis(10)),
+        scheduler_config: super::common::build_poll_schedule_config(
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+        ),
         ..Default::default()
     };
 
@@ -163,7 +170,10 @@ async fn test_multi_task_sequence() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Start manager
     let config = JobsManagerConfig {
         worker_count: 1,
-        worker_config: super::common::build_worker_config(Duration::from_millis(100), Duration::from_millis(10)),
+        scheduler_config: super::common::build_poll_schedule_config(
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+        ),
         ..Default::default()
     };
 
@@ -205,7 +215,7 @@ async fn test_multi_task_sequence() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(feature = "storage-s3")]
 mod on_s3 {
     use super::run_simple_job_execution;
-    use crate::JobStateCodecKind;
+    use crate::storage::state_codec::JobStateCodecKind;
     use crate::tests::common::provider_harness::S3ProviderHarness;
 
     #[tokio::test]
@@ -224,7 +234,7 @@ mod on_s3 {
 #[cfg(feature = "storage-azure")]
 mod on_azure {
     use super::run_simple_job_execution;
-    use crate::JobStateCodecKind;
+    use crate::storage::state_codec::JobStateCodecKind;
     use crate::tests::common::provider_harness::AzureProviderHarness;
 
     #[tokio::test]
@@ -243,7 +253,7 @@ mod on_azure {
 #[cfg(feature = "storage-gcs")]
 mod on_gcs {
     use super::run_simple_job_execution;
-    use crate::JobStateCodecKind;
+    use crate::storage::state_codec::JobStateCodecKind;
     use crate::tests::common::provider_harness::GcsProviderHarness;
 
     #[tokio::test]

@@ -10,7 +10,10 @@ use std::{sync::Arc, time::Duration};
 use parking_lot::Mutex;
 use uuid::Uuid;
 
-use crate::{JobCode, JobsManager, TaskCode, TaskDefinition, TaskOutcome, task_fn};
+use crate::core::job::JobCode;
+use crate::core::task::{TaskCode, TaskDefinition};
+use crate::execution::executor::{TaskOutcome, task_fn};
+use crate::execution::jobs_manager::JobsManager;
 
 /// Bound on every wait here: a job that never finishes must fail the test rather than hang the
 /// suite.

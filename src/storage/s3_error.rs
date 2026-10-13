@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 use aws_sdk_s3::{error::SdkError, primitives::ByteStreamError, types::Error as ObjectDeleteError};
 use tracing::warn;
 
-use crate::StorageError;
+use crate::storage::StorageError;
 use crate::storage::backend::{ProviderError, RequestStatus};
 use crate::storage::http_error::{HttpOutcome, classify_http_status};
 

@@ -1,8 +1,9 @@
 //! Object keys shared by backends. Inverted iteration numbers put the newest state first
 //! in an ascending listing; changing this layout requires migrating existing objects.
 
+use crate::core::job::JobCode;
 use crate::storage::state_codec::JobStateCodec;
-use crate::{JobCode, StorageError, StorageResult};
+use crate::storage::{StorageError, StorageResult};
 
 const JOB_STATE_FILE_PREFIX: &str = "state-";
 

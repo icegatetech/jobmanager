@@ -12,13 +12,19 @@ use super::common::waiting::{
     CONDITION_TIMEOUT, OBSERVATION_WINDOW, measure_settled_requests, wait_until, wait_until_job_is_processed,
 };
 use super::common::{meta_of, persist_completed_iterations};
-use crate::core::task::SkipCause;
+use crate::core::job::{Job, JobCode, JobDefinition, JobDefinitionId, JobStatus, TaskLimits};
+use crate::core::registry::JobRegistry;
+use crate::core::task::{DependencyTolerance, TaskCode, TaskDefinition, TaskRef, TaskStatus};
+use crate::core::task::{FAILED_TASK_RETRY_PAUSE, SkipCause};
+use crate::execution::executor::{TaskExecutor, TaskOutcome, task_fn};
+use crate::execution::job_cleaner::{JobCleaner, JobCleanerConfig};
+use crate::execution::jobs_manager::JobsManagerConfig;
+use crate::execution::scheduler::PollSchedulerConfig;
+use crate::infra::metrics::{MetricsSink, NoopMetrics};
+use crate::storage::cached::CachedStorage;
 use crate::storage::paths::JobPaths;
-use crate::{
-    CachedStorage, DependencyTolerance, Job, JobCleaner, JobCleanerConfig, JobCode, JobDefinition, JobDefinitionId,
-    JobDefinitionRegistry, JobRegistry, JobStateCodecKind, JobStatus, JobsManagerConfig, MetricsSink, NoopMetrics,
-    Storage, TaskCode, TaskDefinition, TaskExecutor, TaskLimits, TaskOutcome, TaskRef, TaskStatus, task_fn,
-};
+use crate::storage::state_codec::JobStateCodecKind;
+use crate::storage::{JobDefinitionRegistry, Storage};
 
 /// Interval the pools below poll at: short enough that an observation window holds many passes, so
 /// a request issued per pass would be counted many times over.
@@ -29,7 +35,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const OUTLIVING_TASK_CODE: &str = "outliving";
 const OUTLIVING_TASK_TIMEOUT: Duration = Duration::from_millis(100);
 
-fn build_job_definition(job_code: &JobCode, executor: Arc<dyn TaskExecutor>) -> Result<JobDefinition, crate::Error> {
+fn build_job_definition(
+    job_code: &JobCode,
+    executor: Arc<dyn TaskExecutor>,
+) -> Result<JobDefinition, crate::core::error::Error> {
     JobDefinition::new(
         JobDefinitionId::new(),
         job_code.clone(),
@@ -73,15 +82,34 @@ fn start_pool_on(
     job_registry: Arc<JobRegistry>,
     job_def: JobDefinition,
 ) -> Result<ManagerEnv, Box<dyn std::error::Error>> {
+    start_pool_on_with_scheduler_config(
+        store,
+        worker_count,
+        job_registry,
+        job_def,
+        super::common::build_poll_schedule_config(POLL_INTERVAL, Duration::ZERO),
+    )
+}
+
+/// [`start_pool_on`] for a scenario whose number depends on a poll setting other than
+/// [`POLL_INTERVAL`].
+fn start_pool_on_with_scheduler_config(
+    store: Arc<dyn Storage>,
+    worker_count: usize,
+    job_registry: Arc<JobRegistry>,
+    job_def: JobDefinition,
+    scheduler_config: PollSchedulerConfig,
+) -> Result<ManagerEnv, Box<dyn std::error::Error>> {
     ManagerEnv::new(
         Arc::new(CachedStorage::new(store, Arc::new(NoopMetrics))) as Arc<dyn Storage>,
         JobsManagerConfig {
             worker_count,
-            worker_config: super::common::build_worker_config(POLL_INTERVAL, Duration::ZERO),
+            scheduler_config,
             cleaner_config: JobCleanerConfig {
                 enabled: false,
                 ..Default::default()
             },
+            ..Default::default()
         },
         job_registry,
         vec![job_def],
@@ -169,6 +197,9 @@ async fn run_a_conditional_read_of_an_unmoved_iteration_costs_one_get_and_no_lis
 /// does. Counted through the storage metric rather than through trait calls, because a backend
 /// turns one call into as many requests as its retries and the SDK's take.
 ///
+/// The task runs in another pool, started over a store nobody counts before the measured pool
+/// starts, so the measured pool reads an iteration it holds no part of.
+///
 /// Checked by reading without the `If-None-Match` the state was taken under: the answers stop being
 /// `304` and land in the very class this bounds, which then grows across the window.
 async fn run_polling_a_running_iteration_costs_no_request_besides_a_conditional_read(
@@ -180,7 +211,7 @@ async fn run_polling_a_running_iteration_costs_no_request_besides_a_conditional_
 
     let started_flag = Arc::clone(&is_task_started);
     let released_flag = Arc::clone(&is_task_released);
-    // The task holds the iteration open for the whole window, so every pass of the other worker
+    // The task holds the iteration open for the whole window, so every pass of the measured pool
     // meets a running iteration - the state the saving is about.
     let job_def = build_job_definition(
         &JobCode::new("running_iteration_job"),
@@ -196,9 +227,15 @@ async fn run_polling_a_running_iteration_costs_no_request_besides_a_conditional_
             }
         }),
     )?;
-    let _env = start_pool(harness, "running", 2, job_def, &metrics).await?;
-
+    let running_pool_store = build_state_probe(harness, "running", &job_def).await?;
+    let _running_pool = start_pool_on(
+        running_pool_store,
+        1,
+        Arc::new(JobRegistry::new(vec![job_def.clone()])?),
+        job_def.clone(),
+    )?;
     wait_until(|| is_task_started.load(Ordering::SeqCst), "the iteration is running").await?;
+    let _env = start_pool(harness, "running", 2, job_def, &metrics).await?;
     // Every request but the conditional read is what the scenario bounds, so that is what has to
     // settle: the conditional reads go on for as long as the iteration runs, which is the whole
     // point.
@@ -233,9 +270,8 @@ const LONG_ITERATION_INTERVAL: Duration = Duration::from_mins(5);
 /// and whose next one is not due may add nothing at all across a window - no listing, no
 /// conditional read, no write.
 ///
-/// Checked by letting a pass reach the job whatever its next iteration is due at - both the wait
-/// between passes and the poll gate, because either one alone still holds the pass back. The total
-/// then more than doubles across the window.
+/// Checked by letting `PollScheduler::try_claim_due_job` hand out a job whatever its poll moment: the
+/// total then more than doubles across the window.
 async fn run_a_job_waiting_for_its_next_iteration_costs_nothing_on_the_store(
     harness: &dyn ProviderHarness,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -262,20 +298,21 @@ async fn run_a_job_waiting_for_its_next_iteration_costs_nothing_on_the_store(
     Ok(())
 }
 
-/// Run quota of one job from an empty store to a finished iteration: five requests, made of three
+/// Run quota of one job from an empty store to a finished iteration: four requests, made of three
 /// writes - the job created, its task started, its task finished together with the iteration - and
-/// two listings, the one that finds the store empty and the one the pass after the iteration
-/// answers with. Nothing is read at all: the pass that follows a write is served by the cache that
-/// write filled, and the last pass recognises the listed version as the one it already holds.
+/// the one listing that finds the store empty. Nothing is read at all, and there is no pass after
+/// the iteration: the write that closed the last iteration already says the job is done.
 ///
-/// One worker and one task are what make this a number rather than a range: a second worker races
-/// for the same task and pays a rejected write for losing, and a second task takes a pass of its
-/// own. The iteration budget of one is what makes the total settle - the pool stops polling a job
-/// it has run out, so a request that should not happen has nowhere to hide.
+/// One worker and one task are what make this a number rather than a range: under
+/// [`POLL_INTERVAL`] a second worker left idle while the task executes polls the job before the
+/// result is written - `run_running_a_single_task_job_once_with_four_workers_costs_four_requests`
+/// lifts that with a poll interval beyond the execution - and a second task takes a pass of its
+/// own. The iteration budget of one is what makes the total settle - the pool stops
+/// polling a job it has run out, so a request that should not happen has nowhere to hide.
 ///
-/// Checked by letting a pass run before the moment it was scheduled for: the finished iteration is
-/// discovered a second time and the listings go from two to three.
-async fn run_running_a_single_task_job_once_costs_five_requests(
+/// Checked by recording `JobProgress::IterationsEnded` like `JobProgress::NothingPickable`:
+/// the pass after the iteration comes back, and its listing makes the count five.
+async fn run_running_a_single_task_job_once_costs_four_requests(
     harness: &dyn ProviderHarness,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(CountingMetrics::default());
@@ -305,17 +342,132 @@ async fn run_running_a_single_task_job_once_costs_five_requests(
     );
     assert_eq!(
         metrics.storage_operations("LIST", "OK"),
-        2,
-        "the empty store and the finished iteration are the only two states that cost a listing"
+        1,
+        "the empty store is the only state that costs a listing"
     );
     assert_eq!(
-        requests, 5,
+        requests, 4,
         "and nothing else is billed: no read, no rejected write, no failed request"
     );
     Ok(())
 }
 
-/// Run quota of a job whose only task refuses for good: the same five requests a successful run of
+/// Run quota of one iteration of a job with an iteration interval: the same four requests a job
+/// with an iteration budget of one costs. The write that closed the iteration names when the next
+/// one is due, and that moment becomes the poll of the job, so no pass reads the closed iteration
+/// to find it out.
+///
+/// The interval is what makes the total settle: it is longer than every wait of the test, so the
+/// next iteration cannot fall due while the counters are read.
+///
+/// Checked by recording an execution end carrying `NextIterationStatus::DueAt` as
+/// `JobProgress::NothingPickable`: the pass after the iteration comes back, and the listings go
+/// from one to two.
+async fn run_running_an_interval_job_once_costs_four_requests(
+    harness: &dyn ProviderHarness,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let metrics = Arc::new(CountingMetrics::default());
+    let job_code = JobCode::new("interval_run_job");
+    let job_def = build_job_definition(&job_code, task_fn(|_ctx| async { Ok(TaskOutcome::empty()) }))?
+        .with_iteration_interval(LONG_ITERATION_INTERVAL)?;
+    let probe = build_state_probe(harness, "interval-run", &job_def).await?;
+    let _env = start_pool(harness, "interval-run", 1, job_def, &metrics).await?;
+
+    wait_until_job_is_processed(probe.as_ref(), &job_code, &CancellationToken::new()).await?;
+    let requests = measure_settled_requests(
+        || metrics.storage_operations_total(),
+        "the pool has stopped polling the job whose next iteration is not due",
+    )
+    .await?;
+
+    let stored_status = probe.get_job(&job_code, &CancellationToken::new()).await?.status().clone();
+    assert_eq!(
+        stored_status,
+        JobStatus::Completed,
+        "the interval is only about a run that reached the end of its iteration"
+    );
+    assert_eq!(
+        metrics.storage_operations("PUT", "OK"),
+        3,
+        "creating the job, starting its task and finishing it are the only writes a single run makes"
+    );
+    assert_eq!(
+        metrics.storage_operations("LIST", "OK"),
+        1,
+        "the empty store is the only state that costs a listing"
+    );
+    assert_eq!(
+        requests, 4,
+        "and nothing else is billed: no read, no rejected write, no failed request"
+    );
+    Ok(())
+}
+
+/// Base poll interval of the pool below: longer than the execution, so no worker left idle while
+/// the task executes polls the job in the meantime.
+const POLL_INTERVAL_BEYOND_EXECUTION: Duration = Duration::from_secs(10);
+
+/// Run quota of the single-task run on four workers: the same four requests one worker costs. The
+/// pool polls its jobs on one schedule and hands a due job to one worker at a time, so the workers
+/// it does not hand the job to cost nothing - no listing of the empty store, no write refused for
+/// losing the creation or the start of the task.
+///
+/// The base poll interval is longer than the execution: a worker left idle while the task executes
+/// would otherwise poll the job once the interval passed, and the number would be a range decided
+/// by how long the store takes to answer the write of the result.
+///
+/// Checked by giving every worker a schedule of its own: every worker then lists the empty store,
+/// so the listings go from one to at least four, and a pass that loses the creation or the start of
+/// the task adds a refused write and the listing that re-discovers the state.
+async fn run_running_a_single_task_job_once_with_four_workers_costs_four_requests(
+    harness: &dyn ProviderHarness,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let metrics = Arc::new(CountingMetrics::default());
+    let job_code = JobCode::new("pooled_run_job");
+    let job_def =
+        build_job_definition(&job_code, task_fn(|_ctx| async { Ok(TaskOutcome::empty()) }))?.with_max_iterations(1)?;
+    let probe = build_state_probe(harness, "pooled-run", &job_def).await?;
+    let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
+    let store = build_measured_store(harness, "pooled-run", &job_registry, &metrics).await?;
+    let env = start_pool_on_with_scheduler_config(
+        store,
+        4,
+        job_registry,
+        job_def,
+        super::common::build_poll_schedule_config(POLL_INTERVAL_BEYOND_EXECUTION, Duration::ZERO),
+    )?;
+
+    env.wait_for_all_jobs_completion(CONDITION_TIMEOUT).await?;
+    let requests = measure_settled_requests(
+        || metrics.storage_operations_total(),
+        "the pool has stopped polling the job whose iteration budget is spent",
+    )
+    .await?;
+
+    let stored_status = probe.get_job(&job_code, &CancellationToken::new()).await?.status().clone();
+    assert_eq!(
+        stored_status,
+        JobStatus::Completed,
+        "the budget is only about a run that reached the end of its iteration"
+    );
+    assert_eq!(
+        metrics.storage_operations("PUT", "OK"),
+        3,
+        "creating the job, starting its task and finishing it are the only writes a single run makes"
+    );
+    assert_eq!(
+        metrics.storage_operations("LIST", "OK"),
+        1,
+        "the empty store is listed once, by the one worker the job was handed to"
+    );
+    assert_eq!(
+        requests, 4,
+        "and nothing else is billed: no read, no rejected write, no failed request"
+    );
+    Ok(())
+}
+
+/// Run quota of a job whose only task refuses for good: the same four requests a successful run of
 /// the same shape costs, because the refusal is stored together with the verdict it settles the
 /// iteration with rather than in a pass of its own.
 ///
@@ -324,8 +476,9 @@ async fn run_running_a_single_task_job_once_costs_five_requests(
 ///
 /// Checked by moving the verdict back into a pass of its own - dropping `try_settle_iteration` from
 /// `Worker::execute_task`: the refusal is then saved under a running iteration and the verdict
-/// costs a fourth write.
-async fn run_a_run_ending_in_a_terminal_failure_costs_five_requests(
+/// costs a fourth write. Recording `JobProgress::IterationsEnded` like
+/// `JobProgress::NothingPickable` brings back the pass after the iteration and its listing.
+async fn run_a_run_ending_in_a_terminal_failure_costs_four_requests(
     harness: &dyn ProviderHarness,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(CountingMetrics::default());
@@ -358,25 +511,111 @@ async fn run_a_run_ending_in_a_terminal_failure_costs_five_requests(
     );
     assert_eq!(
         metrics.storage_operations("LIST", "OK"),
-        2,
-        "the empty store and the finished iteration are the only two states that cost a listing"
+        1,
+        "the empty store is the only state that costs a listing"
     );
     assert_eq!(
-        requests, 5,
+        requests, 4,
         "and a refusal costs no more than a success of the same shape"
     );
     Ok(())
 }
 
-/// Run quota of a two-task job whose first task calls its branch pointless: five requests, the same
+/// Run quota of a job whose only task refuses once, faster than the poll interval, and succeeds on
+/// its retry: eight requests, made of five writes - the job created, the task started, refused,
+/// started again and finished together with the iteration - the listing that finds the store empty,
+/// and two conditional reads.
+///
+/// The first read is the price of `FAILED_TASK_RETRY_PAUSE`: the poll the start scheduled one poll
+/// interval away comes before the pause ends, and an execution end may only bring a poll closer, so
+/// that pass finds the task awaiting its retry and learns when it is due. The second read is the
+/// pass at that moment, which starts the retry.
+///
+/// The backoff ceiling is named no lower than the pause, because a retry due beyond the ceiling is
+/// polled at the ceiling: under the one [`POLL_INTERVAL`] derives, the number would be a range
+/// decided by where in the pause the first read lands.
+///
+/// Checked by mapping `TaskStart::NoTaskAvailable` with a `retry_at` to `JobProgress::Stalled`: the
+/// pool then backs off towards the end of the pause and pays a conditional read on every step.
+async fn run_a_run_retrying_a_refusal_after_its_pause_costs_eight_requests(
+    harness: &dyn ProviderHarness,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let metrics = Arc::new(CountingMetrics::default());
+    let job_code = JobCode::new("retried_refusal_run_job");
+    let has_refused = Arc::new(AtomicBool::new(false));
+    let refused_flag = Arc::clone(&has_refused);
+    let job_def = build_job_definition(
+        &job_code,
+        task_fn(move |_ctx| {
+            let is_first_execution = !refused_flag.swap(true, Ordering::SeqCst);
+            async move {
+                if is_first_execution {
+                    return Err("flaky store".into());
+                }
+                Ok(TaskOutcome::empty())
+            }
+        }),
+    )?
+    .with_max_iterations(1)?;
+    let probe = build_state_probe(harness, "retried-refusal-run", &job_def).await?;
+    let job_registry = Arc::new(JobRegistry::new(vec![job_def.clone()])?);
+    let store = build_measured_store(harness, "retried-refusal-run", &job_registry, &metrics).await?;
+    let env = start_pool_on_with_scheduler_config(
+        store,
+        1,
+        job_registry,
+        job_def,
+        super::common::build_poll_schedule_config(POLL_INTERVAL, Duration::ZERO)
+            .with_max_poll_interval(FAILED_TASK_RETRY_PAUSE.to_std()?)?,
+    )?;
+
+    env.wait_for_all_jobs_completion(CONDITION_TIMEOUT).await?;
+    let requests = measure_settled_requests(
+        || metrics.storage_operations_total(),
+        "the pool has stopped polling the job whose iteration budget is spent",
+    )
+    .await?;
+
+    let stored = probe.get_job(&job_code, &CancellationToken::new()).await?;
+    assert_eq!(
+        *stored.status(),
+        JobStatus::Completed,
+        "the number is only about a run whose retry reached the end of its iteration"
+    );
+    assert!(
+        stored.tasks_as_iter().any(|task| task.is_completed() && task.attempt() == 2),
+        "the task must have been completed by its second attempt, after the refusal"
+    );
+    assert_eq!(
+        metrics.storage_operations("PUT", "OK"),
+        5,
+        "creating the job, starting the task, refusing it, starting it again and finishing it"
+    );
+    assert_eq!(
+        metrics.storage_operations("LIST", "OK"),
+        1,
+        "the empty store is the only state that costs a listing"
+    );
+    assert_eq!(
+        metrics.storage_operations("GET", "304"),
+        2,
+        "the pass that finds the task within its pause, and the pass that starts its retry"
+    );
+    assert_eq!(requests, 8, "and the retry costs nothing else");
+    Ok(())
+}
+
+/// Run quota of a two-task job whose first task calls its branch pointless: four requests, the same
 /// a one-task run costs, because the second task is put out by the cascade instead of being run.
 ///
-/// The number is what proves the branch was never executed: running both tasks would cost seven -
-/// a write to start the second and a write to finish it.
+/// The number is what proves the branch was never executed: running both tasks would cost two
+/// more - a write to start the second and a write to finish it.
 ///
 /// Checked by dropping the cascade from `Job::try_settle_iteration`: the dependent then either runs -
-/// two writes more - or leaves the iteration open for the deadlock the settling reports.
-async fn run_a_run_whose_branch_is_skipped_costs_five_requests(
+/// two writes more - or leaves the iteration open for the deadlock the settling reports. Recording
+/// `JobProgress::IterationsEnded` like `JobProgress::NothingPickable` brings back the pass
+/// after the iteration and its listing.
+async fn run_a_run_whose_branch_is_skipped_costs_four_requests(
     harness: &dyn ProviderHarness,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(CountingMetrics::default());
@@ -432,19 +671,19 @@ async fn run_a_run_whose_branch_is_skipped_costs_five_requests(
     );
     assert_eq!(
         metrics.storage_operations("LIST", "OK"),
-        2,
-        "the empty store and the finished iteration are the only two states that cost a listing"
+        1,
+        "the empty store is the only state that costs a listing"
     );
     assert_eq!(
-        requests, 5,
+        requests, 4,
         "and the branch that was skipped is paid for as if it were not there"
     );
     Ok(())
 }
 
 /// Run quota of a two-task job whose first task refuses for good and whose second declared it
-/// survives that: eight requests, made of five writes - the job created, and a start and a
-/// resolution for each of the two tasks - the two listings every run of this shape pays, and one
+/// survives that: seven requests, made of five writes - the job created, and a start and a
+/// resolution for each of the two tasks - the listing that finds the store empty, and one
 /// conditional read. The read is what a degraded path costs on top of the writes: the dependent
 /// starts in a pass of its own, and that pass finds the iteration its predecessor left open.
 ///
@@ -454,10 +693,11 @@ async fn run_a_run_whose_branch_is_skipped_costs_five_requests(
 /// Checked by making `Task::judge_dependency` ignore `allows_failed` for a terminally failed
 /// dependency: the cascade then puts the dependent out in the pass that stores the refusal, the
 /// iteration ends as failed, and the pass the dependent's own execution took - its two writes and
-/// its conditional read - goes with it, leaving five requests. Dropping the tolerance from the
+/// its conditional read - goes with it, leaving four requests. Dropping the tolerance from the
 /// dependent's definition moves the same three requests, which is what proves the fixture reaches
-/// the tolerant path at all.
-async fn run_a_run_with_a_tolerant_dependent_costs_eight_requests(
+/// the tolerant path at all. Recording `JobProgress::IterationsEnded` like
+/// `JobProgress::NothingPickable` brings back the pass after the iteration and its listing.
+async fn run_a_run_with_a_tolerant_dependent_costs_seven_requests(
     harness: &dyn ProviderHarness,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(CountingMetrics::default());
@@ -515,8 +755,8 @@ async fn run_a_run_with_a_tolerant_dependent_costs_eight_requests(
     );
     assert_eq!(
         metrics.storage_operations("LIST", "OK"),
-        2,
-        "the empty store and the finished iteration are the only two states that cost a listing"
+        1,
+        "the empty store is the only state that costs a listing"
     );
     assert_eq!(
         metrics.storage_operations("GET", "304"),
@@ -524,13 +764,13 @@ async fn run_a_run_with_a_tolerant_dependent_costs_eight_requests(
         "the pass that starts the dependent finds the iteration open and pays a conditional read for it"
     );
     assert_eq!(
-        requests, 8,
+        requests, 7,
         "and a degraded path is paid for as the work it is, no more"
     );
     Ok(())
 }
 
-/// Run quota of the same job when one race is lost: eight requests, the five an uncontended run
+/// Run quota of the same job when one race is lost: seven requests, the four an uncontended run
 /// pays plus the rejected write itself and the listing and read that re-discover the state it was
 /// rejected against. The retry is not part of the price: it is the write the run owed anyway.
 ///
@@ -539,9 +779,9 @@ async fn run_a_run_with_a_tolerant_dependent_costs_eight_requests(
 /// write. The rival reaches the store through one of its own, so what the counters hold is what the
 /// pool alone is billed for.
 ///
-/// Checked by letting a pass run before the moment it was scheduled for: the finished iteration is
-/// discovered a second time and the listings go from three to four.
-async fn run_a_run_losing_one_race_costs_eight_requests(
+/// Checked by recording `JobProgress::IterationsEnded` like `JobProgress::NothingPickable`:
+/// the pass after the iteration comes back, and the listings go from two to three.
+async fn run_a_run_losing_one_race_costs_seven_requests(
     harness: &dyn ProviderHarness,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(CountingMetrics::default());
@@ -582,7 +822,7 @@ async fn run_a_run_losing_one_race_costs_eight_requests(
     );
     assert_eq!(
         metrics.storage_operations("LIST", "OK"),
-        3,
+        2,
         "the refusal empties the cache, so the state has to be discovered once more"
     );
     assert_eq!(
@@ -595,7 +835,7 @@ async fn run_a_run_losing_one_race_costs_eight_requests(
         3,
         "the retry replaces the refused write rather than adding to the writes a run makes"
     );
-    assert_eq!(requests, 8, "and nothing else is billed for the race");
+    assert_eq!(requests, 7, "and nothing else is billed for the race");
     Ok(())
 }
 
@@ -605,7 +845,11 @@ async fn run_a_run_losing_one_race_costs_eight_requests(
 ///
 /// What the number holds is that such a result is dropped rather than merged: the refused write is
 /// answered by one listing and one read that re-discover the state, and nothing is written after
-/// them - one request fewer than a lost race whose merge goes through, which pays for its retry.
+/// them. The seven are the creation and the start, the refused write, the listing that finds the
+/// store empty, the listing and the read after the refusal, and the listing of the pass after the
+/// iteration. That pass stays because the dropped result closed nothing: the rival's write closed
+/// the iteration, and no execution end of this pool reports it. So a dropped result costs what a lost
+/// race does - it saves the retry and pays for that pass instead.
 ///
 /// Checked by answering `JobError::IterationAlreadySettled` with `MergeDecision::Retry` instead of
 /// `SaveOutcome::JobStolen` in the conflict handler of `Worker::execute_task`: the save is then made
@@ -677,7 +921,8 @@ async fn run_a_run_whose_result_lands_in_a_settled_iteration_costs_seven_request
     assert_eq!(
         metrics.storage_operations("LIST", "OK"),
         3,
-        "the refusal empties the cache, so the state has to be discovered once more"
+        "the empty store, the state the refusal emptied the cache of, and the pass after the iteration the \
+         rival closed each cost a listing"
     );
     assert_eq!(
         metrics.storage_operations("GET", "OK"),
@@ -688,8 +933,8 @@ async fn run_a_run_whose_result_lands_in_a_settled_iteration_costs_seven_request
     Ok(())
 }
 
-/// Run quota of the skipped-branch job when the save carrying the decision loses its race: eight
-/// requests, the same shape a lost race costs anywhere - the five of the uncontended run plus the
+/// Run quota of the skipped-branch job when the save carrying the decision loses its race: seven
+/// requests, the same shape a lost race costs anywhere - the four of the uncontended run plus the
 /// rejected write and the listing and read that re-discover the state.
 ///
 /// What the number holds is that the merge closes the iteration itself: the cascade the worker
@@ -698,8 +943,9 @@ async fn run_a_run_whose_result_lands_in_a_settled_iteration_costs_seven_request
 ///
 /// Checked by dropping the `try_settle_iteration` call from the end of
 /// `Job::merge_with_processed_task`: the retry then stores an open iteration, and the pass that
-/// closes it afterwards costs a ninth request of its own.
-async fn run_a_run_whose_skipped_branch_loses_one_race_costs_eight_requests(
+/// closes it afterwards costs requests of its own. Recording `JobProgress::IterationsEnded`
+/// like `JobProgress::NothingPickable` brings back the pass after the iteration and its listing.
+async fn run_a_run_whose_skipped_branch_loses_one_race_costs_seven_requests(
     harness: &dyn ProviderHarness,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(CountingMetrics::default());
@@ -773,7 +1019,7 @@ async fn run_a_run_whose_skipped_branch_loses_one_race_costs_eight_requests(
     );
     assert_eq!(
         metrics.storage_operations("LIST", "OK"),
-        3,
+        2,
         "the refusal empties the cache, so the state has to be discovered once more"
     );
     assert_eq!(
@@ -782,14 +1028,14 @@ async fn run_a_run_whose_skipped_branch_loses_one_race_costs_eight_requests(
         "and read once more, which an uncontended run never does"
     );
     assert_eq!(
-        requests, 8,
+        requests, 7,
         "and the cascade the merge derives again costs no write of its own"
     );
     Ok(())
 }
 
 /// Run quota of a pickup whose save loses its race after a dependency outlived its maximum
-/// lifetime: ten requests.
+/// lifetime: nine requests.
 ///
 /// What the number holds is that the failure and the cascade the merge derives again cost no
 /// request of their own, and that the pickup is carried through rather than dropped: the dependent
@@ -797,8 +1043,9 @@ async fn run_a_run_whose_skipped_branch_loses_one_race_costs_eight_requests(
 ///
 /// Checked by dropping the derivation from `Job::merge_with_picked_task`: the dependency then stays
 /// started in the state the retry writes, so the iteration is closed by a later pass whose own write
-/// and conditional read are billed on top.
-async fn run_a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_ten_requests(
+/// and conditional read are billed on top. Recording `JobProgress::IterationsEnded` like
+/// `JobProgress::NothingPickable` brings back the pass after the iteration and its listing.
+async fn run_a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_nine_requests(
     harness: &dyn ProviderHarness,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(CountingMetrics::default());
@@ -880,7 +1127,7 @@ async fn run_a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_te
     );
     assert_eq!(
         metrics.storage_operations("LIST", "OK"),
-        3,
+        2,
         "the refusal empties the cache, so the state has to be discovered once more"
     );
     assert_eq!(
@@ -894,7 +1141,7 @@ async fn run_a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_te
         "the pass that finds the dependency past its lifetime pays a conditional read for the iteration"
     );
     assert_eq!(
-        requests, 10,
+        requests, 9,
         "and the failure and the cascade the merge derives cost nothing on top of the race"
     );
     Ok(())
@@ -992,14 +1239,17 @@ mod on_s3 {
     use super::{
         run_a_conditional_read_of_an_unmoved_iteration_costs_one_get_and_no_listing,
         run_a_job_waiting_for_its_next_iteration_costs_nothing_on_the_store,
-        run_a_run_ending_in_a_terminal_failure_costs_five_requests, run_a_run_losing_one_race_costs_eight_requests,
-        run_a_run_whose_branch_is_skipped_costs_five_requests,
-        run_a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_ten_requests,
+        run_a_run_ending_in_a_terminal_failure_costs_four_requests, run_a_run_losing_one_race_costs_seven_requests,
+        run_a_run_retrying_a_refusal_after_its_pause_costs_eight_requests,
+        run_a_run_whose_branch_is_skipped_costs_four_requests,
+        run_a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_nine_requests,
         run_a_run_whose_result_lands_in_a_settled_iteration_costs_seven_requests,
-        run_a_run_whose_skipped_branch_loses_one_race_costs_eight_requests,
-        run_a_run_with_a_tolerant_dependent_costs_eight_requests,
+        run_a_run_whose_skipped_branch_loses_one_race_costs_seven_requests,
+        run_a_run_with_a_tolerant_dependent_costs_seven_requests,
         run_polling_a_running_iteration_costs_no_request_besides_a_conditional_read,
-        run_running_a_single_task_job_once_costs_five_requests, run_trimming_a_tail_of_two_iterations,
+        run_running_a_single_task_job_once_costs_four_requests,
+        run_running_a_single_task_job_once_with_four_workers_costs_four_requests,
+        run_running_an_interval_job_once_costs_four_requests, run_trimming_a_tail_of_two_iterations,
     };
     use crate::tests::common::provider_harness::S3ProviderHarness;
 
@@ -1027,33 +1277,54 @@ mod on_s3 {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn running_a_single_task_job_once_costs_five_requests_on_s3() -> Result<(), Box<dyn std::error::Error>> {
+    async fn running_a_single_task_job_once_costs_four_requests_on_s3() -> Result<(), Box<dyn std::error::Error>> {
         crate::tests::common::init_tracing();
-        run_running_a_single_task_job_once_costs_five_requests(&S3ProviderHarness::start().await?).await
+        run_running_a_single_task_job_once_costs_four_requests(&S3ProviderHarness::start().await?).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_run_ending_in_a_terminal_failure_costs_five_requests_on_s3() -> Result<(), Box<dyn std::error::Error>> {
+    async fn running_a_single_task_job_once_with_four_workers_costs_four_requests_on_s3()
+    -> Result<(), Box<dyn std::error::Error>> {
         crate::tests::common::init_tracing();
-        run_a_run_ending_in_a_terminal_failure_costs_five_requests(&S3ProviderHarness::start().await?).await
+        run_running_a_single_task_job_once_with_four_workers_costs_four_requests(&S3ProviderHarness::start().await?)
+            .await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_run_whose_branch_is_skipped_costs_five_requests_on_s3() -> Result<(), Box<dyn std::error::Error>> {
+    async fn running_an_interval_job_once_costs_four_requests_on_s3() -> Result<(), Box<dyn std::error::Error>> {
         crate::tests::common::init_tracing();
-        run_a_run_whose_branch_is_skipped_costs_five_requests(&S3ProviderHarness::start().await?).await
+        run_running_an_interval_job_once_costs_four_requests(&S3ProviderHarness::start().await?).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_run_with_a_tolerant_dependent_costs_eight_requests_on_s3() -> Result<(), Box<dyn std::error::Error>> {
+    async fn a_run_ending_in_a_terminal_failure_costs_four_requests_on_s3() -> Result<(), Box<dyn std::error::Error>> {
         crate::tests::common::init_tracing();
-        run_a_run_with_a_tolerant_dependent_costs_eight_requests(&S3ProviderHarness::start().await?).await
+        run_a_run_ending_in_a_terminal_failure_costs_four_requests(&S3ProviderHarness::start().await?).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_run_losing_one_race_costs_eight_requests_on_s3() -> Result<(), Box<dyn std::error::Error>> {
+    async fn a_run_retrying_a_refusal_after_its_pause_costs_eight_requests_on_s3()
+    -> Result<(), Box<dyn std::error::Error>> {
         crate::tests::common::init_tracing();
-        run_a_run_losing_one_race_costs_eight_requests(&S3ProviderHarness::start().await?).await
+        run_a_run_retrying_a_refusal_after_its_pause_costs_eight_requests(&S3ProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_whose_branch_is_skipped_costs_four_requests_on_s3() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_run_whose_branch_is_skipped_costs_four_requests(&S3ProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_with_a_tolerant_dependent_costs_seven_requests_on_s3() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_run_with_a_tolerant_dependent_costs_seven_requests(&S3ProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_losing_one_race_costs_seven_requests_on_s3() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_run_losing_one_race_costs_seven_requests(&S3ProviderHarness::start().await?).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1065,17 +1336,17 @@ mod on_s3 {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_run_whose_skipped_branch_loses_one_race_costs_eight_requests_on_s3()
+    async fn a_run_whose_skipped_branch_loses_one_race_costs_seven_requests_on_s3()
     -> Result<(), Box<dyn std::error::Error>> {
         crate::tests::common::init_tracing();
-        run_a_run_whose_skipped_branch_loses_one_race_costs_eight_requests(&S3ProviderHarness::start().await?).await
+        run_a_run_whose_skipped_branch_loses_one_race_costs_seven_requests(&S3ProviderHarness::start().await?).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_ten_requests_on_s3()
+    async fn a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_nine_requests_on_s3()
     -> Result<(), Box<dyn std::error::Error>> {
         crate::tests::common::init_tracing();
-        run_a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_ten_requests(
+        run_a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_nine_requests(
             &S3ProviderHarness::start().await?,
         )
         .await
@@ -1101,14 +1372,17 @@ mod on_azure {
     use super::{
         run_a_conditional_read_of_an_unmoved_iteration_costs_one_get_and_no_listing,
         run_a_job_waiting_for_its_next_iteration_costs_nothing_on_the_store,
-        run_a_run_ending_in_a_terminal_failure_costs_five_requests, run_a_run_losing_one_race_costs_eight_requests,
-        run_a_run_whose_branch_is_skipped_costs_five_requests,
-        run_a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_ten_requests,
+        run_a_run_ending_in_a_terminal_failure_costs_four_requests, run_a_run_losing_one_race_costs_seven_requests,
+        run_a_run_retrying_a_refusal_after_its_pause_costs_eight_requests,
+        run_a_run_whose_branch_is_skipped_costs_four_requests,
+        run_a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_nine_requests,
         run_a_run_whose_result_lands_in_a_settled_iteration_costs_seven_requests,
-        run_a_run_whose_skipped_branch_loses_one_race_costs_eight_requests,
-        run_a_run_with_a_tolerant_dependent_costs_eight_requests,
+        run_a_run_whose_skipped_branch_loses_one_race_costs_seven_requests,
+        run_a_run_with_a_tolerant_dependent_costs_seven_requests,
         run_polling_a_running_iteration_costs_no_request_besides_a_conditional_read,
-        run_running_a_single_task_job_once_costs_five_requests, run_trimming_a_tail_of_two_iterations,
+        run_running_a_single_task_job_once_costs_four_requests,
+        run_running_a_single_task_job_once_with_four_workers_costs_four_requests,
+        run_running_an_interval_job_once_costs_four_requests, run_trimming_a_tail_of_two_iterations,
     };
     use crate::tests::common::provider_harness::AzureProviderHarness;
 
@@ -1140,34 +1414,55 @@ mod on_azure {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn running_a_single_task_job_once_costs_five_requests_on_azure() -> Result<(), Box<dyn std::error::Error>> {
+    async fn running_a_single_task_job_once_costs_four_requests_on_azure() -> Result<(), Box<dyn std::error::Error>> {
         crate::tests::common::init_tracing();
-        run_running_a_single_task_job_once_costs_five_requests(&AzureProviderHarness::start().await?).await
+        run_running_a_single_task_job_once_costs_four_requests(&AzureProviderHarness::start().await?).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_run_ending_in_a_terminal_failure_costs_five_requests_on_azure() -> Result<(), Box<dyn std::error::Error>>
+    async fn running_a_single_task_job_once_with_four_workers_costs_four_requests_on_azure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_running_a_single_task_job_once_with_four_workers_costs_four_requests(&AzureProviderHarness::start().await?)
+            .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn running_an_interval_job_once_costs_four_requests_on_azure() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_running_an_interval_job_once_costs_four_requests(&AzureProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_ending_in_a_terminal_failure_costs_four_requests_on_azure() -> Result<(), Box<dyn std::error::Error>>
     {
         crate::tests::common::init_tracing();
-        run_a_run_ending_in_a_terminal_failure_costs_five_requests(&AzureProviderHarness::start().await?).await
+        run_a_run_ending_in_a_terminal_failure_costs_four_requests(&AzureProviderHarness::start().await?).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_run_whose_branch_is_skipped_costs_five_requests_on_azure() -> Result<(), Box<dyn std::error::Error>> {
+    async fn a_run_retrying_a_refusal_after_its_pause_costs_eight_requests_on_azure()
+    -> Result<(), Box<dyn std::error::Error>> {
         crate::tests::common::init_tracing();
-        run_a_run_whose_branch_is_skipped_costs_five_requests(&AzureProviderHarness::start().await?).await
+        run_a_run_retrying_a_refusal_after_its_pause_costs_eight_requests(&AzureProviderHarness::start().await?).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_run_with_a_tolerant_dependent_costs_eight_requests_on_azure() -> Result<(), Box<dyn std::error::Error>> {
+    async fn a_run_whose_branch_is_skipped_costs_four_requests_on_azure() -> Result<(), Box<dyn std::error::Error>> {
         crate::tests::common::init_tracing();
-        run_a_run_with_a_tolerant_dependent_costs_eight_requests(&AzureProviderHarness::start().await?).await
+        run_a_run_whose_branch_is_skipped_costs_four_requests(&AzureProviderHarness::start().await?).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_run_losing_one_race_costs_eight_requests_on_azure() -> Result<(), Box<dyn std::error::Error>> {
+    async fn a_run_with_a_tolerant_dependent_costs_seven_requests_on_azure() -> Result<(), Box<dyn std::error::Error>> {
         crate::tests::common::init_tracing();
-        run_a_run_losing_one_race_costs_eight_requests(&AzureProviderHarness::start().await?).await
+        run_a_run_with_a_tolerant_dependent_costs_seven_requests(&AzureProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_losing_one_race_costs_seven_requests_on_azure() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_run_losing_one_race_costs_seven_requests(&AzureProviderHarness::start().await?).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1179,17 +1474,17 @@ mod on_azure {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_run_whose_skipped_branch_loses_one_race_costs_eight_requests_on_azure()
+    async fn a_run_whose_skipped_branch_loses_one_race_costs_seven_requests_on_azure()
     -> Result<(), Box<dyn std::error::Error>> {
         crate::tests::common::init_tracing();
-        run_a_run_whose_skipped_branch_loses_one_race_costs_eight_requests(&AzureProviderHarness::start().await?).await
+        run_a_run_whose_skipped_branch_loses_one_race_costs_seven_requests(&AzureProviderHarness::start().await?).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_ten_requests_on_azure()
+    async fn a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_nine_requests_on_azure()
     -> Result<(), Box<dyn std::error::Error>> {
         crate::tests::common::init_tracing();
-        run_a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_ten_requests(
+        run_a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_nine_requests(
             &AzureProviderHarness::start().await?,
         )
         .await
@@ -1216,14 +1511,17 @@ mod on_gcs {
     use super::{
         run_a_conditional_read_of_an_unmoved_iteration_costs_one_get_and_no_listing,
         run_a_job_waiting_for_its_next_iteration_costs_nothing_on_the_store,
-        run_a_run_ending_in_a_terminal_failure_costs_five_requests, run_a_run_losing_one_race_costs_eight_requests,
-        run_a_run_whose_branch_is_skipped_costs_five_requests,
-        run_a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_ten_requests,
+        run_a_run_ending_in_a_terminal_failure_costs_four_requests, run_a_run_losing_one_race_costs_seven_requests,
+        run_a_run_retrying_a_refusal_after_its_pause_costs_eight_requests,
+        run_a_run_whose_branch_is_skipped_costs_four_requests,
+        run_a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_nine_requests,
         run_a_run_whose_result_lands_in_a_settled_iteration_costs_seven_requests,
-        run_a_run_whose_skipped_branch_loses_one_race_costs_eight_requests,
-        run_a_run_with_a_tolerant_dependent_costs_eight_requests,
+        run_a_run_whose_skipped_branch_loses_one_race_costs_seven_requests,
+        run_a_run_with_a_tolerant_dependent_costs_seven_requests,
         run_polling_a_running_iteration_costs_no_request_besides_a_conditional_read,
-        run_running_a_single_task_job_once_costs_five_requests, run_trimming_a_tail_of_two_iterations,
+        run_running_a_single_task_job_once_costs_four_requests,
+        run_running_a_single_task_job_once_with_four_workers_costs_four_requests,
+        run_running_an_interval_job_once_costs_four_requests, run_trimming_a_tail_of_two_iterations,
     };
     use crate::tests::common::provider_harness::GcsProviderHarness;
 
@@ -1251,33 +1549,54 @@ mod on_gcs {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn running_a_single_task_job_once_costs_five_requests_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
+    async fn running_a_single_task_job_once_costs_four_requests_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
         crate::tests::common::init_tracing();
-        run_running_a_single_task_job_once_costs_five_requests(&GcsProviderHarness::start().await?).await
+        run_running_a_single_task_job_once_costs_four_requests(&GcsProviderHarness::start().await?).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_run_ending_in_a_terminal_failure_costs_five_requests_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
+    async fn running_a_single_task_job_once_with_four_workers_costs_four_requests_on_gcs()
+    -> Result<(), Box<dyn std::error::Error>> {
         crate::tests::common::init_tracing();
-        run_a_run_ending_in_a_terminal_failure_costs_five_requests(&GcsProviderHarness::start().await?).await
+        run_running_a_single_task_job_once_with_four_workers_costs_four_requests(&GcsProviderHarness::start().await?)
+            .await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_run_whose_branch_is_skipped_costs_five_requests_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
+    async fn running_an_interval_job_once_costs_four_requests_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
         crate::tests::common::init_tracing();
-        run_a_run_whose_branch_is_skipped_costs_five_requests(&GcsProviderHarness::start().await?).await
+        run_running_an_interval_job_once_costs_four_requests(&GcsProviderHarness::start().await?).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_run_with_a_tolerant_dependent_costs_eight_requests_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
+    async fn a_run_ending_in_a_terminal_failure_costs_four_requests_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
         crate::tests::common::init_tracing();
-        run_a_run_with_a_tolerant_dependent_costs_eight_requests(&GcsProviderHarness::start().await?).await
+        run_a_run_ending_in_a_terminal_failure_costs_four_requests(&GcsProviderHarness::start().await?).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_run_losing_one_race_costs_eight_requests_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
+    async fn a_run_retrying_a_refusal_after_its_pause_costs_eight_requests_on_gcs()
+    -> Result<(), Box<dyn std::error::Error>> {
         crate::tests::common::init_tracing();
-        run_a_run_losing_one_race_costs_eight_requests(&GcsProviderHarness::start().await?).await
+        run_a_run_retrying_a_refusal_after_its_pause_costs_eight_requests(&GcsProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_whose_branch_is_skipped_costs_four_requests_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_run_whose_branch_is_skipped_costs_four_requests(&GcsProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_with_a_tolerant_dependent_costs_seven_requests_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_run_with_a_tolerant_dependent_costs_seven_requests(&GcsProviderHarness::start().await?).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_losing_one_race_costs_seven_requests_on_gcs() -> Result<(), Box<dyn std::error::Error>> {
+        crate::tests::common::init_tracing();
+        run_a_run_losing_one_race_costs_seven_requests(&GcsProviderHarness::start().await?).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1289,17 +1608,17 @@ mod on_gcs {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_run_whose_skipped_branch_loses_one_race_costs_eight_requests_on_gcs()
+    async fn a_run_whose_skipped_branch_loses_one_race_costs_seven_requests_on_gcs()
     -> Result<(), Box<dyn std::error::Error>> {
         crate::tests::common::init_tracing();
-        run_a_run_whose_skipped_branch_loses_one_race_costs_eight_requests(&GcsProviderHarness::start().await?).await
+        run_a_run_whose_skipped_branch_loses_one_race_costs_seven_requests(&GcsProviderHarness::start().await?).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_ten_requests_on_gcs()
+    async fn a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_nine_requests_on_gcs()
     -> Result<(), Box<dyn std::error::Error>> {
         crate::tests::common::init_tracing();
-        run_a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_ten_requests(
+        run_a_run_whose_pickup_loses_one_race_after_a_lifetime_failure_costs_nine_requests(
             &GcsProviderHarness::start().await?,
         )
         .await

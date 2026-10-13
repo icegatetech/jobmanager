@@ -26,6 +26,12 @@ jobs:
         os: [ubuntu-latest]
         rust: [stable, beta]
     runs-on: ${{ matrix.os }}
+    # `rust-toolchain.toml` names `stable`, and rustup prefers that file over the default toolchain
+    # the install step below sets - so without this variable every job ran on the latest stable,
+    # whatever toolchain it installed. The variable is what wins over the file; every job running
+    # cargo on a toolchain other than `stable` sets it, or names the toolchain with `+`.
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -169,9 +175,13 @@ jobs:
       # The toolchain is read rather than pinned here: `rust-version` is the one place the minimum
       # is declared, and a copy of it in this file would be a second one to forget. The runner's
       # preinstalled cargo is what reads it, before the minimum toolchain is installed below.
+      # `RUSTUP_TOOLCHAIN` for the reason given on the `test` job.
       - name: Read the minimum supported toolchain from Cargo.toml
         id: msrv
-        run: echo "version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].rust_version')" >> "$GITHUB_OUTPUT"
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].rust_version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "RUSTUP_TOOLCHAIN=$version" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -216,26 +226,28 @@ jobs:
           components: rustfmt
 
       - name: Check formatting
-        run: cargo +nightly fmt -- --check
+        run: make fmt
 
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
-    env:
-      # Pinned deliberately: pedantic and nursery are denied crate-wide, so every new stable
-      # release can fail this job on code nobody touched. Bump this in its own commit and fix
-      # the new lints there.
-      CLIPPY_TOOLCHAIN: "1.97.0"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           persist-credentials: false
 
+      # The pinned version and the reason for the pin live in the `Makefile`, so `make clippy` on a
+      # contributor's machine and this job run one clippy. `make clippy` names it with `+`, which
+      # wins over `rust-toolchain.toml` the way `RUSTUP_TOOLCHAIN` does on the `test` job.
+      - name: Read the pinned clippy toolchain from the Makefile
+        id: clippy
+        run: echo "version=$(make --no-print-directory clippy-toolchain)" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ env.CLIPPY_TOOLCHAIN }}
+          toolchain: ${{ steps.clippy.outputs.version }}
           components: clippy
 
       - name: Cache cargo registry
@@ -258,12 +270,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: target
-          key: ${{ runner.os }}-clippy-${{ env.CLIPPY_TOOLCHAIN }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-clippy-${{ steps.clippy.outputs.version }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-clippy-${{ env.CLIPPY_TOOLCHAIN }}-cargo-build-target-
+            ${{ runner.os }}-clippy-${{ steps.clippy.outputs.version }}-cargo-build-target-
 
-      # Every feature, as in the `Makefile`. The `check` steps above do compile each backend, but
-      # `unwrap_used`, `expect_used`, pedantic and nursery are clippy's lints and no `check` step
-      # sees them.
+      # The `check` steps above do compile each backend, but `unwrap_used`, `expect_used`, pedantic
+      # and nursery are clippy's lints and no `check` step sees them.
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: make clippy
