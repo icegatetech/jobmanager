@@ -786,7 +786,7 @@ pub struct DeadlockPlantingStorage {
 
 impl DeadlockPlantingStorage {
     /// Timeout the planted task carries. It never runs, so any legal value does.
-    const PLANTED_TASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    const PLANTED_TASK_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 
     pub fn new(inner: Arc<dyn Storage>, planted_task_code: TaskCode, processed_task_code: TaskCode) -> Self {
         Self {

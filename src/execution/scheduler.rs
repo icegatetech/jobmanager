@@ -512,7 +512,7 @@ mod tests {
 
     /// Longer than any poll moment the tests below schedule, so a claim that has not come by then
     /// never will.
-    const NO_CLAIM_WAIT: Duration = Duration::from_secs(3600);
+    const NO_CLAIM_WAIT: Duration = Duration::from_hours(1);
 
     fn config_polled_every(interval: Duration) -> PollSchedulerConfig {
         PollSchedulerConfig::new()

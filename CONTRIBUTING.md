@@ -6,7 +6,10 @@
 cargo build
 ```
 
-The toolchain is pinned in `rust-toolchain.toml` and picked up automatically.
+The build uses the latest stable toolchain, as `rust-toolchain.toml` names it. Clippy is the
+exception: `make clippy` runs the version `CLIPPY_TOOLCHAIN` pins in the `Makefile`, the same one
+CI runs. If rustup reports that toolchain as not installed, install it once with
+`rustup toolchain install <version> --component clippy`.
 
 ## Tests
 

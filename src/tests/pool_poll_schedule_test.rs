@@ -112,7 +112,7 @@ fn job_of_tasks(
 
 /// Deadline of the task another pool holds below: far beyond the window, so no pass the window
 /// counts can take it over.
-const HELD_TASK_TIMEOUT: Duration = Duration::from_secs(3600);
+const HELD_TASK_TIMEOUT: Duration = Duration::from_hours(1);
 
 /// Stores the job of `job_def` with its task started by a worker of no pool under test.
 async fn store_with_a_task_held_elsewhere(
@@ -806,7 +806,7 @@ async fn a_pass_that_panicked_releases_its_job_and_keeps_its_worker() -> Result<
 async fn a_panicked_execution_polls_its_job_again_at_the_poll_interval() -> Result<(), Box<dyn std::error::Error>> {
     super::common::init_tracing();
     let executor = task_fn(|_ctx| async {
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        tokio::time::sleep(Duration::from_mins(1)).await;
         Ok(TaskOutcome::empty())
     });
     let job_def = job_of_tasks("panicked_execution_job", 1, false, HELD_TASK_TIMEOUT, &executor)?;
@@ -939,7 +939,7 @@ async fn a_job_due_while_every_worker_executes_is_not_read_until_a_worker_is_fre
 
 /// Interval of the jobs below: far beyond every wait of the tests, so no read they count is the
 /// poll of the next iteration.
-const DISTANT_ITERATION_INTERVAL: Duration = Duration::from_secs(3600);
+const DISTANT_ITERATION_INTERVAL: Duration = Duration::from_hours(1);
 
 /// The write that closed an iteration names when the next one is due, and that moment becomes the
 /// poll of the job at once: no pass reads the closed iteration to find it out. The one read is the
