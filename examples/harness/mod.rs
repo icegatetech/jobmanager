@@ -154,11 +154,14 @@ pub fn build_run_scoped_s3_config(state_prefix: &str) -> Result<S3Config> {
 #[cfg(feature = "storage-s3")]
 pub fn build_s3_config_with_codec(state_prefix: &str, codec: JobStateCodecKind) -> Result<S3Config> {
     let config = S3Config::new(
-        read_setting("JM_S3_ENDPOINT", DEFAULT_S3_ENDPOINT),
-        read_setting("JM_S3_ACCESS_KEY_ID", DEFAULT_S3_ACCESS_KEY_ID),
-        read_setting("JM_S3_SECRET_ACCESS_KEY", DEFAULT_S3_SECRET_ACCESS_KEY),
         read_setting("JM_S3_BUCKET", DEFAULT_S3_BUCKET_NAME),
         read_setting("JM_S3_REGION", DEFAULT_S3_REGION),
+    )
+    .with_endpoint(read_setting("JM_S3_ENDPOINT", DEFAULT_S3_ENDPOINT))
+    .with_static_credentials(
+        read_setting("JM_S3_ACCESS_KEY_ID", DEFAULT_S3_ACCESS_KEY_ID),
+        read_setting("JM_S3_SECRET_ACCESS_KEY", DEFAULT_S3_SECRET_ACCESS_KEY),
+        None,
     )
     .with_state_prefix(state_prefix)
     .with_job_state_codec(codec);

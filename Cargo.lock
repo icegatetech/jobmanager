@@ -214,6 +214,7 @@ dependencies = [
  "http-body 1.1.0",
  "percent-encoding",
  "pin-project-lite",
+ "regex-lite",
  "tracing",
  "uuid",
 ]
@@ -2230,6 +2231,7 @@ dependencies = [
  "aws-sdk-s3",
  "aws-smithy-http-client",
  "aws-smithy-types",
+ "aws-types",
  "azure_core",
  "azure_storage_blob",
  "chrono",

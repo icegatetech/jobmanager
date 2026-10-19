@@ -59,13 +59,9 @@ mod on_s3 {
     }
 
     fn build_config(store: &S3TestContainer, bucket_name: &str) -> S3Config {
-        S3Config::new(
-            store.endpoint(),
-            store.username(),
-            store.password(),
-            bucket_name,
-            "us-east-1",
-        )
+        S3Config::new(bucket_name, "us-east-1")
+            .with_endpoint(store.endpoint())
+            .with_static_credentials(store.username(), store.password(), None)
     }
 
     /// The default a pool gets without asking: a bucket that is not there is created, so a first

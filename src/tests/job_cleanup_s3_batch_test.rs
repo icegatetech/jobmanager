@@ -145,17 +145,13 @@ async fn run_delete_iterations_deletes_every_chunk_and_keeps_the_rest(
     let job_def = build_job_definition(&job_code)?;
     let job_registry = Arc::new(JobRegistry::new(vec![job_def])?);
     let storage = S3Backend::build(
-        S3Config::new(
-            store.endpoint(),
-            store.username(),
-            store.password(),
-            bucket_name,
-            "us-east-1",
-        )
-        .with_state_prefix(STATE_PREFIX)
-        .with_job_state_codec(codec)
-        // Five iterations over a batch of two is what makes the chunking observable at all.
-        .with_delete_batch_size(2)?,
+        S3Config::new(bucket_name, "us-east-1")
+            .with_endpoint(store.endpoint())
+            .with_static_credentials(store.username(), store.password(), None)
+            .with_state_prefix(STATE_PREFIX)
+            .with_job_state_codec(codec)
+            // Five iterations over a batch of two is what makes the chunking observable at all.
+            .with_delete_batch_size(2)?,
         job_registry,
         Arc::new(NoopMetrics),
     )
