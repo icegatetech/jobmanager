@@ -37,13 +37,11 @@ use jobmanager::S3Config;
 
 # async fn run() -> Result<()> {
 let manager = JobsManager::builder()
-    .s3(S3Config::new(
-        "http://localhost:9000",
-        "access key",
-        "secret key",
-        "jobs",
-        "us-east-1",
-    ))
+    .s3(
+        S3Config::new("jobs", "us-east-1")
+            .with_endpoint("http://localhost:9000")
+            .with_static_credentials("access key", "secret key", None),
+    )
     .workers(4)
     .job("simple job", |j| {
         j.add_task(

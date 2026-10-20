@@ -14,8 +14,8 @@ use tokio::{
     task::JoinHandle,
 };
 
-/// An endpoint that answers each request with the next scripted response and keeps the targets it
-/// was asked for.
+/// An endpoint that answers each request with the next scripted response and keeps the head - the
+/// request line and the headers - of every request it was sent.
 ///
 /// The clients under test are the providers' own, over URLs this crate builds, so what the endpoint
 /// received is the only place the URL - the conditions, the page token, the listing boundary - is
@@ -27,7 +27,7 @@ pub struct ScriptedEndpoint {
     /// and the others do not.
     #[cfg(feature = "storage-gcs")]
     responses: Arc<Mutex<Vec<String>>>,
-    requested_targets: Arc<Mutex<Vec<String>>>,
+    request_heads: Arc<Mutex<Vec<String>>>,
     accepting: JoinHandle<()>,
 }
 
@@ -40,10 +40,10 @@ impl ScriptedEndpoint {
             "http://{}",
             listener.local_addr().expect("a bound listener has an address")
         );
-        let requested_targets = Arc::new(Mutex::new(Vec::new()));
+        let request_heads = Arc::new(Mutex::new(Vec::new()));
         let responses = Arc::new(Mutex::new(responses));
 
-        let served_targets = Arc::clone(&requested_targets);
+        let served_heads = Arc::clone(&request_heads);
         let served_responses = Arc::clone(&responses);
         let accepting = tokio::spawn(async move {
             let mut served = 0;
@@ -54,7 +54,7 @@ impl ScriptedEndpoint {
                     .cloned()
                     .unwrap_or_else(|| build_http_response(500, &[], "unscripted request"));
                 served += 1;
-                serve_one_request(connection, &response, &served_targets).await;
+                serve_one_request(connection, &response, &served_heads).await;
             }
         });
 
@@ -62,7 +62,7 @@ impl ScriptedEndpoint {
             endpoint,
             #[cfg(feature = "storage-gcs")]
             responses,
-            requested_targets,
+            request_heads,
             accepting,
         }
     }
@@ -76,7 +76,29 @@ impl ScriptedEndpoint {
     /// a request line, from the path to the end of the query, and each recorded before the answer to
     /// it was written - so a call that has come back has its target here already.
     pub fn requested_targets(&self) -> Vec<String> {
-        self.requested_targets.lock().clone()
+        self.request_heads
+            .lock()
+            .iter()
+            .map(|head| head.split_whitespace().nth(1).unwrap_or("<no target>").to_string())
+            .collect()
+    }
+
+    /// Headers of every request, one entry per request in the order served, recorded when its target
+    /// is. Names are lowercased, a header name being case-insensitive on the wire.
+    // Only the S3 cases read what a request was signed with; the other providers' cases need none.
+    #[cfg(feature = "storage-s3")]
+    pub fn requested_headers(&self) -> Vec<Vec<(String, String)>> {
+        self.request_heads
+            .lock()
+            .iter()
+            .map(|head| {
+                head.lines()
+                    .skip(1)
+                    .filter_map(|line| line.split_once(':'))
+                    .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+                    .collect()
+            })
+            .collect()
     }
 
     /// Replaces the first scripted response, for the one case whose answer has to name the address
@@ -95,16 +117,15 @@ impl Drop for ScriptedEndpoint {
     }
 }
 
-/// Reads one HTTP request whole, records the target it asked for in `served_targets` and answers it
-/// with `response`.
+/// Reads one HTTP request whole, records its head in `served_heads` and answers it with `response`.
 ///
 /// The body is read before the answer is written because a client whose request was refused
 /// mid-send reports a transport failure, which is a different case from the status under test.
 ///
-/// The target is recorded before the answer rather than after it: a case reads the targets the
-/// moment the call under test comes back, and everything from the first byte of the answer onwards
-/// is a point at which the client's task may run to that read while this one has not resumed.
-async fn serve_one_request(mut connection: TcpStream, response: &str, served_targets: &Mutex<Vec<String>>) {
+/// The head is recorded before the answer rather than after it: a case reads it the moment the call
+/// under test comes back, and everything from the first byte of the answer onwards is a point at
+/// which the client's task may run to that read while this one has not resumed.
+async fn serve_one_request(mut connection: TcpStream, response: &str, served_heads: &Mutex<Vec<String>>) {
     let mut received = Vec::new();
     let mut chunk = [0_u8; 1024];
     loop {
@@ -130,9 +151,9 @@ async fn serve_one_request(mut connection: TcpStream, response: &str, served_tar
         }
     }
 
-    let request = String::from_utf8_lossy(&received).to_string();
-    let target = request.split_whitespace().nth(1).unwrap_or("<no target>").to_string();
-    served_targets.lock().push(target);
+    let request = String::from_utf8_lossy(&received);
+    let head = request.split("\r\n\r\n").next().unwrap_or_default();
+    served_heads.lock().push(head.to_string());
 
     let _ = connection.write_all(response.as_bytes()).await;
     let _ = connection.shutdown().await;

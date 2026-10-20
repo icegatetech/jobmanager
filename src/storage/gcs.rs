@@ -39,7 +39,7 @@ const CREATE_ONLY_GENERATION: &str = "0";
 /// Where a pool's credentials come from.
 ///
 /// Google's own default - Application Default Credentials - is the one this backend takes without
-/// being asked, which is why [`GcsConfig::new`] names no credential: unlike S3 and Azure,
+/// being asked, which is why [`GcsConfig::new`] names no credential: like S3 and unlike Azure,
 /// this provider has a way in that needs nothing spelled out.
 enum GcsCredentialsSource {
     /// The chain Google's own tooling establishes: the environment, a `gcloud` login, the metadata
@@ -67,8 +67,8 @@ enum MissingBucketPolicy {
 /// [`JobsManagerBuilder::gcs`](crate::JobsManagerBuilder::gcs).
 ///
 /// Build with [`GcsConfig::new`] and override the optional parts with the `with_*` methods.
-/// Unlike the other two backends this one names no credential in its constructor: left alone it
-/// authenticates with Application Default Credentials, and
+/// Like the S3 backend and unlike the Azure one, this one names no credential in its constructor:
+/// left alone it authenticates with Application Default Credentials, and
 /// [`GcsConfig::with_service_account_key`] or [`GcsConfig::with_anonymous_access`]
 /// replace that.
 ///

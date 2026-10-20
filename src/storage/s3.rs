@@ -12,6 +12,7 @@ use aws_sdk_s3::{
     primitives::ByteStream,
     types::{Delete, ObjectIdentifier},
 };
+use aws_types::{SdkConfig, service_config::ServiceConfigKey};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -56,14 +57,33 @@ const DEFAULT_DELETE_BATCH_SIZE: usize = 1000;
 /// version rather than naming one.
 const ANY_VERSION: &str = "*";
 
+/// Where a pool's credentials come from.
+///
+/// The AWS SDK's default credential chain is the one this backend takes without being asked, which
+/// is why [`S3Config::new`] names no credential.
+enum S3CredentialsSource {
+    /// The chain the AWS SDK resolves: the environment, the shared config files, a web identity
+    /// token, the container credentials endpoint - which EKS Pod Identity serves - and the instance
+    /// metadata service, in that order.
+    DefaultChain,
+    /// A key pair given in the configuration, with the session token temporary credentials carry.
+    Static {
+        access_key_id: String,
+        secret_access_key: String,
+        session_token: Option<String>,
+    },
+}
+
 /// Connection details of the S3-compatible bucket a pool keeps job state in, passed to
 /// [`JobsManagerBuilder::s3`](crate::JobsManagerBuilder::s3).
 ///
-/// Build with [`S3Config::new`] and override the optional parts with the `with_*` methods.
+/// Build with [`S3Config::new`] and override the optional parts with the `with_*` methods. Left
+/// alone it signs with the AWS SDK's default credential chain and reaches the endpoint the SDK
+/// resolves for the region; [`S3Config::with_static_credentials`] and [`S3Config::with_endpoint`]
+/// replace those.
 pub struct S3Config {
-    endpoint: String,
-    access_key_id: String,
-    secret_access_key: String,
+    endpoint: Option<String>,
+    credentials_source: S3CredentialsSource,
     bucket_name: String,
     region: String,
     state_prefix: String,
@@ -78,19 +98,10 @@ pub struct S3Config {
 impl S3Config {
     /// Connection details of the bucket holding job state. Everything else takes a default that
     /// the `with_*` methods override.
-    ///
-    /// Pass an `https://` endpoint to use TLS - there is no separate switch for it.
-    pub fn new(
-        endpoint: impl Into<String>,
-        access_key_id: impl Into<String>,
-        secret_access_key: impl Into<String>,
-        bucket_name: impl Into<String>,
-        region: impl Into<String>,
-    ) -> Self {
+    pub fn new(bucket_name: impl Into<String>, region: impl Into<String>) -> Self {
         Self {
-            endpoint: endpoint.into(),
-            access_key_id: access_key_id.into(),
-            secret_access_key: secret_access_key.into(),
+            endpoint: None,
+            credentials_source: S3CredentialsSource::DefaultChain,
             bucket_name: bucket_name.into(),
             region: region.into(),
             state_prefix: DEFAULT_STATE_PREFIX.to_string(),
@@ -101,6 +112,41 @@ impl S3Config {
             delete_batch_size: DEFAULT_DELETE_BATCH_SIZE,
             is_container_creation_allowed: true,
         }
+    }
+
+    /// Address of the store, for an S3-compatible one or an AWS endpoint the SDK would not pick on
+    /// its own. Requests to it address the bucket in the path rather than in the host name, which is
+    /// what an S3-compatible store serves. Without it the client takes the endpoint the SDK's own
+    /// configuration names (`AWS_ENDPOINT_URL_S3`, `AWS_ENDPOINT_URL`, `endpoint_url` in the shared
+    /// config file) and addresses it by path the same way; with none there, it reaches AWS for the
+    /// region and the SDK picks the addressing.
+    ///
+    /// Pass an `https://` endpoint to use TLS - there is no separate switch for it.
+    #[must_use]
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = Some(endpoint.into());
+        self
+    }
+
+    /// Signs with this key pair instead of the AWS SDK's default credential chain, whatever that
+    /// chain would find. `session_token` is the token temporary credentials come with, `None` for a
+    /// long-term key.
+    ///
+    /// Nothing is checked here: a key the store refuses fails the bucket check the backend makes
+    /// when it is built.
+    #[must_use]
+    pub fn with_static_credentials(
+        mut self,
+        access_key_id: impl Into<String>,
+        secret_access_key: impl Into<String>,
+        session_token: Option<String>,
+    ) -> Self {
+        self.credentials_source = S3CredentialsSource::Static {
+            access_key_id: access_key_id.into(),
+            secret_access_key: secret_access_key.into(),
+            session_token,
+        };
+        self
     }
 
     /// Prefix every job's state objects live under. Defaults to `jobs`.
@@ -179,37 +225,77 @@ impl S3Config {
     }
 }
 
-/// Builds the SDK client configuration a pool reaches the store through.
+/// Builds the SDK client configuration a pool reaches the store through, from what `loader` reads -
+/// `aws_config::defaults` in production, which is also where the default credential chain looks.
 ///
 /// Kept out of [`S3Backend::build`], which reaches the endpoint to check the bucket: the
-/// configuration is otherwise unobservable without a store to talk to.
-async fn build_client_config(config: &S3Config) -> aws_sdk_s3::Config {
-    // TODO(med): add creds options
-    let credentials = aws_sdk_s3::config::Credentials::new(
-        config.access_key_id.clone(),
-        config.secret_access_key.clone(),
-        None,
-        None,
-        "static",
-    );
+/// configuration is otherwise unobservable without a store to talk to. Logs the endpoint the client
+/// addresses, which is only known once the configuration is loaded.
+async fn build_client_config(config: &S3Config, loader: aws_config::ConfigLoader) -> Result<aws_sdk_s3::Config, Error> {
+    let loader = loader.region(aws_config::Region::new(config.region.clone()));
+    // A provider set here keeps the loader from building the default chain at all.
+    let loader = match &config.credentials_source {
+        S3CredentialsSource::DefaultChain => loader,
+        S3CredentialsSource::Static {
+            access_key_id,
+            secret_access_key,
+            session_token,
+        } => loader.credentials_provider(aws_sdk_s3::config::Credentials::new(
+            access_key_id.clone(),
+            secret_access_key.clone(),
+            session_token.clone(),
+            None,
+            "static",
+        )),
+    };
 
     // No operation timeout: the SDK's ends when an answer's headers land, leaving the reading of a
     // body outside it, and a second bound over the one `send_request` puts around the whole request
     // would be a parallel mechanism for the same job. The connect timeout the defaults carry stays,
     // and so does stalled-stream protection - neither bounds what this one bounds.
-    let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(aws_config::Region::new(config.region.clone()))
-        .credentials_provider(credentials)
-        .load()
-        .await;
+    let sdk_config = loader.load().await;
 
-    aws_sdk_s3::config::Builder::from(&sdk_config)
-        .endpoint_url(config.endpoint.clone())
-        .force_path_style(true)
+    let endpoint = match &config.endpoint {
+        Some(endpoint) => Some(endpoint.clone()),
+        None => read_configured_endpoint(&sdk_config)?,
+    };
+    match &endpoint {
+        Some(endpoint) => info!("Starting jobmanager with s3 storage at {endpoint}"),
+        None => info!(
+            "Starting jobmanager with s3 storage at the AWS endpoint of region {}",
+            config.region
+        ),
+    }
+
+    let mut client_config = aws_sdk_s3::config::Builder::from(&sdk_config)
         // Retries belong to `Retrier` - see the invariant on what a call of `Storage` may cost in
         // `AGENTS.md`.
-        .retry_config(RetryConfig::disabled())
+        .retry_config(RetryConfig::disabled());
+    // An endpoint from the SDK's configuration names an S3-compatible store just as one from
+    // `with_endpoint` does, so either one gets path style.
+    if let Some(endpoint) = endpoint {
+        client_config = client_config.endpoint_url(endpoint).force_path_style(true);
+    }
+
+    Ok(client_config.build())
+}
+
+/// Endpoint the SDK takes from its own configuration when the code names none -
+/// `AWS_ENDPOINT_URL_S3`, `AWS_ENDPOINT_URL`, or `endpoint_url` in the shared config file - looked up
+/// with the key `aws_sdk_s3::config::Builder::from` uses, so it is the one the client is built with.
+/// `None` means the client addresses AWS itself.
+fn read_configured_endpoint(sdk_config: &SdkConfig) -> Result<Option<String>, Error> {
+    let endpoint_key = ServiceConfigKey::builder()
+        .service_id("S3")
+        .env("AWS_ENDPOINT_URL")
+        .profile("endpoint_url")
         .build()
+        .map_err(|error| Error::Other(format!("s3 endpoint lookup key: {error}")))?;
+
+    Ok(sdk_config
+        .service_config()
+        .and_then(|service_config| service_config.load_config(endpoint_key))
+        .or_else(|| sdk_config.endpoint_url().map(str::to_owned)))
 }
 
 /// State objects of one S3-compatible bucket: each job iteration is one object.
@@ -229,9 +315,10 @@ pub(crate) struct S3Backend {
 }
 
 impl S3Backend {
-    /// Connects to `config.endpoint`, makes sure `config.bucket_name` is reachable - creating it
-    /// when it is missing and `config.is_container_creation_allowed` allows it - and hands out the
-    /// storage built over the bucket.
+    /// Connects to `config.endpoint`, or to the one the SDK resolves when it names none, makes sure
+    /// `config.bucket_name` is reachable - creating it when it is missing and
+    /// `config.is_container_creation_allowed` allows it - and hands out the storage built over the
+    /// bucket.
     ///
     /// The check and the creation are retried per `config.retrier_config`; a persistent failure
     /// (including one from a concurrent creator returning a non-409 error, and a missing bucket the
@@ -241,9 +328,9 @@ impl S3Backend {
         registry: Arc<dyn JobDefinitionRegistry>,
         metrics: Arc<dyn MetricsSink>,
     ) -> Result<ObjectStorage<Self>, Error> {
-        info!("Starting jobmanager with s3 storage {}", config.endpoint);
-
-        let client = Client::from_conf(build_client_config(&config).await);
+        let client = Client::from_conf(
+            build_client_config(&config, aws_config::defaults(aws_config::BehaviorVersion::latest())).await?,
+        );
 
         // TODO(med): add check that conditional requests work for specific S3.
         // For example, some S3 backends ignore the header and atomicity breaks.
@@ -608,8 +695,9 @@ mod tests {
     use std::time::Instant;
 
     use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
-    use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
+    use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient, capture_request};
     use aws_smithy_types::body::SdkBody;
+    use aws_types::os_shim_internal::{Env, Fs};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -637,8 +725,272 @@ mod tests {
     /// so the expectation does not come from the key builder under test.
     const OLDEST_KEPT_ITERATION_TARGET_KEY: &str = "jobs%2Fjob%2Fstate-18446744073709551612.json";
 
+    /// Temporary credentials as the container credentials endpoint answers them.
+    const CONTAINER_CREDENTIALS: &str = "{\"AccessKeyId\":\"ASIAPODIDENTITYTEST\",\"SecretAccessKey\":\"pod-secret\",\
+         \"Token\":\"pod-session-token\",\"Expiration\":\"2099-01-01T00:00:00Z\"}";
+
     fn build_config() -> S3Config {
-        S3Config::new("http://localhost:9000", "key", "secret", "jobs", "us-east-1")
+        S3Config::new("jobs", "us-east-1")
+    }
+
+    /// A loader reading the SDK's configuration from `environment` and `files` alone, so a key or an
+    /// endpoint set on the machine running the tests cannot decide what a case observes.
+    fn build_sdk_config_loader(environment: &[(&str, &str)], files: &[(&str, &str)]) -> aws_config::ConfigLoader {
+        aws_config::defaults(BehaviorVersion::latest())
+            .env(Env::from_slice(environment))
+            .fs(Fs::from_slice(files))
+    }
+
+    /// The environment and token file EKS Pod Identity gives a pod, with `credentials_endpoint`
+    /// standing in for the agent the token is presented to.
+    fn build_pod_identity_loader(credentials_endpoint: &ScriptedEndpoint) -> aws_config::ConfigLoader {
+        let credentials_uri = format!("{}/creds", credentials_endpoint.endpoint());
+
+        build_sdk_config_loader(
+            &[
+                ("AWS_CONTAINER_CREDENTIALS_FULL_URI", &credentials_uri),
+                ("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", "/var/run/token"),
+            ],
+            &[("/var/run/token", "pod-auth-token")],
+        )
+    }
+
+    /// The credentials endpoint of [`build_pod_identity_loader`], answering one request.
+    async fn start_credentials_endpoint() -> ScriptedEndpoint {
+        ScriptedEndpoint::start(vec![build_http_response(
+            200,
+            &[("content-type", "application/json")],
+            CONTAINER_CREDENTIALS,
+        )])
+        .await
+    }
+
+    /// Sends the one `HeadBucket` the signing cases inspect, through a client built from
+    /// `client_config`.
+    async fn send_bucket_check(client_config: aws_sdk_s3::Config) {
+        Client::from_conf(client_config)
+            .head_bucket()
+            .bucket("jobs")
+            .send()
+            .await
+            .expect("the scripted store answers the check");
+    }
+
+    /// Value of the header `name` among `headers`, `None` when the request carried none.
+    fn find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(header_name, _)| header_name == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// Address a `HeadBucket` of `jobs` is sent to by a client built from `config`. Nothing leaves the
+    /// process: the request is captured where a connection would take it.
+    async fn capture_bucket_check_uri(config: &S3Config) -> String {
+        capture_bucket_check_uri_in(config, &[], &[]).await
+    }
+
+    /// [`capture_bucket_check_uri`] with the SDK reading `environment` and `files` as the process
+    /// environment and file system.
+    async fn capture_bucket_check_uri_in(
+        config: &S3Config,
+        environment: &[(&str, &str)],
+        files: &[(&str, &str)],
+    ) -> String {
+        let (http_client, captured) = capture_request(None);
+        let client_config = build_client_config(config, build_sdk_config_loader(environment, files))
+            .await
+            .expect("the client configuration builds")
+            .to_builder()
+            .http_client(http_client)
+            .build();
+
+        Client::from_conf(client_config)
+            .head_bucket()
+            .bucket("jobs")
+            .send()
+            .await
+            .expect("the captured request is answered 200");
+
+        captured.expect_request().uri().to_string()
+    }
+
+    /// A pool given no keys signs with what the default chain finds, which under EKS Pod Identity is
+    /// the container credentials endpoint: asked with the token in the file the environment names,
+    /// it answers temporary credentials, and their session token has to reach the store with them.
+    ///
+    /// Checked by breaking it: handing a config without keys a fixed key pair, as a static source
+    /// gets, signs with that key and leaves the credentials endpoint unasked.
+    #[tokio::test]
+    async fn a_config_without_keys_signs_with_container_credentials() {
+        let credentials_endpoint = start_credentials_endpoint().await;
+        let store_endpoint = ScriptedEndpoint::start(vec![build_http_response(200, &[], "")]).await;
+        let config = S3Config::new("jobs", "us-east-1").with_endpoint(store_endpoint.endpoint());
+
+        send_bucket_check(
+            build_client_config(&config, build_pod_identity_loader(&credentials_endpoint))
+                .await
+                .expect("the client configuration builds"),
+        )
+        .await;
+
+        let credentials_requests = credentials_endpoint.requested_headers();
+        assert_eq!(
+            credentials_requests.len(),
+            1,
+            "the credentials must have been asked for once"
+        );
+        assert_eq!(
+            find_header(&credentials_requests[0], "authorization"),
+            Some("pod-auth-token")
+        );
+        let store_requests = store_endpoint.requested_headers();
+        assert_eq!(store_requests.len(), 1, "the check is one request");
+        assert_eq!(
+            find_header(&store_requests[0], "x-amz-security-token"),
+            Some("pod-session-token")
+        );
+        let authorization = find_header(&store_requests[0], "authorization").unwrap_or_default();
+        assert!(
+            authorization.contains("Credential=ASIAPODIDENTITYTEST/"),
+            "the request must be signed with the container's key, got: {authorization}"
+        );
+    }
+
+    /// Temporary credentials given as static keys are refused by the store without their token.
+    ///
+    /// Checked by breaking it: building the static credentials with no session token leaves the
+    /// header off the request.
+    #[tokio::test]
+    async fn static_credentials_carry_the_session_token() {
+        let store_endpoint = ScriptedEndpoint::start(vec![build_http_response(200, &[], "")]).await;
+        let config = S3Config::new("jobs", "us-east-1")
+            .with_endpoint(store_endpoint.endpoint())
+            .with_static_credentials("AKIASTATIC", "s", Some("static-token".to_string()));
+
+        send_bucket_check(
+            build_client_config(&config, build_sdk_config_loader(&[], &[]))
+                .await
+                .expect("the client configuration builds"),
+        )
+        .await;
+
+        let store_requests = store_endpoint.requested_headers();
+        assert_eq!(store_requests.len(), 1, "the check is one request");
+        assert_eq!(
+            find_header(&store_requests[0], "x-amz-security-token"),
+            Some("static-token")
+        );
+        let authorization = find_header(&store_requests[0], "authorization").unwrap_or_default();
+        assert!(
+            authorization.contains("Credential=AKIASTATIC/"),
+            "the request must be signed with the configured key, got: {authorization}"
+        );
+    }
+
+    /// Keys given in the configuration are what the pool signs with even where the default chain
+    /// would find others - the same environment signs with the container's key in
+    /// [`a_config_without_keys_signs_with_container_credentials`].
+    ///
+    /// Checked by breaking it: leaving the chain on the loader for a static source signs with the
+    /// container's key and asks its endpoint for it.
+    #[tokio::test]
+    async fn static_credentials_win_over_the_default_chain() {
+        let credentials_endpoint = start_credentials_endpoint().await;
+        let store_endpoint = ScriptedEndpoint::start(vec![build_http_response(200, &[], "")]).await;
+        let config = S3Config::new("jobs", "us-east-1")
+            .with_endpoint(store_endpoint.endpoint())
+            .with_static_credentials("AKIASTATIC", "s", None);
+
+        send_bucket_check(
+            build_client_config(&config, build_pod_identity_loader(&credentials_endpoint))
+                .await
+                .expect("the client configuration builds"),
+        )
+        .await;
+
+        let store_requests = store_endpoint.requested_headers();
+        assert_eq!(store_requests.len(), 1, "the check is one request");
+        let authorization = find_header(&store_requests[0], "authorization").unwrap_or_default();
+        assert!(
+            authorization.contains("Credential=AKIASTATIC/"),
+            "the request must be signed with the configured key, got: {authorization}"
+        );
+        assert_eq!(
+            find_header(&store_requests[0], "x-amz-security-token"),
+            None,
+            "a key pair given without a token must not pick up the container's"
+        );
+        let credentials_targets = credentials_endpoint.requested_targets();
+        assert!(
+            credentials_targets.is_empty(),
+            "the container credentials must not be asked for, got: {credentials_targets:?}"
+        );
+    }
+
+    /// Without an endpoint the SDK addresses AWS itself, the bucket in the host name; forcing
+    /// path-style there would address every request of a pool the way S3-compatible stores need and
+    /// AWS's own endpoints do not.
+    ///
+    /// Checked by breaking it: forcing path-style whatever the endpoint moves the bucket into the path.
+    #[tokio::test]
+    async fn a_config_without_an_endpoint_leaves_addressing_to_the_sdk() {
+        let config = S3Config::new("jobs", "us-east-1").with_static_credentials("AKIASTATIC", "s", None);
+
+        let uri = capture_bucket_check_uri(&config).await;
+
+        assert_eq!(uri, "https://jobs.s3.us-east-1.amazonaws.com/");
+    }
+
+    /// An S3-compatible store is reached at its own endpoint, bucket in the path. A host name rather
+    /// than an address: the SDK addresses an IP endpoint by path on its own, so only a name tells a
+    /// forced path-style from the default.
+    ///
+    /// Checked by breaking it: dropping `force_path_style` puts the bucket into the host name.
+    #[tokio::test]
+    async fn a_config_with_an_endpoint_forces_path_style() {
+        let config = S3Config::new("jobs", "us-east-1")
+            .with_endpoint("http://localhost:9000")
+            .with_static_credentials("AKIASTATIC", "s", None);
+
+        let uri = capture_bucket_check_uri(&config).await;
+
+        assert_eq!(uri, "http://localhost:9000/jobs/");
+    }
+
+    /// An endpoint the SDK picks up itself rather than from `with_endpoint` names an S3-compatible
+    /// store just the same, so it is addressed by path too: the general `AWS_ENDPOINT_URL`, the
+    /// S3-only `AWS_ENDPOINT_URL_S3` and `endpoint_url` in the shared config file alike.
+    ///
+    /// Checked by breaking it: deciding path-style on `with_endpoint` alone puts the bucket into the
+    /// host name for every source.
+    #[tokio::test]
+    async fn an_endpoint_from_the_sdk_configuration_forces_path_style() {
+        let config = S3Config::new("jobs", "us-east-1").with_static_credentials("AKIASTATIC", "s", None);
+        let config_file = "[default]\nendpoint_url = http://localhost:9000\n";
+        let sources: [(&str, &[(&str, &str)], &[(&str, &str)]); 3] = [
+            (
+                "AWS_ENDPOINT_URL",
+                &[("AWS_ENDPOINT_URL", "http://localhost:9000")],
+                &[],
+            ),
+            (
+                "AWS_ENDPOINT_URL_S3",
+                &[("AWS_ENDPOINT_URL_S3", "http://localhost:9000")],
+                &[],
+            ),
+            (
+                "the shared config file",
+                &[("AWS_CONFIG_FILE", "/aws/config")],
+                &[("/aws/config", config_file)],
+            ),
+        ];
+
+        for (source, environment, files) in sources {
+            let uri = capture_bucket_check_uri_in(&config, environment, files).await;
+
+            assert_eq!(uri, "http://localhost:9000/jobs/", "endpoint from {source}");
+        }
     }
 
     /// Builds a store whose S3 client answers with `response`, recording every request it makes
@@ -1018,7 +1370,9 @@ mod tests {
     /// nor bounded by `Retrier`, which owns the retry policy of this crate.
     #[tokio::test]
     async fn the_production_client_does_not_retry_inside_the_sdk() {
-        let client_config = build_client_config(&build_config()).await;
+        let client_config = build_client_config(&build_config(), build_sdk_config_loader(&[], &[]))
+            .await
+            .expect("the client configuration builds");
 
         let attempts = client_config
             .retry_config()
@@ -1048,7 +1402,9 @@ mod tests {
             ),
         ])
         .await;
-        let config = S3Config::new(endpoint.endpoint(), "key", "secret", "jobs", "us-east-1")
+        let config = S3Config::new("jobs", "us-east-1")
+            .with_endpoint(endpoint.endpoint())
+            .with_static_credentials("key", "secret", None)
             .with_request_timeout(LOCAL_ENDPOINT_TIMEOUT);
 
         let storage = S3Backend::build(

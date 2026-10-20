@@ -154,15 +154,11 @@ mod s3 {
             &self,
             request: &ProviderStorageRequest,
         ) -> Result<Arc<dyn Storage>, Box<dyn std::error::Error>> {
-            let mut config = S3Config::new(
-                self.container.endpoint(),
-                self.container.username(),
-                self.container.password(),
-                PERIMETER_CONTAINER_NAME,
-                PERIMETER_REGION,
-            )
-            .with_state_prefix(&request.state_prefix)
-            .with_job_state_codec(request.codec);
+            let mut config = S3Config::new(PERIMETER_CONTAINER_NAME, PERIMETER_REGION)
+                .with_endpoint(self.container.endpoint())
+                .with_static_credentials(self.container.username(), self.container.password(), None)
+                .with_state_prefix(&request.state_prefix)
+                .with_job_state_codec(request.codec);
             if let Some(list_page_size) = request.list_page_size {
                 config = config.with_list_page_size(list_page_size)?;
             }
@@ -177,15 +173,11 @@ mod s3 {
         }
 
         fn attach_storage(&self, builder: JobsManagerBuilder, state_prefix: &str) -> JobsManagerBuilder {
-            builder.s3(S3Config::new(
-                self.container.endpoint(),
-                self.container.username(),
-                self.container.password(),
-                PERIMETER_CONTAINER_NAME,
-                PERIMETER_REGION,
-            )
-            .with_state_prefix(state_prefix)
-            .with_job_state_codec(JobStateCodecKind::Json))
+            builder.s3(S3Config::new(PERIMETER_CONTAINER_NAME, PERIMETER_REGION)
+                .with_endpoint(self.container.endpoint())
+                .with_static_credentials(self.container.username(), self.container.password(), None)
+                .with_state_prefix(state_prefix)
+                .with_job_state_codec(JobStateCodecKind::Json))
         }
 
         async fn read_state_keys(&self, state_prefix: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
