@@ -51,7 +51,7 @@ redundant_pub_crate = "allow"
 default = ["storage-s3"]
 # Off by default so consumers using another metrics sink do not carry OpenTelemetry.
 metrics-otel = ["dep:opentelemetry"]
-storage-s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
+storage-s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-types"]
 storage-azure = ["dep:azure_core", "dep:azure_storage_blob"]
 storage-gcs = ["dep:google-cloud-auth", "dep:reqwest", "dep:http"]
 
@@ -164,6 +164,10 @@ tokio-util = "0.7"
 # `rust-version` above - the SDK declares 1.94.1.
 aws-sdk-s3 = { version = "1.146", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"], optional = true }
 aws-config = { version = "1.8", default-features = false, features = ["credentials-process", "default-https-client", "rt-tokio", "sso"], optional = true }
+# Names the key the endpoint an S3 client takes from the SDK's own configuration is looked up
+# under, so the backend knows that endpoint before it builds the client - see
+# `read_configured_endpoint` in `storage/s3.rs`.
+aws-types = { version = "1", optional = true }
 
 # Azure Blob Storage. `hmac_rust` is on because the SDK carries no shared-key authentication, and
 # `azure_core::hmac::hmac_sha256` behind that feature is what signs a request with the account key -

@@ -12,6 +12,7 @@ use aws_sdk_s3::{
     primitives::ByteStream,
     types::{Delete, ObjectIdentifier},
 };
+use aws_types::{SdkConfig, service_config::ServiceConfigKey};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -115,8 +116,10 @@ impl S3Config {
 
     /// Address of the store, for an S3-compatible one or an AWS endpoint the SDK would not pick on
     /// its own. Requests to it address the bucket in the path rather than in the host name, which is
-    /// what an S3-compatible store serves. Without it the SDK resolves the endpoint and the
-    /// addressing itself.
+    /// what an S3-compatible store serves. Without it the client takes the endpoint the SDK's own
+    /// configuration names (`AWS_ENDPOINT_URL_S3`, `AWS_ENDPOINT_URL`, `endpoint_url` in the shared
+    /// config file) and addresses it by path the same way; with none there, it reaches AWS for the
+    /// region and the SDK picks the addressing.
     ///
     /// Pass an `https://` endpoint to use TLS - there is no separate switch for it.
     #[must_use]
@@ -226,8 +229,9 @@ impl S3Config {
 /// `aws_config::defaults` in production, which is also where the default credential chain looks.
 ///
 /// Kept out of [`S3Backend::build`], which reaches the endpoint to check the bucket: the
-/// configuration is otherwise unobservable without a store to talk to.
-async fn build_client_config(config: &S3Config, loader: aws_config::ConfigLoader) -> aws_sdk_s3::Config {
+/// configuration is otherwise unobservable without a store to talk to. Logs the endpoint the client
+/// addresses, which is only known once the configuration is loaded.
+async fn build_client_config(config: &S3Config, loader: aws_config::ConfigLoader) -> Result<aws_sdk_s3::Config, Error> {
     let loader = loader.region(aws_config::Region::new(config.region.clone()));
     // A provider set here keeps the loader from building the default chain at all.
     let loader = match &config.credentials_source {
@@ -251,15 +255,47 @@ async fn build_client_config(config: &S3Config, loader: aws_config::ConfigLoader
     // and so does stalled-stream protection - neither bounds what this one bounds.
     let sdk_config = loader.load().await;
 
+    let endpoint = match &config.endpoint {
+        Some(endpoint) => Some(endpoint.clone()),
+        None => read_configured_endpoint(&sdk_config)?,
+    };
+    match &endpoint {
+        Some(endpoint) => info!("Starting jobmanager with s3 storage at {endpoint}"),
+        None => info!(
+            "Starting jobmanager with s3 storage at the AWS endpoint of region {}",
+            config.region
+        ),
+    }
+
     let mut client_config = aws_sdk_s3::config::Builder::from(&sdk_config)
         // Retries belong to `Retrier` - see the invariant on what a call of `Storage` may cost in
         // `AGENTS.md`.
         .retry_config(RetryConfig::disabled());
-    if let Some(endpoint) = &config.endpoint {
-        client_config = client_config.endpoint_url(endpoint.clone()).force_path_style(true);
+    // An endpoint from the SDK's configuration names an S3-compatible store just as one from
+    // `with_endpoint` does, so either one gets path style.
+    if let Some(endpoint) = endpoint {
+        client_config = client_config.endpoint_url(endpoint).force_path_style(true);
     }
 
-    client_config.build()
+    Ok(client_config.build())
+}
+
+/// Endpoint the SDK takes from its own configuration when the code names none -
+/// `AWS_ENDPOINT_URL_S3`, `AWS_ENDPOINT_URL`, or `endpoint_url` in the shared config file - looked up
+/// with the key `aws_sdk_s3::config::Builder::from` uses, so it is the one the client is built with.
+/// `None` means the client addresses AWS itself.
+fn read_configured_endpoint(sdk_config: &SdkConfig) -> Result<Option<String>, Error> {
+    let endpoint_key = ServiceConfigKey::builder()
+        .service_id("S3")
+        .env("AWS_ENDPOINT_URL")
+        .profile("endpoint_url")
+        .build()
+        .map_err(|error| Error::Other(format!("s3 endpoint lookup key: {error}")))?;
+
+    Ok(sdk_config
+        .service_config()
+        .and_then(|service_config| service_config.load_config(endpoint_key))
+        .or_else(|| sdk_config.endpoint_url().map(str::to_owned)))
 }
 
 /// State objects of one S3-compatible bucket: each job iteration is one object.
@@ -292,13 +328,8 @@ impl S3Backend {
         registry: Arc<dyn JobDefinitionRegistry>,
         metrics: Arc<dyn MetricsSink>,
     ) -> Result<ObjectStorage<Self>, Error> {
-        info!(
-            "Starting jobmanager with s3 storage {}",
-            config.endpoint.as_deref().unwrap_or("at the endpoint the SDK resolves")
-        );
-
         let client = Client::from_conf(
-            build_client_config(&config, aws_config::defaults(aws_config::BehaviorVersion::latest())).await,
+            build_client_config(&config, aws_config::defaults(aws_config::BehaviorVersion::latest())).await?,
         );
 
         // TODO(med): add check that conditional requests work for specific S3.
@@ -756,9 +787,20 @@ mod tests {
     /// Address a `HeadBucket` of `jobs` is sent to by a client built from `config`. Nothing leaves the
     /// process: the request is captured where a connection would take it.
     async fn capture_bucket_check_uri(config: &S3Config) -> String {
+        capture_bucket_check_uri_in(config, &[], &[]).await
+    }
+
+    /// [`capture_bucket_check_uri`] with the SDK reading `environment` and `files` as the process
+    /// environment and file system.
+    async fn capture_bucket_check_uri_in(
+        config: &S3Config,
+        environment: &[(&str, &str)],
+        files: &[(&str, &str)],
+    ) -> String {
         let (http_client, captured) = capture_request(None);
-        let client_config = build_client_config(config, build_sdk_config_loader(&[], &[]))
+        let client_config = build_client_config(config, build_sdk_config_loader(environment, files))
             .await
+            .expect("the client configuration builds")
             .to_builder()
             .http_client(http_client)
             .build();
@@ -785,7 +827,12 @@ mod tests {
         let store_endpoint = ScriptedEndpoint::start(vec![build_http_response(200, &[], "")]).await;
         let config = S3Config::new("jobs", "us-east-1").with_endpoint(store_endpoint.endpoint());
 
-        send_bucket_check(build_client_config(&config, build_pod_identity_loader(&credentials_endpoint)).await).await;
+        send_bucket_check(
+            build_client_config(&config, build_pod_identity_loader(&credentials_endpoint))
+                .await
+                .expect("the client configuration builds"),
+        )
+        .await;
 
         let credentials_requests = credentials_endpoint.requested_headers();
         assert_eq!(
@@ -821,7 +868,12 @@ mod tests {
             .with_endpoint(store_endpoint.endpoint())
             .with_static_credentials("AKIASTATIC", "s", Some("static-token".to_string()));
 
-        send_bucket_check(build_client_config(&config, build_sdk_config_loader(&[], &[])).await).await;
+        send_bucket_check(
+            build_client_config(&config, build_sdk_config_loader(&[], &[]))
+                .await
+                .expect("the client configuration builds"),
+        )
+        .await;
 
         let store_requests = store_endpoint.requested_headers();
         assert_eq!(store_requests.len(), 1, "the check is one request");
@@ -850,7 +902,12 @@ mod tests {
             .with_endpoint(store_endpoint.endpoint())
             .with_static_credentials("AKIASTATIC", "s", None);
 
-        send_bucket_check(build_client_config(&config, build_pod_identity_loader(&credentials_endpoint)).await).await;
+        send_bucket_check(
+            build_client_config(&config, build_pod_identity_loader(&credentials_endpoint))
+                .await
+                .expect("the client configuration builds"),
+        )
+        .await;
 
         let store_requests = store_endpoint.requested_headers();
         assert_eq!(store_requests.len(), 1, "the check is one request");
@@ -899,6 +956,41 @@ mod tests {
         let uri = capture_bucket_check_uri(&config).await;
 
         assert_eq!(uri, "http://localhost:9000/jobs/");
+    }
+
+    /// An endpoint the SDK picks up itself rather than from `with_endpoint` names an S3-compatible
+    /// store just the same, so it is addressed by path too: the general `AWS_ENDPOINT_URL`, the
+    /// S3-only `AWS_ENDPOINT_URL_S3` and `endpoint_url` in the shared config file alike.
+    ///
+    /// Checked by breaking it: deciding path-style on `with_endpoint` alone puts the bucket into the
+    /// host name for every source.
+    #[tokio::test]
+    async fn an_endpoint_from_the_sdk_configuration_forces_path_style() {
+        let config = S3Config::new("jobs", "us-east-1").with_static_credentials("AKIASTATIC", "s", None);
+        let config_file = "[default]\nendpoint_url = http://localhost:9000\n";
+        let sources: [(&str, &[(&str, &str)], &[(&str, &str)]); 3] = [
+            (
+                "AWS_ENDPOINT_URL",
+                &[("AWS_ENDPOINT_URL", "http://localhost:9000")],
+                &[],
+            ),
+            (
+                "AWS_ENDPOINT_URL_S3",
+                &[("AWS_ENDPOINT_URL_S3", "http://localhost:9000")],
+                &[],
+            ),
+            (
+                "the shared config file",
+                &[("AWS_CONFIG_FILE", "/aws/config")],
+                &[("/aws/config", config_file)],
+            ),
+        ];
+
+        for (source, environment, files) in sources {
+            let uri = capture_bucket_check_uri_in(&config, environment, files).await;
+
+            assert_eq!(uri, "http://localhost:9000/jobs/", "endpoint from {source}");
+        }
     }
 
     /// Builds a store whose S3 client answers with `response`, recording every request it makes
@@ -1278,7 +1370,9 @@ mod tests {
     /// nor bounded by `Retrier`, which owns the retry policy of this crate.
     #[tokio::test]
     async fn the_production_client_does_not_retry_inside_the_sdk() {
-        let client_config = build_client_config(&build_config(), build_sdk_config_loader(&[], &[])).await;
+        let client_config = build_client_config(&build_config(), build_sdk_config_loader(&[], &[]))
+            .await
+            .expect("the client configuration builds");
 
         let attempts = client_config
             .retry_config()
